@@ -181,7 +181,8 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
 
         # 4. Sleep
         elapsed = time.time() - t_loop_start
-        sleep_time = MPC_PERIOD_MS / 1000.0 - elapsed
+        # sleep_time = MPC_PERIOD_MS / 1000.0 - elapsed
+        sleep_time = 0.0
         if sleep_time > 0:
             t0 = time.perf_counter()
             time.sleep(sleep_time)
