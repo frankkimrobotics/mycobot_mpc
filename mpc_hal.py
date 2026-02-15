@@ -413,9 +413,9 @@ def main():
     try:
         for i in range(10):
             init = [-90,-90,0,-90,0,0]
-            target = [a + 15.0 for a in init]
-            run_mpc_loop(h, s, init, duration_sec=5.0)
-            run_mpc_loop(h, s, target, duration_sec=5.0)
+            target = [a + 5.0 for a in init]
+            run_mpc_loop(h, s, init, duration_sec=10.0)
+            run_mpc_loop(h, s, target, duration_sec=10.0)
         # run_mpc_loop(h, s, target, duration_sec=10.0)
         # run_mpc_loop(h, s, current, duration_sec=10.0)
     except KeyboardInterrupt:
