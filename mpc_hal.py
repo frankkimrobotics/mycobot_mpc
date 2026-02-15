@@ -139,9 +139,15 @@ def _save_log(log_rows, target_angles):
     print(f"  Log saved: {filename} ({len(log_rows)} rows)")
 
 
-def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
-    """Run MPC loop: poll -> PD solve -> HAL write."""
+def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
+                 pos_tol=0.5, vel_tol=1.0, settle_steps=50):
+    """Run MPC loop: poll -> PD solve -> HAL write.
+
+    Early-stops when position error norm < pos_tol (deg) AND velocity norm
+    < vel_tol (deg/s) for settle_steps consecutive iterations.
+    """
     print("MPC HAL loop starting. Target:", target_angles)
+    print(f"  Early stop: pos_tol={pos_tol}°, vel_tol={vel_tol}°/s, settle={settle_steps} steps")
     print("Press Ctrl+C to stop.\n")
 
     # Enable MPC override
@@ -149,6 +155,7 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
 
     t_start = time.time()
     loop_count = 0
+    converged_count = 0
     prev_current = None
     t_prev = None
     for k in _timing:
@@ -184,6 +191,16 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
 
         loop_count += 1
         err = sum((t - a) ** 2 for t, a in zip(target_angles, q)) ** 0.5
+        vel_norm = sum(v ** 2 for v in vel_cmd) ** 0.5
+
+        # Early stop: converged if pos error and vel command are both small
+        if err < pos_tol and vel_norm < vel_tol:
+            converged_count += 1
+            if converged_count >= settle_steps:
+                print(f"  Converged at loop {loop_count}: err={err:.3f}° vel_norm={vel_norm:.3f}°/s")
+                break
+        else:
+            converged_count = 0
 
         # Collect log row (no file I/O in the control loop)
         vel_list = q_vel if q_vel else [0.0] * MAX_JOINTS
@@ -490,13 +507,12 @@ def main():
 
     # Run (Ctrl+C to stop)
     try:
+        init = [-90, -90, 0, -90, 0, 0]
         for i in range(5):
-            init = [-90,-90,0,-90,0,0]
-            target = [a + (i+1)*3.0 for a in init]
+            target = [a + np.random.uniform(0, 5) for a in init]
+            print(f"\n=== Run {i+1}/5: target={[round(t,1) for t in target]} ===")
             run_mpc_loop(h, s, init, duration_sec=5.0)
             run_mpc_loop(h, s, target, duration_sec=5.0)
-        # run_mpc_loop(h, s, target, duration_sec=10.0)
-        # run_mpc_loop(h, s, current, duration_sec=10.0)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
