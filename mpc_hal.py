@@ -31,7 +31,7 @@ KP = 0.3
 KD = 0.1
 
 # Suction pump
-SUCTION_PIN = "pro600.gpio_out0"  # HAL pin for suction pump
+SUCTION_PIN = "pro600.digital_out00"  # HAL pin for suction pump
 
 # Logging
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -488,7 +488,7 @@ def enable_machine(h, timeout=60.0):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MPC control for myCobot Pro 630")
-    parser.add_argument("--suction", action="store_true", default=False,
+    parser.add_argument("--suction", action="store_true", default=True,
                         help="Turn on suction pump during operation (default: off)")
     args = parser.parse_args()
 
