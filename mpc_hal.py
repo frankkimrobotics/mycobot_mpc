@@ -30,6 +30,9 @@ U_MAX_PER_STEP = 5.0
 KP = 0.3
 KD = 0.1
 
+# Suction pump
+SUCTION_PIN = "pro600.gpio_out0"  # HAL pin for suction pump
+
 # Logging
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
@@ -302,6 +305,13 @@ def power_on_robot():
     return True
 
 
+def suction_pump(on=True):
+    """Turn suction pump on or off via HAL GPIO pin."""
+    val = 1 if on else 0
+    print(f"  Suction pump: {'ON' if on else 'OFF'} ({SUCTION_PIN}={val})")
+    _halcmd_set(SUCTION_PIN, val)
+
+
 def power_off_robot():
     """Power off robot: disable MPC, set ESTOP, power off motors via CAN."""
     print("Powering off robot...")
@@ -476,6 +486,12 @@ def enable_machine(h, timeout=60.0):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="MPC control for myCobot Pro 630")
+    parser.add_argument("--suction", action="store_true", default=False,
+                        help="Turn on suction pump during operation (default: off)")
+    args = parser.parse_args()
+
     # Create HAL component
     try:
         h = hal.component("mpc")
@@ -511,6 +527,10 @@ def main():
     print("Current angles:", current)
     print("Target (current + 5° each):", target)
 
+    # Suction pump
+    if args.suction:
+        suction_pump(on=True)
+
     # Run (Ctrl+C to stop)
     try:
         init = [-90, -90, 0, -90, 0, 0]
@@ -524,6 +544,8 @@ def main():
         print("\nInterrupted.")
     finally:
         h["enable"] = False
+        if args.suction:
+            suction_pump(on=False)
         power_off_robot()
 
     print("Done.")
