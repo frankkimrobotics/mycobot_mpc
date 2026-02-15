@@ -48,12 +48,13 @@ def load_csv(filepath):
     return df
 
 
-def plot_merged_trajectories(dfs, labels, fig, axes):
+def plot_merged_trajectories(dfs, axes):
     """Plot all runs merged: position error (target - actual) and velocity per joint."""
     ax_pos, ax_vel = axes
-    colors = plt.cm.tab10(np.linspace(0, 1, max(len(dfs), 10)))
+    cmap = plt.colormaps["tab10"]
+    colors = [cmap(i / max(len(dfs), 10)) for i in range(len(dfs))]
 
-    for i, (df, label) in enumerate(zip(dfs, labels)):
+    for i, df in enumerate(dfs):
         t = df["elapsed_s"]
         clr = colors[i % len(colors)]
 
@@ -64,10 +65,10 @@ def plot_merged_trajectories(dfs, labels, fig, axes):
         pos_err = np.sqrt(pos_err)
         ax_pos.plot(t, pos_err, color=clr, linewidth=1, alpha=0.8)
 
-        # Velocity norm per timestep
+        # Commanded velocity norm per timestep
         vel_norm = np.zeros(len(df))
         for j in range(NUM_JOINTS):
-            vel_norm += df[f"qvel{j}"] ** 2
+            vel_norm += df[f"cmd_vel{j}"] ** 2
         vel_norm = np.sqrt(vel_norm)
         ax_vel.plot(t, vel_norm, color=clr, linewidth=1, alpha=0.8)
 
@@ -75,9 +76,9 @@ def plot_merged_trajectories(dfs, labels, fig, axes):
     ax_pos.set_title("Position Error (‖target − actual‖) — all runs")
     ax_pos.grid(True, alpha=0.3)
 
-    ax_vel.set_ylabel("Velocity norm (deg/s)")
+    ax_vel.set_ylabel("Cmd velocity norm (deg/s)")
     ax_vel.set_xlabel("Time (s)")
-    ax_vel.set_title("Velocity Norm (‖q_vel‖) — all runs")
+    ax_vel.set_title("Commanded Velocity Norm (‖vel_cmd‖) — all runs")
     ax_vel.grid(True, alpha=0.3)
 
 
@@ -132,7 +133,7 @@ def main():
     # --- Figure 1: Merged trajectories (pos error + vel norm) ---
     fig_traj, axes_traj = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
     fig_traj.suptitle("MPC Trajectories — All Runs", fontsize=13, fontweight="bold")
-    plot_merged_trajectories(dfs, run_labels, fig_traj, axes_traj)
+    plot_merged_trajectories(dfs, axes_traj)
     fig_traj.tight_layout(rect=[0, 0, 1, 0.96])
     _save_fig(fig_traj, "trajectories")
 

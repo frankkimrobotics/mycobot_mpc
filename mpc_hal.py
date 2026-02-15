@@ -173,7 +173,13 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
         q, q_vel, t_status = _poll_feedback(s)
 
         # 2. PD solve → (position, velocity)
-        next_pos, vel_cmd = mpc_solve_qp(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
+        # q_vel from LinuxCNC is ~0 (motion planner bypassed), use prev_q estimation instead
+        next_pos, vel_cmd = mpc_solve_qp(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
+        # Estimate velocity for logging (before overwriting prev_current)
+        if prev_current is not None and dt is not None and dt > 0:
+            est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
+        else:
+            est_vel = [0.0] * MAX_JOINTS
         prev_current = q.copy()
 
         # 3. HAL write — position + velocity
@@ -204,10 +210,9 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
             converged_count = 0
 
         # Collect log row (no file I/O in the control loop)
-        vel_list = q_vel if q_vel else [0.0] * MAX_JOINTS
         log_rows.append([
             t_status, loop_count,
-            *q, *vel_list, *target_angles, *next_pos, *vel_cmd,
+            *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
             err,
             _timing["poll"][-1], _timing["pd_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
@@ -509,12 +514,12 @@ def main():
     # Run (Ctrl+C to stop)
     try:
         init = [-90, -90, 0, -90, 0, 0]
-        for i in range(100):
-            target = [a + np.random.uniform(-15, 15) for a in init]
+        for i in range(10):
+            target = [a + np.random.uniform(-20, 20) for a in init]
             print(f"\n=== Run {i+1}/5: target={[round(t,1) for t in target]} ===")
             
-            run_mpc_loop(h, s, target, duration_sec=5.0)
-            run_mpc_loop(h, s, init, duration_sec=5.0)
+            run_mpc_loop(h, s, target, duration_sec=3.0)
+            run_mpc_loop(h, s, init, duration_sec=3.0)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
