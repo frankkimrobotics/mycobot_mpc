@@ -13,4 +13,4 @@ Connect to the raspi via SSH with pi@10.0.0.27
 
 In raspi, run the command with 
 
-"linuxcnc /home/pi/Desktop/mpc/config/elerob_mpc.ini"
+"linuxcnc /home/pi/Desktop/mpc/elerob_mpc.ini"
