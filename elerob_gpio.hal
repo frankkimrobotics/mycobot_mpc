@@ -1,0 +1,3 @@
+# elerob_gpio.hal - Robot power/switch/GPIO wiring
+# GPIO is loaded via POSTGUI_HALFILE in elerob_mpc.ini (original config path).
+# This file stays empty to avoid double-loading when elephantmonitor runs halcmd -f.
