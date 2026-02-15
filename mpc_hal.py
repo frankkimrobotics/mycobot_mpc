@@ -73,7 +73,7 @@ def mpc_solve_qp(q, target_angles, q_vel=None, prev_q=None, dt=None):
     next_pos = current + u_opt
     # Velocity = position increment / dt (deg/s)
     if dt is not None and dt > 0:
-        vel_cmd = u_opt / dt * 0.1
+        vel_cmd = u_opt / dt * 0.5
     else:
         vel_cmd = np.zeros(MAX_JOINTS)
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]

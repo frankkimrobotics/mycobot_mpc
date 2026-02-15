@@ -18,7 +18,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+FIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
 NUM_JOINTS = 6
+
+
+def _save_fig(fig, name):
+    """Save figure to figures/ directory as PNG and PDF."""
+    os.makedirs(FIG_DIR, exist_ok=True)
+    from datetime import datetime
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(FIG_DIR, f"{name}_{stamp}.png")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    print(f"  Saved: {path}")
 
 
 def load_csv(filepath):
@@ -125,6 +136,7 @@ def main():
         plot_trajectory(df, label, ax_pos, ax_vel, ax_err)
 
     fig_traj.tight_layout(rect=[0, 0, 1, 0.97])
+    _save_fig(fig_traj, "trajectories")
 
     # --- Figure 2: Timing bar charts ---
     cols = min(n, 4)
@@ -144,6 +156,7 @@ def main():
         axes_bar[r, c].set_visible(False)
 
     fig_bar.tight_layout(rect=[0, 0, 1, 0.95])
+    _save_fig(fig_bar, "timing_bars")
 
     # --- Figure 3: Timing comparison across runs (if multiple) ---
     if n > 1:
@@ -170,6 +183,7 @@ def main():
         ax_cmp.legend()
         ax_cmp.grid(True, axis="y", alpha=0.3)
         fig_cmp.tight_layout(rect=[0, 0, 1, 0.95])
+        _save_fig(fig_cmp, "timing_comparison")
 
     plt.show()
 
