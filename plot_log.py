@@ -48,35 +48,39 @@ def load_csv(filepath):
     return df
 
 
-def plot_trajectory(df, title, axes_pos, axes_vel, ax_err):
-    """Plot joint position and velocity trajectories for one run."""
-    t = df["elapsed_s"]
+def plot_merged_trajectories(dfs, labels, fig, axes):
+    """Plot all runs merged: position error (target - actual) and velocity per joint."""
+    ax_pos, ax_vel = axes
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(dfs), 10)))
 
-    # Joint positions + targets
-    for j in range(NUM_JOINTS):
-        axes_pos.plot(t, df[f"q{j}"], label=f"q{j}", linewidth=1)
-        axes_pos.axhline(
-            y=df[f"target{j}"].iloc[0], color=f"C{j}",
-            linestyle="--", alpha=0.4, linewidth=0.8,
-        )
-    axes_pos.set_ylabel("Joint angle (deg)")
-    axes_pos.set_title(title, fontsize=10)
-    axes_pos.legend(fontsize=7, ncol=3, loc="upper right")
-    axes_pos.grid(True, alpha=0.3)
+    for i, (df, label) in enumerate(zip(dfs, labels)):
+        t = df["elapsed_s"]
+        clr = colors[i % len(colors)]
 
-    # Joint velocities
-    for j in range(NUM_JOINTS):
-        axes_vel.plot(t, df[f"qvel{j}"], label=f"qvel{j}", linewidth=1)
-    axes_vel.set_ylabel("Joint velocity (deg/s)")
-    axes_vel.set_xlabel("Time (s)")
-    axes_vel.legend(fontsize=7, ncol=3, loc="upper right")
-    axes_vel.grid(True, alpha=0.3)
+        # Position error per joint → compute norm of (target - q) per timestep
+        pos_err = np.zeros(len(df))
+        for j in range(NUM_JOINTS):
+            pos_err += (df[f"target{j}"] - df[f"q{j}"]) ** 2
+        pos_err = np.sqrt(pos_err)
+        ax_pos.plot(t, pos_err, color=clr, linewidth=1, alpha=0.8, label=label)
 
-    # Error norm
-    ax_err.plot(t, df["err_norm"], color="red", linewidth=1)
-    ax_err.set_ylabel("Error norm (deg)")
-    ax_err.set_xlabel("Time (s)")
-    ax_err.grid(True, alpha=0.3)
+        # Velocity norm per timestep
+        vel_norm = np.zeros(len(df))
+        for j in range(NUM_JOINTS):
+            vel_norm += df[f"qvel{j}"] ** 2
+        vel_norm = np.sqrt(vel_norm)
+        ax_vel.plot(t, vel_norm, color=clr, linewidth=1, alpha=0.8, label=label)
+
+    ax_pos.set_ylabel("Position error norm (deg)")
+    ax_pos.set_title("Position Error (‖target − actual‖) — all runs")
+    ax_pos.legend(fontsize=6, ncol=2, loc="upper right")
+    ax_pos.grid(True, alpha=0.3)
+
+    ax_vel.set_ylabel("Velocity norm (deg/s)")
+    ax_vel.set_xlabel("Time (s)")
+    ax_vel.set_title("Velocity Norm (‖q_vel‖) — all runs")
+    ax_vel.legend(fontsize=6, ncol=2, loc="upper right")
+    ax_vel.grid(True, alpha=0.3)
 
 
 def plot_timing_bar(df, title, ax):
@@ -122,40 +126,24 @@ def main():
 
     print(f"Plotting {len(csv_files)} log file(s)...")
 
-    # --- Figure 1: Trajectories ---
+    # Load all CSVs
     n = len(csv_files)
-    fig_traj, axes = plt.subplots(n * 3, 1, figsize=(12, 4 * n), squeeze=False)
-    fig_traj.suptitle("MPC Joint Trajectories", fontsize=13, fontweight="bold")
+    dfs = [load_csv(fp) for fp in csv_files]
+    run_labels = [os.path.basename(fp).replace("mpc_", "").replace(".csv", "") for fp in csv_files]
 
-    for i, fp in enumerate(csv_files):
-        df = load_csv(fp)
-        label = os.path.basename(fp).replace(".csv", "")
-        ax_pos = axes[i * 3, 0]
-        ax_vel = axes[i * 3 + 1, 0]
-        ax_err = axes[i * 3 + 2, 0]
-        plot_trajectory(df, label, ax_pos, ax_vel, ax_err)
-
-    fig_traj.tight_layout(rect=[0, 0, 1, 0.97])
+    # --- Figure 1: Merged trajectories (pos error + vel norm) ---
+    fig_traj, axes_traj = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig_traj.suptitle("MPC Trajectories — All Runs", fontsize=13, fontweight="bold")
+    plot_merged_trajectories(dfs, run_labels, fig_traj, axes_traj)
+    fig_traj.tight_layout(rect=[0, 0, 1, 0.96])
     _save_fig(fig_traj, "trajectories")
 
-    # --- Figure 2: Timing bar charts ---
-    cols = min(n, 4)
-    rows = (n + cols - 1) // cols
-    fig_bar, axes_bar = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows), squeeze=False)
-    fig_bar.suptitle("Average Processing Time per Step", fontsize=13, fontweight="bold")
-
-    for i, fp in enumerate(csv_files):
-        df = load_csv(fp)
-        label = os.path.basename(fp).replace(".csv", "")
-        r, c = divmod(i, cols)
-        plot_timing_bar(df, label, axes_bar[r, c])
-
-    # Hide unused subplots
-    for i in range(n, rows * cols):
-        r, c = divmod(i, cols)
-        axes_bar[r, c].set_visible(False)
-
-    fig_bar.tight_layout(rect=[0, 0, 1, 0.95])
+    # --- Figure 2: Timing bar chart (averaged across all runs) ---
+    fig_bar, ax_bar = plt.subplots(figsize=(6, 4))
+    fig_bar.suptitle("Average Processing Time per Step (all runs)", fontsize=13, fontweight="bold")
+    all_df = pd.concat(dfs, ignore_index=True)
+    plot_timing_bar(all_df, f"{n} runs combined", ax_bar)
+    fig_bar.tight_layout(rect=[0, 0, 1, 0.93])
     _save_fig(fig_bar, "timing_bars")
 
     # --- Figure 3: Timing comparison across runs (if multiple) ---
@@ -170,14 +158,10 @@ def main():
         width = 0.18
 
         for j, (step, lbl, clr) in enumerate(zip(steps, labels, colors)):
-            means = []
-            for fp in csv_files:
-                df = load_csv(fp)
-                means.append(df[step].mean())
+            means = [df[step].mean() for df in dfs]
             ax_cmp.bar(x + j * width, means, width, label=lbl, color=clr, edgecolor="black", linewidth=0.5)
 
         ax_cmp.set_xticks(x + width * 1.5)
-        run_labels = [os.path.basename(fp).replace("mpc_", "").replace(".csv", "") for fp in csv_files]
         ax_cmp.set_xticklabels(run_labels, rotation=45, ha="right", fontsize=8)
         ax_cmp.set_ylabel("Time (ms)")
         ax_cmp.legend()
