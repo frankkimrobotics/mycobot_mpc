@@ -279,6 +279,40 @@ def power_on_robot():
     return True
 
 
+def power_off_robot():
+    """Power off robot: disable MPC, set ESTOP, power off motors via CAN."""
+    print("Powering off robot...")
+
+    # Disable MPC so PIDs stop driving motors
+    _halcmd_set("mpc.enable", 0)
+    time.sleep(0.1)
+
+    # Power off motors via CAN
+    _halcmd_set("pro600.poweron", 0)
+    time.sleep(1)
+
+    # Verify power off
+    for i in range(10):
+        powered = _halcmd_get_bool("pro600.svr_poweroned")
+        print(f"  Power-off check {i+1}/10: svr_poweroned={powered}")
+        if not powered:
+            break
+        time.sleep(0.5)
+
+    # Put LinuxCNC into ESTOP
+    try:
+        c = linuxcnc.command()
+        c.state(linuxcnc.STATE_ESTOP)
+        time.sleep(0.5)
+    except Exception as e:
+        print(f"  ESTOP command failed: {e}")
+
+    s = linuxcnc.stat()
+    s.poll()
+    print(f"  Final state: task_state={s.task_state}, svr_poweroned={_halcmd_get_bool('pro600.svr_poweroned')}")
+    print("  Robot powered off.")
+
+
 def wait_for_stable_feedback(settle_time=3.0, check_interval=0.5):
     """Wait for pro600 encoder feedback to stabilize after motor init.
 
@@ -465,7 +499,9 @@ def main():
         # run_mpc_loop(h, s, current, duration_sec=10.0)
     except KeyboardInterrupt:
         print("\nInterrupted.")
+    finally:
         h["enable"] = False
+        power_off_robot()
 
     print("Done.")
     sys.exit(0)
