@@ -405,13 +405,13 @@ def main():
     s.poll()
     current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
     init = [-90,-90,0,-90,0,0]
-    target = [a + 5.0 for a in current]
+    target = [a + 15.0 for a in current]
     print("Current angles:", current)
     print("Target (current + 5° each):", target)
 
     # Run (Ctrl+C to stop)
     try:
-        run_mpc_loop(h, s, init, duration_sec=10.0)
+        run_mpc_loop(h, s, target, duration_sec=10.0)
         # run_mpc_loop(h, s, target, duration_sec=10.0)
         # run_mpc_loop(h, s, current, duration_sec=10.0)
     except KeyboardInterrupt:
