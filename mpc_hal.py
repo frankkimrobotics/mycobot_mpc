@@ -27,8 +27,8 @@ except ImportError as e:
 MAX_JOINTS = 6
 MPC_PERIOD_MS = 2   # 100 Hz - HAL write is fast
 U_MAX_PER_STEP = 5.0
-KP = 0.99
-KD = 0.01
+KP = 0.5
+KD = 0.1
 
 # Logging
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
