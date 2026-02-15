@@ -27,7 +27,7 @@ except ImportError as e:
 MAX_JOINTS = 6
 MPC_PERIOD_MS = 2   # 100 Hz - HAL write is fast
 U_MAX_PER_STEP = 5.0
-KP = 0.5
+KP = 0.3
 KD = 0.1
 
 # Logging
@@ -73,7 +73,7 @@ def mpc_solve_qp(q, target_angles, q_vel=None, prev_q=None, dt=None):
     next_pos = current + u_opt
     # Velocity = position increment / dt (deg/s)
     if dt is not None and dt > 0:
-        vel_cmd = u_opt / dt
+        vel_cmd = u_opt / dt * 0.1
     else:
         vel_cmd = np.zeros(MAX_JOINTS)
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
