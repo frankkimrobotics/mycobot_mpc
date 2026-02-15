@@ -144,29 +144,6 @@ def main():
     fig_bar.tight_layout(rect=[0, 0, 1, 0.93])
     _save_fig(fig_bar, "timing_bars")
 
-    # --- Figure 3: Timing comparison across runs (if multiple) ---
-    if n > 1:
-        fig_cmp, ax_cmp = plt.subplots(figsize=(max(8, n * 1.5), 5))
-        fig_cmp.suptitle("Timing Comparison Across Runs", fontsize=13, fontweight="bold")
-
-        steps = ["poll_ms", "pd_solve_ms", "hal_write_ms", "sleep_ms"]
-        labels = ["Poll", "PD Solve", "HAL Write", "Sleep"]
-        colors = ["#4C72B0", "#55A868", "#C44E52", "#8172B2"]
-        x = np.arange(n)
-        width = 0.18
-
-        for j, (step, lbl, clr) in enumerate(zip(steps, labels, colors)):
-            means = [df[step].mean() for df in dfs]
-            ax_cmp.bar(x + j * width, means, width, label=lbl, color=clr, edgecolor="black", linewidth=0.5)
-
-        ax_cmp.set_xticks(x + width * 1.5)
-        ax_cmp.set_xticklabels(run_labels, rotation=45, ha="right", fontsize=8)
-        ax_cmp.set_ylabel("Time (ms)")
-        ax_cmp.legend()
-        ax_cmp.grid(True, axis="y", alpha=0.3)
-        fig_cmp.tight_layout(rect=[0, 0, 1, 0.95])
-        _save_fig(fig_cmp, "timing_comparison")
-
     plt.show()
 
 
