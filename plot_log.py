@@ -49,37 +49,37 @@ def load_csv(filepath):
 
 
 def plot_merged_trajectories(dfs, axes):
-    """Plot all runs merged: position error (target - actual) and velocity per joint."""
-    ax_pos, ax_vel = axes
-    cmap = plt.colormaps["tab10"]
-    colors = [cmap(i / max(len(dfs), 10)) for i in range(len(dfs))]
+    """Plot all runs merged: signed per-joint position error and cmd velocity.
 
-    for i, df in enumerate(dfs):
-        t = df["elapsed_s"]
-        clr = colors[i % len(colors)]
+    axes: (2, NUM_JOINTS) array — row 0 = position error, row 1 = velocity.
+    """
+    joint_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
-        # Position error per joint → compute norm of (target - q) per timestep
-        pos_err = np.zeros(len(df))
-        for j in range(NUM_JOINTS):
-            pos_err += (df[f"target{j}"] - df[f"q{j}"]) ** 2
-        pos_err = np.sqrt(pos_err)
-        ax_pos.plot(t, pos_err, color=clr, linewidth=1, alpha=0.8)
+    for j in range(NUM_JOINTS):
+        ax_pos = axes[0, j]
+        ax_vel = axes[1, j]
 
-        # Commanded velocity norm per timestep
-        vel_norm = np.zeros(len(df))
-        for j in range(NUM_JOINTS):
-            vel_norm += df[f"cmd_vel{j}"] ** 2
-        vel_norm = np.sqrt(vel_norm)
-        ax_vel.plot(t, vel_norm, color=clr, linewidth=1, alpha=0.8)
+        for i, df in enumerate(dfs):
+            t = df["elapsed_s"]
+            alpha = max(0.3, 1.0 - i * 0.05)
 
-    ax_pos.set_ylabel("Position error norm (deg)")
-    ax_pos.set_title("Position Error (‖target − actual‖) — all runs")
-    ax_pos.grid(True, alpha=0.3)
+            pos_err = df[f"target{j}"] - df[f"q{j}"]
+            ax_pos.plot(t, pos_err, color=joint_colors[j], linewidth=0.8, alpha=alpha)
 
-    ax_vel.set_ylabel("Cmd velocity norm (deg/s)")
-    ax_vel.set_xlabel("Time (s)")
-    ax_vel.set_title("Commanded Velocity Norm (‖vel_cmd‖) — all runs")
-    ax_vel.grid(True, alpha=0.3)
+            vel_err = df[f"cmd_vel{j}"] - df[f"qvel{j}"]
+            ax_vel.plot(t, vel_err, color=joint_colors[j], linewidth=0.8, alpha=alpha)
+
+        ax_pos.axhline(y=0, color="k", linewidth=0.5, alpha=0.5)
+        ax_pos.set_title(f"J{j}", fontsize=10)
+        ax_pos.grid(True, alpha=0.3)
+        if j == 0:
+            ax_pos.set_ylabel("Pos error (deg)")
+
+        ax_vel.axhline(y=0, color="k", linewidth=0.5, alpha=0.5)
+        ax_vel.set_xlabel("Time (s)")
+        ax_vel.grid(True, alpha=0.3)
+        if j == 0:
+            ax_vel.set_ylabel("Vel error (deg/s)")
 
 
 def plot_timing_bar(df, title, ax):
@@ -130,11 +130,11 @@ def main():
     dfs = [load_csv(fp) for fp in csv_files]
     run_labels = [os.path.basename(fp).replace("mpc_", "").replace(".csv", "") for fp in csv_files]
 
-    # --- Figure 1: Merged trajectories (pos error + vel norm) ---
-    fig_traj, axes_traj = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
-    fig_traj.suptitle("MPC Trajectories — All Runs", fontsize=13, fontweight="bold")
+    # --- Figure 1: Per-joint trajectories (2 rows x 6 cols) ---
+    fig_traj, axes_traj = plt.subplots(2, NUM_JOINTS, figsize=(18, 6), sharex=True)
+    fig_traj.suptitle("MPC Trajectories — All Runs (top: pos error, bottom: vel error)", fontsize=13, fontweight="bold")
     plot_merged_trajectories(dfs, axes_traj)
-    fig_traj.tight_layout(rect=[0, 0, 1, 0.96])
+    fig_traj.tight_layout(rect=[0, 0, 1, 0.94])
     _save_fig(fig_traj, "trajectories")
 
     # --- Figure 2: Timing bar chart (averaged across all runs) ---
