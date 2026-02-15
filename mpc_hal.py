@@ -508,8 +508,8 @@ def main():
     # Run (Ctrl+C to stop)
     try:
         init = [-90, -90, 0, -90, 0, 0]
-        for i in range(5):
-            target = [a + np.random.uniform(-5, 15) for a in init]
+        for i in range(100):
+            target = [a + np.random.uniform(-15, 15) for a in init]
             print(f"\n=== Run {i+1}/5: target={[round(t,1) for t in target]} ===")
             
             run_mpc_loop(h, s, target, duration_sec=5.0)
