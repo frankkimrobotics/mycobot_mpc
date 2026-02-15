@@ -6,3 +6,11 @@ Existing python api has slow communication (>20ms) and not responding while the 
 
 - By directly using the HAL, communication between the STM32 <==> Raspi becomes around 2.1 ms (safely use 3ms)
 - But if computing MPC or trajectory optimization in a separate computed, this can be increased
+
+
+Connect to the raspi via SSH with pi@10.0.0.27
+
+
+In raspi, run the command with 
+
+"linuxcnc /home/pi/Desktop/mpc/config/elerob_mpc.ini"
