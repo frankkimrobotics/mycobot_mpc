@@ -62,24 +62,22 @@ def plot_merged_trajectories(dfs, labels, fig, axes):
         for j in range(NUM_JOINTS):
             pos_err += (df[f"target{j}"] - df[f"q{j}"]) ** 2
         pos_err = np.sqrt(pos_err)
-        ax_pos.plot(t, pos_err, color=clr, linewidth=1, alpha=0.8, label=label)
+        ax_pos.plot(t, pos_err, color=clr, linewidth=1, alpha=0.8)
 
         # Velocity norm per timestep
         vel_norm = np.zeros(len(df))
         for j in range(NUM_JOINTS):
             vel_norm += df[f"qvel{j}"] ** 2
         vel_norm = np.sqrt(vel_norm)
-        ax_vel.plot(t, vel_norm, color=clr, linewidth=1, alpha=0.8, label=label)
+        ax_vel.plot(t, vel_norm, color=clr, linewidth=1, alpha=0.8)
 
     ax_pos.set_ylabel("Position error norm (deg)")
     ax_pos.set_title("Position Error (‖target − actual‖) — all runs")
-    ax_pos.legend(fontsize=6, ncol=2, loc="upper right")
     ax_pos.grid(True, alpha=0.3)
 
     ax_vel.set_ylabel("Velocity norm (deg/s)")
     ax_vel.set_xlabel("Time (s)")
     ax_vel.set_title("Velocity Norm (‖q_vel‖) — all runs")
-    ax_vel.legend(fontsize=6, ncol=2, loc="upper right")
     ax_vel.grid(True, alpha=0.3)
 
 
