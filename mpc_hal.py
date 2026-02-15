@@ -9,6 +9,8 @@ Requires HAL setup: load mpc component and wire mpc.jointN_pos_cmd to pid.N.comm
 
 import time
 import sys
+import csv
+import os
 from datetime import datetime
 from functools import wraps
 import numpy as np
@@ -27,6 +29,9 @@ MPC_PERIOD_MS = 2   # 100 Hz - HAL write is fast
 U_MAX_PER_STEP = 5.0
 KP = 0.99
 KD = 0.01
+
+# Logging
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 # Timing
 _timing = {"poll": [], "pd_solve": [], "hal_write": [], "sleep": []}
@@ -110,6 +115,30 @@ def _print_timing_summary(loop_count):
     print(f"  [timing] poll={poll_ms:.2f}ms pd_solve={solve_ms:.2f}ms hal_write={hal_ms:.2f}ms sleep={sleep_ms:.2f}ms total={total_ms:.2f}ms")
 
 
+def _save_log(log_rows, target_angles):
+    """Write collected log rows to a timestamped CSV file."""
+    if not log_rows:
+        return
+    os.makedirs(LOG_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_str = "_".join(str(int(a)) for a in target_angles)
+    filename = os.path.join(LOG_DIR, f"mpc_{stamp}_t{target_str}.csv")
+    header = (
+        ["timestamp", "loop"]
+        + [f"q{i}" for i in range(MAX_JOINTS)]
+        + [f"qvel{i}" for i in range(MAX_JOINTS)]
+        + [f"target{i}" for i in range(MAX_JOINTS)]
+        + [f"cmd_pos{i}" for i in range(MAX_JOINTS)]
+        + [f"cmd_vel{i}" for i in range(MAX_JOINTS)]
+        + ["err_norm", "poll_ms", "pd_solve_ms", "hal_write_ms", "sleep_ms"]
+    )
+    with open(filename, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(log_rows)
+    print(f"  Log saved: {filename} ({len(log_rows)} rows)")
+
+
 def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
     """Run MPC loop: poll -> PD solve -> HAL write."""
     print("MPC HAL loop starting. Target:", target_angles)
@@ -124,6 +153,9 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
     t_prev = None
     for k in _timing:
         _timing[k] = []
+
+    # Log buffer: collect rows in memory, flush to CSV after loop
+    log_rows = []
 
     while (time.time() - t_start) < duration_sec:
         t_loop_start = time.time()
@@ -152,6 +184,17 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
 
         loop_count += 1
         err = sum((t - a) ** 2 for t, a in zip(target_angles, q)) ** 0.5
+
+        # Collect log row (no file I/O in the control loop)
+        vel_list = q_vel if q_vel else [0.0] * MAX_JOINTS
+        log_rows.append([
+            t_status, loop_count,
+            *q, *vel_list, *target_angles, *next_pos, *vel_cmd,
+            err,
+            _timing["poll"][-1], _timing["pd_solve"][-1],
+            _timing["hal_write"][-1], _timing["sleep"][-1],
+        ])
+
         if loop_count % 10 == 0 or loop_count <= 3:
             vel_str = f" q_vel={[round(v, 3) for v in q_vel[:3]]}" if q_vel else ""
             vcmd_str = f" vcmd={[round(v, 1) for v in vel_cmd[:3]]}"
@@ -162,8 +205,10 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
     print(f"\nDone. Ran {loop_count} MPC iterations.")
     _print_timing_summary(loop_count)
 
+    # Flush log to CSV
+    _save_log(log_rows, target_angles)
 
-import os
+
 import subprocess
 
 
@@ -411,11 +456,11 @@ def main():
 
     # Run (Ctrl+C to stop)
     try:
-        for i in range(10):
+        for i in range(1):
             init = [-90,-90,0,-90,0,0]
             target = [a + 5.0 for a in init]
             run_mpc_loop(h, s, init, duration_sec=10.0)
-            run_mpc_loop(h, s, target, duration_sec=10.0)
+            # run_mpc_loop(h, s, target, duration_sec=10.0)
         # run_mpc_loop(h, s, target, duration_sec=10.0)
         # run_mpc_loop(h, s, current, duration_sec=10.0)
     except KeyboardInterrupt:
