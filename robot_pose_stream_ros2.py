@@ -37,6 +37,36 @@ JOINT_NAMES = [f"joint{i+1}" for i in range(MAX_JOINTS)]
 # Default home pose in degrees (matches mpc_hal.py init)
 HOME_DEG = [-90.0, -90.0, 0.0, -90.0, 0.0, 0.0]
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Joint calibration: LinuxCNC → URDF mapping
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  urdf_angle = JOINT_SIGNS[i] * (linuxcnc_angle + JOINT_OFFSETS_DEG[i])
+#
+#  CALIBRATION PROCEDURE:
+#    1. Power on robot, let it home (all joints report ~0° in LinuxCNC)
+#    2. Run server + client, observe rviz2 vs physical robot
+#    3. For each joint that looks wrong:
+#       - If the joint moves the OPPOSITE direction in rviz2 → flip sign: -1
+#       - If the joint has a constant angular offset → add offset in degrees
+#    4. Update the arrays below and re-run
+#
+#  QUICK TEST: manually jog one joint at a time on the robot and watch rviz2:
+#    - Joint moves same direction in rviz2? → sign is correct (+1)
+#    - Joint moves opposite direction?       → flip to -1
+#    - Joint resting position offset?        → adjust JOINT_OFFSETS_DEG
+#
+#  URDF axis directions (from mycobot_pro_630.urdf):
+#    joint1: axis z=+1    joint2: axis z=-1    joint3: axis z=-1
+#    joint4: axis z=-1    joint5: axis z=+1    joint6: axis x=-1
+#
+#  LinuxCNC encoder scale signs (from elerob_mpc.hal):
+#    joint0: +    joint1: +    joint2: -
+#    joint3: -    joint4: -    joint5: -
+
+JOINT_SIGNS       = [+1, +1, +1, +1, +1, +1]  # per-joint sign: +1 or -1
+JOINT_OFFSETS_DEG = [0.0, 90.0, 0.0, 90.0, 0.0, 0.0]  # per-joint offset (degrees)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Server mode — runs on the robot controller (LinuxCNC machine)
@@ -289,8 +319,11 @@ def run_client(host: str, port: int, reconnect: bool = True):
                     if joints_deg is None or len(joints_deg) != MAX_JOINTS:
                         continue
 
-                    # Convert degrees → radians for ROS2 URDF
-                    joints_rad = [math.radians(d) for d in joints_deg]
+                    # Apply calibration: sign flip + offset, then deg → rad
+                    joints_rad = [
+                        math.radians(JOINT_SIGNS[i] * (d + JOINT_OFFSETS_DEG[i]))
+                        for i, d in enumerate(joints_deg)
+                    ]
 
                     # Build and publish JointState
                     js = JointState()
