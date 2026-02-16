@@ -30,6 +30,12 @@ U_MAX_PER_STEP = 5.0
 KP = 0.3
 KD = 0.1
 
+# MPC parameters
+MPC_HORIZON = 20    # prediction horizon (N steps)
+MPC_Q = 10.0        # state cost weight (tracking error)
+MPC_R = 0.1         # control effort weight
+MPC_Q_TERMINAL = 50.0  # terminal state cost weight
+
 # Suction pump
 SUCTION_PIN = "pro600.digital_out00"  # HAL pin for suction pump
 
@@ -37,7 +43,7 @@ SUCTION_PIN = "pro600.digital_out00"  # HAL pin for suction pump
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 # Timing
-_timing = {"poll": [], "pd_solve": [], "hal_write": [], "sleep": []}
+_timing = {"poll": [], "pd_solve": [], "mpc_solve": [], "hal_write": [], "sleep": []}
 
 
 def timed(step_name):
@@ -54,7 +60,7 @@ def timed(step_name):
 
 
 @timed("pd_solve")
-def mpc_solve_qp(q, target_angles, q_vel=None, prev_q=None, dt=None):
+def pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
     """PD controller returning (next_pos, vel_cmd).
 
     u = Kp * e - Kd * q_vel, clipped to ±U_MAX_PER_STEP.
@@ -80,6 +86,228 @@ def mpc_solve_qp(q, target_angles, q_vel=None, prev_q=None, dt=None):
     else:
         vel_cmd = np.zeros(MAX_JOINTS)
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
+
+
+# ── MPC (QP-based) solver ────────────────────────────────────────────────────
+# Uses OSQP for real-time QP solving (~0.1ms per solve on Pi).
+# Formulation per joint (independent, solved in batch):
+#   Plant:  x(k+1) = x(k) + u(k)       (single integrator, position += step)
+#   Cost:   sum_{k=0}^{N-1} [ Q * (x(k) - x_ref)^2 + R * u(k)^2 ]
+#           + Q_terminal * (x(N) - x_ref)^2
+#   Constraints: -U_MAX <= u(k) <= U_MAX  for all k
+#
+# Decision variable: u = [u(0), u(1), ..., u(N-1)]  per joint
+# State is eliminated: x(k) = x(0) + sum_{i=0}^{k-1} u(i)
+
+try:
+    import osqp
+    from scipy import sparse
+    _HAS_OSQP = True
+except ImportError:
+    _HAS_OSQP = False
+
+
+def _build_mpc_qp(N, Q, R, Q_term, u_max):
+    """Pre-build QP matrices for a single-joint MPC (reused across solves).
+
+    Returns (P, A, l_template, u_template, solver_settings) that only need
+    q-vector update per solve (depends on current state and target).
+    """
+    # State propagation: x(k) = x0 + sum_{i<k} u(i)
+    # So x(k) - x_ref = (x0 - x_ref) + sum_{i<k} u(i)
+    # Let e0 = x0 - x_ref (scalar, updated each solve)
+    #
+    # Cost = sum_{k=1}^{N} Q_k * (e0 + sum_{i<k} u(i))^2 + sum_{k=0}^{N-1} R * u(k)^2
+    # where Q_k = Q for k<N, Q_term for k=N
+    #
+    # Expanding: quadratic in u → P matrix, linear in u → q vector (depends on e0)
+
+    # Build cumulative sum matrix S: S[k,i] = 1 if i < k+1 (for k=0..N-1 representing x(1)..x(N))
+    S = np.tril(np.ones((N, N)))  # S[k,i] = 1 for i <= k
+
+    # Weight vector for states x(1)..x(N)
+    w = np.full(N, Q)
+    w[-1] = Q_term
+
+    W = np.diag(w)
+
+    # P = S^T W S + R * I  (Hessian, N x N)
+    P = S.T @ W @ S + R * np.eye(N)
+    P = sparse.csc_matrix(P)
+
+    # q = S^T W @ ones * e0  → q_vec = (S^T @ w) * e0 (computed per solve)
+    q_coeffs = S.T @ w  # N-vector, multiply by e0 each solve
+
+    # Constraints: -u_max <= u(k) <= u_max
+    A = sparse.eye(N, format="csc")
+    l_bound = np.full(N, -u_max)
+    u_bound = np.full(N, u_max)
+
+    return P, A, l_bound, u_bound, q_coeffs
+
+
+class MPCSolver:
+    """Pre-compiled OSQP solver for single-integrator MPC, one per joint.
+
+    Warm-starts between solves for speed.
+    """
+
+    def __init__(self, N=MPC_HORIZON, Q=MPC_Q, R=MPC_R, Q_term=MPC_Q_TERMINAL,
+                 u_max=U_MAX_PER_STEP):
+        self.N = N
+        self.q_coeffs = None
+        self.solvers = []  # one OSQP instance per joint
+
+        if not _HAS_OSQP:
+            raise ImportError("osqp not installed. Run: pip install osqp")
+
+        P, A, l_bound, u_bound, self.q_coeffs = _build_mpc_qp(N, Q, R, Q_term, u_max)
+
+        # Create one solver per joint (same structure, different q vector each solve)
+        for _ in range(MAX_JOINTS):
+            solver = osqp.OSQP()
+            solver.setup(P, np.zeros(N), A, l_bound, u_bound,
+                         warm_start=True, verbose=False,
+                         eps_abs=1e-4, eps_rel=1e-4,
+                         max_iter=200, polish=False)
+            self.solvers.append(solver)
+
+    def solve(self, q_current, target, dt):
+        """Solve MPC for all joints. Returns (next_pos, vel_cmd) lists."""
+        next_pos = []
+        vel_cmd = []
+        for j in range(MAX_JOINTS):
+            e0 = q_current[j] - target[j]
+            q_vec = self.q_coeffs * e0  # linear cost term
+
+            self.solvers[j].update(q=q_vec)
+            result = self.solvers[j].solve()
+
+            if result.info.status == "solved" or result.info.status == "solved_inaccurate":
+                u0 = result.x[0]
+            else:
+                # Fallback: simple proportional step
+                u0 = np.clip(-KP * e0, -U_MAX_PER_STEP, U_MAX_PER_STEP)
+
+            u0 = float(u0)
+            next_pos.append(q_current[j] + u0)
+            vel_cmd.append(u0 / dt if dt > 0 else 0.0)
+
+        return next_pos, vel_cmd
+
+
+# Global MPC solver instance (lazy init)
+_mpc_solver = None
+
+
+@timed("mpc_solve")
+def mpc_solve(q, target_angles, dt):
+    """Solve MPC QP for all joints. Returns (next_pos, vel_cmd).
+
+    Uses OSQP with warm-starting. Falls back to PD if OSQP unavailable.
+    """
+    global _mpc_solver
+    if _mpc_solver is None:
+        _mpc_solver = MPCSolver()
+    if dt is None or dt <= 0:
+        dt = MPC_PERIOD_MS / 1000.0
+    return _mpc_solver.solve(q, target_angles, dt)
+
+
+def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
+                     pos_tol=0.5, vel_tol=1.0, settle_steps=50):
+    """Run MPC control loop: poll -> QP solve (N-step horizon) -> HAL write.
+
+    Uses OSQP to solve a QP over MPC_HORIZON steps per iteration,
+    applies only the first control action (receding horizon).
+
+    Early-stops when position error norm < pos_tol (deg) AND velocity norm
+    < vel_tol (deg/s) for settle_steps consecutive iterations.
+    """
+    print("MPC control loop starting. Target:", target_angles)
+    print(f"  Horizon={MPC_HORIZON}, Q={MPC_Q}, R={MPC_R}, Q_term={MPC_Q_TERMINAL}")
+    print(f"  Early stop: pos_tol={pos_tol}°, vel_tol={vel_tol}°/s, settle={settle_steps} steps")
+    print("Press Ctrl+C to stop.\n")
+
+    # Enable MPC override
+    h["enable"] = True
+
+    t_start = time.time()
+    loop_count = 0
+    converged_count = 0
+    prev_current = None
+    t_prev = None
+    for k in _timing:
+        _timing[k] = []
+
+    # Log buffer
+    log_rows = []
+
+    while (time.time() - t_start) < duration_sec:
+        t_loop_start = time.time()
+        dt = (t_loop_start - t_prev) if t_prev is not None else None
+        t_prev = t_loop_start
+
+        # 1. Poll feedback
+        q, q_vel, t_status = _poll_feedback(s)
+
+        # 2. MPC solve (N-step QP, apply first action)
+        next_pos, vel_cmd = mpc_solve(q, target_angles,
+                                      dt if dt else MPC_PERIOD_MS / 1000.0)
+        # Estimate velocity for logging (before overwriting prev_current)
+        if prev_current is not None and dt is not None and dt > 0:
+            est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
+        else:
+            est_vel = [0.0] * MAX_JOINTS
+        prev_current = q.copy()
+
+        # 3. HAL write
+        t_cmd = _write_hal_cmd(h, next_pos, vel_cmd)
+
+        # 4. Sleep
+        elapsed = time.time() - t_loop_start
+        sleep_time = MPC_PERIOD_MS / 1000.0 - elapsed
+        if sleep_time > 0:
+            t0 = time.perf_counter()
+            time.sleep(sleep_time)
+            _timing["sleep"].append((time.perf_counter() - t0) * 1000)
+        else:
+            _timing["sleep"].append(0.0)
+
+        loop_count += 1
+        err = sum((t - a) ** 2 for t, a in zip(target_angles, q)) ** 0.5
+        vel_norm = sum(v ** 2 for v in vel_cmd) ** 0.5
+
+        # Early stop
+        if err < pos_tol and vel_norm < vel_tol:
+            converged_count += 1
+            if converged_count >= settle_steps:
+                print(f"  Converged at loop {loop_count}: err={err:.3f}° vel_norm={vel_norm:.3f}°/s")
+                break
+        else:
+            converged_count = 0
+
+        # Collect log row
+        log_rows.append([
+            t_status, loop_count,
+            *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            err,
+            _timing["poll"][-1], _timing["mpc_solve"][-1],
+            _timing["hal_write"][-1], _timing["sleep"][-1],
+        ])
+
+        if loop_count % 10 == 0 or loop_count <= 3:
+            vel_str = f" q_vel={[round(v, 3) for v in q_vel[:3]]}" if q_vel else ""
+            vcmd_str = f" vcmd={[round(v, 1) for v in vel_cmd[:3]]}"
+            print(f"Loop {loop_count}: status_recv={t_status} hal_write={t_cmd} q={q[:3]}... err={err:.3f}{vel_str}{vcmd_str}")
+            if _timing["mpc_solve"]:
+                n = len(_timing["mpc_solve"])
+                avg_ms = sum(_timing["mpc_solve"][-n:]) / n
+                print(f"  [timing] mpc_solve={avg_ms:.2f}ms")
+
+    h["enable"] = False
+    print(f"\nDone. Ran {loop_count} MPC iterations.")
+    _save_log(log_rows, target_angles)
 
 
 @timed("poll")
@@ -142,7 +370,7 @@ def _save_log(log_rows, target_angles):
     print(f"  Log saved: {filename} ({len(log_rows)} rows)")
 
 
-def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
+def pd_control_loop(h, s, target_angles, duration_sec=10.0,
                  pos_tol=0.5, vel_tol=1.0, settle_steps=50):
     """Run MPC loop: poll -> PD solve -> HAL write.
 
@@ -177,7 +405,7 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
 
         # 2. PD solve → (position, velocity)
         # q_vel from LinuxCNC is ~0 (motion planner bypassed), use prev_q estimation instead
-        next_pos, vel_cmd = mpc_solve_qp(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
+        next_pos, vel_cmd = pd_solve(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
         # Estimate velocity for logging (before overwriting prev_current)
         if prev_current is not None and dt is not None and dt > 0:
             est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
@@ -538,8 +766,8 @@ def main():
             target = [a + np.random.uniform(-20, 20) for a in init]
             print(f"\n=== Run {i+1}/5: target={[round(t,1) for t in target]} ===")
             
-            run_mpc_loop(h, s, target, duration_sec=3.0)
-            run_mpc_loop(h, s, init, duration_sec=3.0)
+            pd_control_loop(h, s, target, duration_sec=3.0)
+            pd_control_loop(h, s, init, duration_sec=3.0)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
