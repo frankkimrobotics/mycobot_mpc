@@ -23,13 +23,163 @@ Usage:
 """
 
 import argparse
+import csv
 import json
+import os
+import signal
 import socket
+import subprocess
 import sys
 import time
+from datetime import datetime
 import numpy as np
 
 from ik_pyroki import MyCobotIK, HOME_LINUXCNC_DEG
+
+MAX_JOINTS = 6
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+
+class PipelineTimer:
+    """Hierarchical stopwatch for measuring pipeline stages."""
+
+    def __init__(self):
+        self._timings: dict[str, float] = {}
+        self._starts: dict[str, float] = {}
+
+    def start(self, name: str):
+        self._starts[name] = time.perf_counter()
+
+    def stop(self, name: str) -> float:
+        """Stop timer and return elapsed milliseconds."""
+        elapsed_ms = (time.perf_counter() - self._starts.pop(name)) * 1000
+        self._timings[name] = elapsed_ms
+        return elapsed_ms
+
+    def get(self, name: str, default: float = 0.0) -> float:
+        return self._timings.get(name, default)
+
+    def as_dict(self) -> dict[str, float]:
+        return {k: round(v, 3) for k, v in self._timings.items()}
+
+    def summary(self) -> str:
+        parts = [f"{k}={v:.1f}ms" for k, v in self._timings.items()]
+        return " | ".join(parts)
+
+    def reset(self):
+        self._timings.clear()
+        self._starts.clear()
+
+
+class MoveLogger:
+    """Accumulates per-move timing data and writes to CSV."""
+
+    HEADER = [
+        "timestamp", "move_id", "target_type", "controller",
+        # Desktop-side timing (ms)
+        "ik_solve_ms", "fk_verify_ms", "cmd_send_ms", "ack_rtt_ms",
+        "wait_done_ms", "total_ms",
+        # Robot-side timing (from status message)
+        "robot_exec_ms", "robot_n_loops",
+        "robot_avg_poll_ms", "robot_avg_solve_ms",
+        "robot_avg_hal_write_ms", "robot_avg_sleep_ms",
+        # Accuracy
+        "pos_error_mm", "joint_error_deg",
+    ] + [f"target_j{i}" for i in range(MAX_JOINTS)] \
+      + [f"solved_j{i}" for i in range(MAX_JOINTS)] \
+      + [f"final_j{i}" for i in range(MAX_JOINTS)]
+
+    def __init__(self):
+        self._rows: list[list] = []
+        self._move_id = 0
+
+    def log_move(
+        self,
+        timer: PipelineTimer,
+        target_type: str,
+        controller: str,
+        target_deg: list[float],
+        solved_deg: list[float] | None,
+        final_status: dict,
+        pos_error_mm: float = 0.0,
+    ):
+        self._move_id += 1
+        final_deg = final_status.get("current_deg", [0.0] * MAX_JOINTS)
+        joint_err = final_status.get("error_norm", 0.0)
+
+        row = [
+            datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            self._move_id,
+            target_type,
+            controller,
+            # Desktop timings
+            round(timer.get("ik_solve"), 3),
+            round(timer.get("fk_verify"), 3),
+            round(timer.get("cmd_send"), 3),
+            round(timer.get("ack_rtt"), 3),
+            round(timer.get("wait_done"), 3),
+            round(timer.get("total"), 3),
+            # Robot timings (from done status)
+            final_status.get("robot_exec_ms", 0.0),
+            final_status.get("n_loops", 0),
+            final_status.get("avg_poll_ms", 0.0),
+            final_status.get("avg_solve_ms", 0.0),
+            final_status.get("avg_hal_write_ms", 0.0),
+            final_status.get("avg_sleep_ms", 0.0),
+            # Accuracy
+            round(pos_error_mm, 3),
+            round(joint_err, 3),
+        ]
+        row += [round(v, 4) for v in target_deg]
+        row += [round(v, 4) for v in (solved_deg or [0.0] * MAX_JOINTS)]
+        row += [round(v, 4) for v in final_deg]
+        self._rows.append(row)
+
+    def save(self, tag: str = ""):
+        if not self._rows:
+            return None
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"control_{tag}_{stamp}.csv" if tag else f"control_{stamp}.csv"
+        path = os.path.join(LOG_DIR, name)
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.HEADER)
+            writer.writerows(self._rows)
+        print(f"[log] Saved {len(self._rows)} moves → {path}")
+        return path
+
+
+# Path to the streaming script (same directory as this file)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_STREAM_SCRIPT = os.path.join(_THIS_DIR, "robot_pose_stream_ros2.py")
+
+
+def launch_rviz_streamer(host: str, stream_port: int = 9999) -> subprocess.Popen:
+    """Launch robot_pose_stream_ros2.py in a subprocess with the ROS2 conda env.
+
+    This starts rviz2 + the streaming client that subscribes to the robot's
+    joint angle stream and publishes to /joint_states for rviz2 visualization.
+    """
+    shell_cmd = (
+        "source ~/miniconda3/etc/profile.d/conda.sh && "
+        "conda activate ros_env && "
+        "source $CONDA_PREFIX/setup.zsh && "
+        "source ~/ros2_ws/install/setup.zsh && "
+        f"python3 {_STREAM_SCRIPT} --host {host} --port {stream_port}"
+    )
+    print(f"[rviz2] Launching rviz2 + streaming client...")
+    proc = subprocess.Popen(
+        shell_cmd,
+        shell=True,
+        executable="/bin/zsh",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
+    )
+    print(f"[rviz2] Started (PID {proc.pid}), waiting for rviz2 to initialize...")
+    time.sleep(5.0)
+    return proc
 
 
 class RobotConnection:
@@ -148,6 +298,8 @@ def move_to_joints(
     target_deg: np.ndarray,
     duration: float = 5.0,
     controller: str = "pd",
+    timer: PipelineTimer | None = None,
+    logger: MoveLogger | None = None,
 ) -> dict:
     """Send joint angle target and wait for completion.
 
@@ -156,12 +308,45 @@ def move_to_joints(
         target_deg: 6 joint angles in LinuxCNC degrees
         duration: Max duration for the move
         controller: "pd" or "mpc"
+        timer: Optional PipelineTimer (will be created if None)
+        logger: Optional MoveLogger to record the move
 
     Returns:
         Final status dict from robot
     """
-    conn.send_target(list(target_deg), duration=duration, controller=controller)
-    return conn.wait_for_done(timeout=duration + 5.0)
+    if timer is None:
+        timer = PipelineTimer()
+
+    timer.start("total")
+    timer.start("cmd_send")
+    timer.start("ack_rtt")
+    ack = conn.send_target(list(target_deg), duration=duration, controller=controller)
+    timer.stop("ack_rtt")
+    timer.stop("cmd_send")
+
+    timer.start("wait_done")
+    status = conn.wait_for_done(timeout=duration + 5.0)
+    timer.stop("wait_done")
+    timer.stop("total")
+
+    # Fill in zero for stages that didn't apply
+    for key in ("ik_solve", "fk_verify"):
+        if key not in timer.as_dict():
+            timer._timings[key] = 0.0
+
+    print(f"[timer] {timer.summary()}")
+
+    if logger:
+        logger.log_move(
+            timer=timer,
+            target_type="joints",
+            controller=controller,
+            target_deg=list(target_deg),
+            solved_deg=None,
+            final_status=status,
+        )
+
+    return status
 
 
 def move_to_pose(
@@ -171,6 +356,7 @@ def move_to_pose(
     t: np.ndarray,
     duration: float = 5.0,
     controller: str = "pd",
+    logger: MoveLogger | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Solve IK for (R, t) and move the robot there.
 
@@ -181,28 +367,68 @@ def move_to_pose(
         t: (3,) translation vector for eef (meters)
         duration: Max duration for the move
         controller: "pd" or "mpc"
+        logger: Optional MoveLogger to record the move
 
     Returns:
         (solved_joints_deg, final_status)
     """
-    t0 = time.time()
+    timer = PipelineTimer()
+
+    # IK solve
+    timer.start("ik_solve")
     joints_deg = ik.solve(R=R, t=t)
-    solve_ms = (time.time() - t0) * 1000
-    print(f"[ik] Solved in {solve_ms:.1f}ms → {[round(v, 1) for v in joints_deg]} deg")
+    timer.stop("ik_solve")
+    print(f"[ik] Solved in {timer.get('ik_solve'):.1f}ms → {[round(v, 1) for v in joints_deg]} deg")
 
-    # Verify FK matches target
+    # FK verification
+    timer.start("fk_verify")
     _, t_check = ik.forward_kinematics(joints_deg)
+    timer.stop("fk_verify")
     pos_err = np.linalg.norm(t - t_check)
+    pos_err_mm = pos_err * 1000
     if pos_err > 0.01:
-        print(f"[ik] WARNING: FK verification error = {pos_err*1000:.2f}mm (>10mm)")
+        print(f"[ik] WARNING: FK verification error = {pos_err_mm:.2f}mm (>10mm)")
 
-    status = move_to_joints(conn, joints_deg, duration=duration, controller=controller)
+    # Send + wait (timer passed through to measure cmd_send, ack_rtt, wait_done, total)
+    timer.start("total")
+    timer.start("cmd_send")
+    timer.start("ack_rtt")
+    conn.send_target(list(joints_deg), duration=duration, controller=controller)
+    timer.stop("ack_rtt")
+    timer.stop("cmd_send")
+
+    timer.start("wait_done")
+    status = conn.wait_for_done(timeout=duration + 5.0)
+    timer.stop("wait_done")
+    timer.stop("total")
+
+    # Add IK + FK time to total
+    timer._timings["total"] += timer.get("ik_solve") + timer.get("fk_verify")
+
+    print(f"[timer] {timer.summary()}")
+
+    if logger:
+        logger.log_move(
+            timer=timer,
+            target_type="pose",
+            controller=controller,
+            target_deg=list(joints_deg),
+            solved_deg=list(joints_deg),
+            final_status=status,
+            pos_error_mm=pos_err_mm,
+        )
+
     return joints_deg, status
 
 
-def interactive_mode(conn: RobotConnection, ik: MyCobotIK, controller: str, duration: float):
+def interactive_mode(
+    conn: RobotConnection,
+    ik: MyCobotIK,
+    controller: str,
+    duration: float,
+    logger: MoveLogger | None = None,
+):
     """Interactive control loop: enter poses from the terminal."""
-    # Get home orientation for Cartesian commands
     R_home, _ = ik.forward_kinematics(HOME_LINUXCNC_DEG)
 
     print("\n" + "=" * 60)
@@ -211,8 +437,11 @@ def interactive_mode(conn: RobotConnection, ik: MyCobotIK, controller: str, dura
     print("  joints <j1> ... <j6>   - Move to joint angles (LinuxCNC degrees)")
     print("  home                   - Move to home pose")
     print("  fk                     - Print current eef pose (from last known joints)")
+    print("  timing                 - Print last move timing breakdown")
     print("  quit                   - Exit")
     print("=" * 60)
+
+    last_timer: PipelineTimer | None = None
 
     while True:
         try:
@@ -234,35 +463,53 @@ def interactive_mode(conn: RobotConnection, ik: MyCobotIK, controller: str, dura
             elif cmd == "home":
                 print(f"Moving to home: {HOME_LINUXCNC_DEG}")
                 move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
-                               duration=duration, controller=controller)
+                               duration=duration, controller=controller,
+                               logger=logger)
 
             elif cmd == "xyz" and len(parts) == 4:
                 x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
                 t_target = np.array([x, y, z])
                 print(f"Target position: {t_target.tolist()} m (home orientation)")
                 move_to_pose(conn, ik, R_home, t_target,
-                             duration=duration, controller=controller)
+                             duration=duration, controller=controller,
+                             logger=logger)
 
             elif cmd == "joints" and len(parts) == 7:
                 joints = [float(v) for v in parts[1:7]]
                 print(f"Target joints: {joints} deg")
                 move_to_joints(conn, np.array(joints),
-                               duration=duration, controller=controller)
+                               duration=duration, controller=controller,
+                               logger=logger)
 
             elif cmd == "fk":
+                timer = PipelineTimer()
+                timer.start("fk")
                 status = conn.get_status()
                 current = status.get("current_deg")
                 if current:
                     R, t_vec = ik.forward_kinematics(current)
+                    timer.stop("fk")
                     print(f"  Joints (LinuxCNC): {[round(v, 1) for v in current]} deg")
                     print(f"  EEF position:      {np.round(t_vec, 4).tolist()} m")
                     print(f"  EEF rotation:\n{np.round(R, 4)}")
+                    print(f"  FK compute: {timer.get('fk'):.2f}ms")
                 else:
                     print("  No status available from robot.")
 
+            elif cmd == "timing":
+                if logger and logger._rows:
+                    last = logger._rows[-1]
+                    header = MoveLogger.HEADER
+                    print("  Last move timing:")
+                    for i, h in enumerate(header):
+                        if h.endswith("_ms") or h.endswith("_mm") or h in ("move_id", "target_type", "controller", "robot_n_loops", "joint_error_deg"):
+                            print(f"    {h:>25s} = {last[i]}")
+                else:
+                    print("  No moves recorded yet.")
+
             else:
                 print(f"  Unknown command: {line}")
-                print("  Try: xyz 0.3 0.0 0.5 | joints -80 -85 5 -85 5 5 | home | fk | quit")
+                print("  Try: xyz 0.3 0.0 0.5 | joints -80 -85 5 -85 5 5 | home | fk | timing | quit")
 
         except (ValueError, OSError) as e:
             print(f"  Error: {e}")
@@ -284,10 +531,14 @@ Examples:
         help="Robot controller IP (e.g., 10.0.0.27)")
     parser.add_argument("--cmd-port", type=int, default=9998,
         help="Robot command port (default: 9998)")
+    parser.add_argument("--stream-port", type=int, default=9999,
+        help="Robot streaming port for rviz2 (default: 9999)")
     parser.add_argument("--controller", choices=["pd", "mpc"], default="pd",
         help="Controller type (default: pd)")
     parser.add_argument("--duration", type=float, default=5.0,
         help="Move duration in seconds (default: 5.0)")
+    parser.add_argument("--no-rviz", action="store_true",
+        help="Don't launch rviz2 (use if it's already running)")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--xyz", nargs=3, type=float, metavar=("X", "Y", "Z"),
@@ -302,9 +553,34 @@ Examples:
 
     args = parser.parse_args()
 
-    # Initialize IK solver
+    rviz_proc = None
+
+    def cleanup(signum=None, frame=None):
+        """Clean shutdown: kill rviz2 subprocess on exit."""
+        if rviz_proc and rviz_proc.poll() is None:
+            print("\n[rviz2] Shutting down...")
+            try:
+                os.killpg(os.getpgid(rviz_proc.pid), signal.SIGTERM)
+                rviz_proc.wait(timeout=5)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(os.getpgid(rviz_proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    # Launch rviz2 + streaming client (before IK init, so rviz2 loads in parallel)
+    if not args.no_rviz:
+        rviz_proc = launch_rviz_streamer(args.host, args.stream_port)
+
+    # Initialize IK solver (JIT warmup happens here, ~2s)
     print("Initializing IK solver...")
+    t_ik_init = time.perf_counter()
     ik = MyCobotIK()
+    ik_init_ms = (time.perf_counter() - t_ik_init) * 1000
+    print(f"IK solver ready ({ik_init_ms:.0f}ms)")
+
+    # Per-session move logger
+    logger = MoveLogger()
 
     # Connect to robot
     conn = RobotConnection(host=args.host, cmd_port=args.cmd_port)
@@ -313,35 +589,42 @@ Examples:
     except (ConnectionRefusedError, socket.timeout, OSError) as e:
         print(f"ERROR: Cannot connect to robot at {args.host}:{args.cmd_port}: {e}")
         print("Make sure mpc_hal.py is running on the robot (via linuxcnc elerob_mpc.ini).")
+        cleanup()
         sys.exit(1)
 
     try:
         if args.interactive:
-            interactive_mode(conn, ik, controller=args.controller, duration=args.duration)
+            interactive_mode(conn, ik, controller=args.controller,
+                             duration=args.duration, logger=logger)
 
         elif args.home:
             print(f"Moving to home: {HOME_LINUXCNC_DEG}")
             move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
-                           duration=args.duration, controller=args.controller)
+                           duration=args.duration, controller=args.controller,
+                           logger=logger)
 
         elif args.xyz:
             R_home, _ = ik.forward_kinematics(HOME_LINUXCNC_DEG)
             t_target = np.array(args.xyz)
             print(f"Target position: {t_target.tolist()} m")
             move_to_pose(conn, ik, R_home, t_target,
-                         duration=args.duration, controller=args.controller)
+                         duration=args.duration, controller=args.controller,
+                         logger=logger)
 
         elif args.joints:
             target_deg = np.array(args.joints)
             print(f"Target joints: {target_deg.tolist()} deg")
             move_to_joints(conn, target_deg,
-                           duration=args.duration, controller=args.controller)
+                           duration=args.duration, controller=args.controller,
+                           logger=logger)
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
+        logger.save(tag=args.controller)
         conn.close()
-        print("Connection closed.")
+        cleanup()
+        print("Done.")
 
 
 if __name__ == "__main__":

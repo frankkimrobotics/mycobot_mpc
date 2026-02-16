@@ -903,13 +903,15 @@ def start_command_server(port: int = CMD_PORT):
     return t
 
 
-def _update_cmd_status(state, current_deg, target_deg, error_norm):
+def _update_cmd_status(state, current_deg, target_deg, error_norm, **extra):
     """Update shared status dict (thread-safe)."""
     with _cmd_status_lock:
         _cmd_status["state"] = state
         _cmd_status["current_deg"] = [round(v, 3) for v in current_deg]
         _cmd_status["target_deg"] = [round(v, 3) for v in target_deg]
         _cmd_status["error_norm"] = round(error_norm, 4)
+        for k, v in extra.items():
+            _cmd_status[k] = v
 
 
 def main():
@@ -994,6 +996,8 @@ def main():
             duration = cmd.get("duration", 5.0)
             controller = cmd.get("controller", "pd")
 
+            t_cmd_start = time.perf_counter()
+
             s.poll()
             current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
             err = sum((t - c) ** 2 for t, c in zip(target, current)) ** 0.5
@@ -1007,12 +1011,32 @@ def main():
             else:
                 pd_control_loop(h, s, target, duration_sec=duration)
 
+            robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
+
             s.poll()
             final = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
             final_err = sum((t - f) ** 2 for t, f in zip(target, final)) ** 0.5
-            _update_cmd_status("done", final, target, final_err)
 
-            print(f"[cmd] Done. Final error: {final_err:.3f}°")
+            # Compute per-loop timing averages for this command
+            n_loops = len(_timing["poll"]) if _timing["poll"] else 1
+            avg_poll = sum(_timing["poll"][-n_loops:]) / n_loops if _timing["poll"] else 0
+            solve_key = "mpc_solve" if controller == "mpc" else "pd_solve"
+            avg_solve = sum(_timing[solve_key][-n_loops:]) / n_loops if _timing[solve_key] else 0
+            avg_hal = sum(_timing["hal_write"][-n_loops:]) / n_loops if _timing["hal_write"] else 0
+            avg_sleep = sum(_timing["sleep"][-n_loops:]) / n_loops if _timing["sleep"] else 0
+
+            _update_cmd_status(
+                "done", final, target, final_err,
+                robot_exec_ms=round(robot_exec_ms, 2),
+                n_loops=n_loops,
+                avg_poll_ms=round(avg_poll, 3),
+                avg_solve_ms=round(avg_solve, 3),
+                avg_hal_write_ms=round(avg_hal, 3),
+                avg_sleep_ms=round(avg_sleep, 3),
+            )
+
+            print(f"[cmd] Done. exec={robot_exec_ms:.0f}ms loops={n_loops} err={final_err:.3f}°"
+                  f" [avg poll={avg_poll:.2f} solve={avg_solve:.2f} hal={avg_hal:.2f} sleep={avg_sleep:.2f} ms]")
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
