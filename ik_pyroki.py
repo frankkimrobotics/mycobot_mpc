@@ -16,13 +16,49 @@ Usage:
     python3 ik_pyroki.py --target-linuxcnc -80 -85 5 -85 5 5
 """
 
+import importlib.util
 import math
 import os
 import time
 from typing import Optional  # noqa: F401 – used in type hints
 
-# Force JAX to use CPU (Apple Metal GPU has incomplete support)
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
+# ── JAX backend selection ──────────────────────────────────────────────────
+# Must be set BEFORE importing JAX (backend initializes on import).
+#
+# Override:   JAX_PLATFORMS=METAL python3 ...    (force Metal — needs compatible plugin)
+#             JAX_PLATFORMS=cpu   python3 ...    (force CPU)
+#
+# Auto-detection logic (runs only when JAX_PLATFORMS is not set):
+#   1. Check if a Metal GPU plugin is installed and likely compatible
+#   2. If yes, try Metal; if no (or broken), fall back to CPU
+#
+# Compatibility (as of Feb 2026):
+#   - jax-metal 0.1.1:    requires jaxlib ~0.4.x (fails on JAX 0.6+ with
+#                          "UNIMPLEMENTED: default_memory_space")
+#   - jax-metallib 0.9.1: requires JAX 0.9.x + Python 3.11+
+#   When a compatible Metal/GPU plugin is installed, this will auto-detect it.
+
+if "JAX_PLATFORMS" not in os.environ:
+    _use_gpu = False
+
+    # Check for jax-metallib (JAX 0.9.x — registers as 'mps')
+    if importlib.util.find_spec("jax_plugins.silicon") is not None:
+        _use_gpu = True
+        os.environ["JAX_PLATFORMS"] = "mps"
+
+    # Check for jax-metal (Apple official — registers as 'METAL')
+    # Only usable with jaxlib < 0.5 due to API changes
+    elif importlib.util.find_spec("jax_plugins.metal") is not None:
+        try:
+            from importlib.metadata import version as _pkg_version
+            _jaxlib_ver = tuple(int(x) for x in _pkg_version("jaxlib").split(".")[:2])
+            if _jaxlib_ver < (0, 5):
+                _use_gpu = True  # jax-metal should work with jaxlib 0.4.x
+        except Exception:
+            pass
+
+    if not _use_gpu:
+        os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +68,8 @@ import jaxls
 import numpy as np
 import pyroki as pk
 import yourdfpy
+
+_JAX_BACKEND = jax.default_backend()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Calibration: LinuxCNC ↔ URDF joint angle mapping
@@ -311,6 +349,7 @@ class MyCobotIK:
     """
 
     def __init__(self, urdf_path: str = DEFAULT_URDF_PATH):
+        print(f"[MyCobotIK] JAX backend: {_JAX_BACKEND}  (devices: {jax.devices()})")
         print(f"[MyCobotIK] Loading URDF: {urdf_path}")
         self.urdf = _load_urdf(urdf_path)
         self.robot = pk.Robot.from_urdf(
