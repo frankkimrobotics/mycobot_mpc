@@ -13,7 +13,8 @@ loadrt mux_generic config="ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2"
 #motor update
 loadrt hal_ele_master600
 loadrt collidet_panda
-loadusr -Wn mpc python /home/pi/Desktop/mpc/mpc_hal.py
+# Add --suction to enable suction pump during operation
+loadusr -Wn mpc python /home/pi/Desktop/mpc/mpc_hal.py --suction
 
 # add motion controller functions to servo thread
 addf motion-command-handler servo-thread

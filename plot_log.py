@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""
+Visualize MPC log CSV files.
+
+Usage:
+    python plot_log.py                          # plot all CSVs in logs/
+    python plot_log.py logs/mpc_20260215_*.csv  # plot specific files
+    python plot_log.py --latest                 # plot only the most recent file
+    python plot_log.py --latest 3               # plot the 3 most recent files
+"""
+
+import sys
+import os
+import glob
+import argparse
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+FIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
+NUM_JOINTS = 6
+
+
+def _save_fig(fig, name):
+    """Save figure to figures/ directory as PNG and PDF."""
+    os.makedirs(FIG_DIR, exist_ok=True)
+    from datetime import datetime
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(FIG_DIR, f"{name}_{stamp}.png")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    print(f"  Saved: {path}")
+
+
+def load_csv(filepath):
+    """Load a log CSV and add an elapsed-time column (seconds from start)."""
+    df = pd.read_csv(filepath)
+    # Convert timestamp string (HH:MM:SS.mmm) to elapsed seconds
+    t0_parts = df["timestamp"].iloc[0].split(":")
+    t0_sec = int(t0_parts[0]) * 3600 + int(t0_parts[1]) * 60 + float(t0_parts[2])
+
+    def to_elapsed(ts):
+        p = ts.split(":")
+        sec = int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2])
+        return sec - t0_sec
+
+    df["elapsed_s"] = df["timestamp"].apply(to_elapsed)
+    return df
+
+
+def plot_merged_trajectories(dfs, axes):
+    """Plot all runs merged: signed per-joint position error and cmd velocity.
+
+    axes: (2, NUM_JOINTS) array — row 0 = position error, row 1 = velocity.
+    """
+    joint_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+
+    for j in range(NUM_JOINTS):
+        ax_pos = axes[0, j]
+        ax_vel = axes[1, j]
+
+        for i, df in enumerate(dfs):
+            t = df["elapsed_s"]
+            alpha = max(0.3, 1.0 - i * 0.05)
+
+            pos_err = df[f"target{j}"] - df[f"q{j}"]
+            ax_pos.plot(t, pos_err, color=joint_colors[j], linewidth=0.8, alpha=alpha)
+
+            vel_err = df[f"cmd_vel{j}"] - df[f"qvel{j}"]
+            ax_vel.plot(t, vel_err, color=joint_colors[j], linewidth=0.8, alpha=alpha)
+
+        ax_pos.axhline(y=0, color="k", linewidth=0.5, alpha=0.5)
+        ax_pos.set_title(f"J{j}", fontsize=10)
+        ax_pos.grid(True, alpha=0.3)
+        if j == 0:
+            ax_pos.set_ylabel("Pos error (deg)")
+
+        ax_vel.axhline(y=0, color="k", linewidth=0.5, alpha=0.5)
+        ax_vel.set_xlabel("Time (s)")
+        ax_vel.grid(True, alpha=0.3)
+        if j == 0:
+            ax_vel.set_ylabel("Vel error (deg/s)")
+
+
+def plot_timing_bar(df, title, ax):
+    """Bar chart of average processing time per step for one run."""
+    steps = ["poll_ms", "pd_solve_ms", "hal_write_ms", "sleep_ms"]
+    labels = ["Poll", "PD Solve", "HAL Write", "Sleep"]
+    means = [df[s].mean() for s in steps]
+    stds = [df[s].std() for s in steps]
+    colors = ["#4C72B0", "#55A868", "#C44E52", "#8172B2"]
+
+    bars = ax.bar(labels, means, yerr=stds, color=colors, capsize=4, edgecolor="black", linewidth=0.5)
+    ax.set_ylabel("Time (ms)")
+    ax.set_title(title, fontsize=10)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    # Annotate bar values
+    for bar, mean in zip(bars, means):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+            f"{mean:.3f}", ha="center", va="bottom", fontsize=8,
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize MPC log CSVs")
+    parser.add_argument("files", nargs="*", help="CSV file paths (default: all in logs/)")
+    parser.add_argument("--latest", nargs="?", const=1, type=int, metavar="N",
+                        help="Plot only the N most recent log files (default: 1)")
+    args = parser.parse_args()
+
+    # Resolve file list
+    if args.files:
+        csv_files = args.files
+    else:
+        csv_files = sorted(glob.glob(os.path.join(LOG_DIR, "mpc_*.csv")))
+
+    if not csv_files:
+        print(f"No CSV files found in {LOG_DIR}")
+        sys.exit(1)
+
+    if args.latest is not None:
+        csv_files = csv_files[-args.latest:]
+
+    print(f"Plotting {len(csv_files)} log file(s)...")
+
+    # Load all CSVs
+    n = len(csv_files)
+    dfs = [load_csv(fp) for fp in csv_files]
+    run_labels = [os.path.basename(fp).replace("mpc_", "").replace(".csv", "") for fp in csv_files]
+
+    # --- Figure 1: Per-joint trajectories (2 rows x 6 cols) ---
+    fig_traj, axes_traj = plt.subplots(2, NUM_JOINTS, figsize=(18, 6), sharex=True)
+    fig_traj.suptitle("MPC Trajectories — All Runs (top: pos error, bottom: vel error)", fontsize=13, fontweight="bold")
+    plot_merged_trajectories(dfs, axes_traj)
+    fig_traj.tight_layout(rect=[0, 0, 1, 0.94])
+    _save_fig(fig_traj, "trajectories")
+
+    # --- Figure 2: Timing bar chart (averaged across all runs) ---
+    fig_bar, ax_bar = plt.subplots(figsize=(6, 4))
+    fig_bar.suptitle("Average Processing Time per Step (all runs)", fontsize=13, fontweight="bold")
+    all_df = pd.concat(dfs, ignore_index=True)
+    plot_timing_bar(all_df, f"{n} runs combined", ax_bar)
+    fig_bar.tight_layout(rect=[0, 0, 1, 0.93])
+    _save_fig(fig_bar, "timing_bars")
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()

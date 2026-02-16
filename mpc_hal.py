@@ -9,6 +9,8 @@ Requires HAL setup: load mpc component and wire mpc.jointN_pos_cmd to pid.N.comm
 
 import time
 import sys
+import csv
+import os
 from datetime import datetime
 from functools import wraps
 import numpy as np
@@ -25,8 +27,14 @@ except ImportError as e:
 MAX_JOINTS = 6
 MPC_PERIOD_MS = 2   # 100 Hz - HAL write is fast
 U_MAX_PER_STEP = 5.0
-KP = 0.99
-KD = 0.01
+KP = 0.3
+KD = 0.1
+
+# Suction pump
+SUCTION_PIN = "pro600.digital_out00"  # HAL pin for suction pump
+
+# Logging
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 # Timing
 _timing = {"poll": [], "pd_solve": [], "hal_write": [], "sleep": []}
@@ -68,7 +76,7 @@ def mpc_solve_qp(q, target_angles, q_vel=None, prev_q=None, dt=None):
     next_pos = current + u_opt
     # Velocity = position increment / dt (deg/s)
     if dt is not None and dt > 0:
-        vel_cmd = u_opt / dt
+        vel_cmd = u_opt / dt * 0.5
     else:
         vel_cmd = np.zeros(MAX_JOINTS)
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
@@ -110,9 +118,39 @@ def _print_timing_summary(loop_count):
     print(f"  [timing] poll={poll_ms:.2f}ms pd_solve={solve_ms:.2f}ms hal_write={hal_ms:.2f}ms sleep={sleep_ms:.2f}ms total={total_ms:.2f}ms")
 
 
-def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
-    """Run MPC loop: poll -> PD solve -> HAL write."""
+def _save_log(log_rows, target_angles):
+    """Write collected log rows to a timestamped CSV file."""
+    if not log_rows:
+        return
+    os.makedirs(LOG_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_str = "_".join(str(int(a)) for a in target_angles)
+    filename = os.path.join(LOG_DIR, f"mpc_{stamp}_t{target_str}.csv")
+    header = (
+        ["timestamp", "loop"]
+        + [f"q{i}" for i in range(MAX_JOINTS)]
+        + [f"qvel{i}" for i in range(MAX_JOINTS)]
+        + [f"target{i}" for i in range(MAX_JOINTS)]
+        + [f"cmd_pos{i}" for i in range(MAX_JOINTS)]
+        + [f"cmd_vel{i}" for i in range(MAX_JOINTS)]
+        + ["err_norm", "poll_ms", "pd_solve_ms", "hal_write_ms", "sleep_ms"]
+    )
+    with open(filename, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(log_rows)
+    print(f"  Log saved: {filename} ({len(log_rows)} rows)")
+
+
+def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
+                 pos_tol=0.5, vel_tol=1.0, settle_steps=50):
+    """Run MPC loop: poll -> PD solve -> HAL write.
+
+    Early-stops when position error norm < pos_tol (deg) AND velocity norm
+    < vel_tol (deg/s) for settle_steps consecutive iterations.
+    """
     print("MPC HAL loop starting. Target:", target_angles)
+    print(f"  Early stop: pos_tol={pos_tol}°, vel_tol={vel_tol}°/s, settle={settle_steps} steps")
     print("Press Ctrl+C to stop.\n")
 
     # Enable MPC override
@@ -120,10 +158,14 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
 
     t_start = time.time()
     loop_count = 0
+    converged_count = 0
     prev_current = None
     t_prev = None
     for k in _timing:
         _timing[k] = []
+
+    # Log buffer: collect rows in memory, flush to CSV after loop
+    log_rows = []
 
     while (time.time() - t_start) < duration_sec:
         t_loop_start = time.time()
@@ -134,7 +176,13 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
         q, q_vel, t_status = _poll_feedback(s)
 
         # 2. PD solve → (position, velocity)
-        next_pos, vel_cmd = mpc_solve_qp(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
+        # q_vel from LinuxCNC is ~0 (motion planner bypassed), use prev_q estimation instead
+        next_pos, vel_cmd = mpc_solve_qp(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
+        # Estimate velocity for logging (before overwriting prev_current)
+        if prev_current is not None and dt is not None and dt > 0:
+            est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
+        else:
+            est_vel = [0.0] * MAX_JOINTS
         prev_current = q.copy()
 
         # 3. HAL write — position + velocity
@@ -142,7 +190,8 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
 
         # 4. Sleep
         elapsed = time.time() - t_loop_start
-        sleep_time = MPC_PERIOD_MS / 1000.0 - elapsed
+        # sleep_time = MPC_PERIOD_MS / 1000.0 - elapsed
+        sleep_time = 0.0
         if sleep_time > 0:
             t0 = time.perf_counter()
             time.sleep(sleep_time)
@@ -152,6 +201,26 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
 
         loop_count += 1
         err = sum((t - a) ** 2 for t, a in zip(target_angles, q)) ** 0.5
+        vel_norm = sum(v ** 2 for v in vel_cmd) ** 0.5
+
+        # Early stop: converged if pos error and vel command are both small
+        if err < pos_tol and vel_norm < vel_tol:
+            converged_count += 1
+            if converged_count >= settle_steps:
+                print(f"  Converged at loop {loop_count}: err={err:.3f}° vel_norm={vel_norm:.3f}°/s")
+                break
+        else:
+            converged_count = 0
+
+        # Collect log row (no file I/O in the control loop)
+        log_rows.append([
+            t_status, loop_count,
+            *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            err,
+            _timing["poll"][-1], _timing["pd_solve"][-1],
+            _timing["hal_write"][-1], _timing["sleep"][-1],
+        ])
+
         if loop_count % 10 == 0 or loop_count <= 3:
             vel_str = f" q_vel={[round(v, 3) for v in q_vel[:3]]}" if q_vel else ""
             vcmd_str = f" vcmd={[round(v, 1) for v in vel_cmd[:3]]}"
@@ -162,8 +231,10 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0):
     print(f"\nDone. Ran {loop_count} MPC iterations.")
     _print_timing_summary(loop_count)
 
+    # Flush log to CSV
+    _save_log(log_rows, target_angles)
 
-import os
+
 import subprocess
 
 
@@ -232,6 +303,47 @@ def power_on_robot():
 
     print("  Robot powered on and servos enabled!")
     return True
+
+
+def suction_pump(on=True):
+    """Turn suction pump on or off via HAL GPIO pin."""
+    val = 1 if on else 0
+    print(f"  Suction pump: {'ON' if on else 'OFF'} ({SUCTION_PIN}={val})")
+    _halcmd_set(SUCTION_PIN, val)
+
+
+def power_off_robot():
+    """Power off robot: disable MPC, set ESTOP, power off motors via CAN."""
+    print("Powering off robot...")
+
+    # Disable MPC so PIDs stop driving motors
+    _halcmd_set("mpc.enable", 0)
+    time.sleep(0.1)
+
+    # Power off motors via CAN
+    _halcmd_set("pro600.poweron", 0)
+    time.sleep(1)
+
+    # Verify power off
+    for i in range(10):
+        powered = _halcmd_get_bool("pro600.svr_poweroned")
+        print(f"  Power-off check {i+1}/10: svr_poweroned={powered}")
+        if not powered:
+            break
+        time.sleep(0.5)
+
+    # Put LinuxCNC into ESTOP
+    try:
+        c = linuxcnc.command()
+        c.state(linuxcnc.STATE_ESTOP)
+        time.sleep(0.5)
+    except Exception as e:
+        print(f"  ESTOP command failed: {e}")
+
+    s = linuxcnc.stat()
+    s.poll()
+    print(f"  Final state: task_state={s.task_state}, svr_poweroned={_halcmd_get_bool('pro600.svr_poweroned')}")
+    print("  Robot powered off.")
 
 
 def wait_for_stable_feedback(settle_time=3.0, check_interval=0.5):
@@ -374,6 +486,12 @@ def enable_machine(h, timeout=60.0):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="MPC control for myCobot Pro 630")
+    parser.add_argument("--suction", action="store_true", default=True,
+                        help="Turn on suction pump during operation (default: off)")
+    args = parser.parse_args()
+
     # Create HAL component
     try:
         h = hal.component("mpc")
@@ -405,18 +523,30 @@ def main():
     s.poll()
     current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
     init = [-90,-90,0,-90,0,0]
-    target = [a + 5.0 for a in current]
+    target = [a + 15.0 for a in current]
     print("Current angles:", current)
     print("Target (current + 5° each):", target)
 
+    # Suction pump
+    if args.suction:
+        suction_pump(on=True)
+
     # Run (Ctrl+C to stop)
     try:
-        run_mpc_loop(h, s, init, duration_sec=10.0)
-        # run_mpc_loop(h, s, target, duration_sec=10.0)
-        # run_mpc_loop(h, s, current, duration_sec=10.0)
+        init = [-90, -90, 0, -90, 0, 0]
+        for i in range(10):
+            target = [a + np.random.uniform(-20, 20) for a in init]
+            print(f"\n=== Run {i+1}/5: target={[round(t,1) for t in target]} ===")
+            
+            run_mpc_loop(h, s, target, duration_sec=3.0)
+            run_mpc_loop(h, s, init, duration_sec=3.0)
     except KeyboardInterrupt:
         print("\nInterrupted.")
+    finally:
         h["enable"] = False
+        if args.suction:
+            suction_pump(on=False)
+        power_off_robot()
 
     print("Done.")
     sys.exit(0)
