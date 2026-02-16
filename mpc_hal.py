@@ -10,7 +10,10 @@ Requires HAL setup: load mpc component and wire mpc.jointN_pos_cmd to pid.N.comm
 import time
 import sys
 import csv
+import json
 import os
+import socket
+import threading
 from datetime import datetime
 from functools import wraps
 import numpy as np
@@ -713,11 +716,104 @@ def enable_machine(h, timeout=60.0):
     return True
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Integrated TCP streaming server (runs as background daemon thread)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+STREAM_PORT = 9999
+STREAM_RATE_HZ = 50.0
+
+
+def _stream_server_thread(port: int, rate_hz: float):
+    """Background thread: poll LinuxCNC joint positions and broadcast over TCP.
+
+    Desktop client (robot_pose_stream_ros2.py client) connects here to feed
+    rviz2 with live joint angles. Multiple clients supported.
+    """
+    stat = linuxcnc.stat()
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", port))
+    server_sock.listen(5)
+    print(f"[stream] Listening on 0.0.0.0:{port} at {rate_hz} Hz")
+
+    clients = []
+    clients_lock = threading.Lock()
+
+    def accept_loop():
+        while True:
+            try:
+                conn, addr = server_sock.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                with clients_lock:
+                    clients.append(conn)
+                print(f"[stream] Client connected: {addr} (total: {len(clients)})")
+            except OSError:
+                break
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+
+    period = 1.0 / rate_hz
+    loop_count = 0
+
+    while True:
+        t0 = time.time()
+        try:
+            stat.poll()
+            joints_deg = [round(stat.joint_actual_position[i], 4)
+                          for i in range(MAX_JOINTS)]
+        except (RuntimeError, OSError):
+            time.sleep(1.0)
+            continue
+
+        msg = json.dumps({
+            "joints_deg": joints_deg,
+            "timestamp": time.time(),
+        }) + "\n"
+        msg_bytes = msg.encode("utf-8")
+
+        dead = []
+        with clients_lock:
+            for conn in clients:
+                try:
+                    conn.sendall(msg_bytes)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    dead.append(conn)
+            for conn in dead:
+                clients.remove(conn)
+                conn.close()
+
+        if dead:
+            print(f"[stream] {len(dead)} client(s) disconnected (remaining: {len(clients)})")
+
+        loop_count += 1
+        if loop_count % (int(rate_hz) * 10) == 0:
+            print(f"[stream] loop={loop_count} q={[round(j, 1) for j in joints_deg]} clients={len(clients)}")
+
+        elapsed = time.time() - t0
+        sleep_time = period - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+def start_stream_server(port: int = STREAM_PORT, rate_hz: float = STREAM_RATE_HZ):
+    """Launch the TCP streaming server as a daemon thread (non-blocking)."""
+    t = threading.Thread(target=_stream_server_thread, args=(port, rate_hz), daemon=True)
+    t.start()
+    print(f"[stream] Background streaming server started on port {port}")
+    return t
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MPC control for myCobot Pro 630")
     parser.add_argument("--suction", action="store_true", default=True,
                         help="Turn on suction pump during operation (default: off)")
+    parser.add_argument("--stream-port", type=int, default=STREAM_PORT,
+                        help=f"TCP port for rviz2 streaming server (default: {STREAM_PORT}, 0=disable)")
+    parser.add_argument("--stream-rate", type=float, default=STREAM_RATE_HZ,
+                        help=f"Streaming rate in Hz (default: {STREAM_RATE_HZ})")
     args = parser.parse_args()
 
     # Create HAL component
@@ -732,6 +828,10 @@ def main():
         print(f"HAL component creation failed: {e}")
         print("Ensure LinuxCNC is running and mpc component not already loaded.")
         sys.exit(1)
+
+    # Start integrated streaming server for rviz2 visualization
+    if args.stream_port > 0:
+        start_stream_server(port=args.stream_port, rate_hz=args.stream_rate)
 
     # Initialize pins
     for i in range(MAX_JOINTS):
