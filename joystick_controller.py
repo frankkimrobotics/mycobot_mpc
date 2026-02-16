@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3.10
 """
 Joystick teleoperation for myCobot Pro 630 using a DualShock 4 (PS4) controller.
 
@@ -41,6 +41,12 @@ import socket
 import subprocess
 import sys
 import time
+
+# Prevent conda PYTHONPATH from injecting incompatible packages (e.g. numpy 3.11
+# into python 3.10). Safe to clear because Homebrew python3.10 has all we need.
+if "CONDA_PREFIX" in os.environ:
+    os.environ.pop("PYTHONPATH", None)
+    sys.path[:] = [p for p in sys.path if "conda" not in p and "envs" not in p]
 
 import numpy as np
 
@@ -187,9 +193,28 @@ class RobotStream:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def init_joystick() -> pygame.joystick.JoystickType:
-    """Initialize pygame and find a DualShock 4 controller."""
+    """Initialize pygame and find a DualShock 4 controller.
+
+    macOS requires a display surface for SDL2 to detect Bluetooth controllers,
+    so we create a small status window.
+    """
     pygame.init()
+
+    # macOS Bluetooth controllers require a display surface for SDL2 detection
+    screen = pygame.display.set_mode((420, 120))
+    pygame.display.set_caption("myCobot Joystick Teleop")
+    screen.fill((30, 30, 30))
+    font = pygame.font.SysFont("menlo", 14)
+    screen.blit(font.render("Detecting controller...", True, (200, 200, 200)), (10, 10))
+    pygame.display.flip()
+
+    # Pump events to let SDL2 discover Bluetooth devices
     pygame.joystick.init()
+    for _ in range(30):
+        pygame.event.pump()
+        if pygame.joystick.get_count() > 0:
+            break
+        time.sleep(0.1)
 
     count = pygame.joystick.get_count()
     if count == 0:
@@ -197,6 +222,7 @@ def init_joystick() -> pygame.joystick.JoystickType:
         print("  1. Put DualShock 4 in pairing mode (hold Share + PS until light bar flashes)")
         print("  2. Connect via System Preferences → Bluetooth")
         print("  3. Re-run this script")
+        pygame.quit()
         sys.exit(1)
 
     print(f"[joy] Found {count} joystick(s):")
@@ -210,6 +236,15 @@ def init_joystick() -> pygame.joystick.JoystickType:
             js = j
 
     print(f"[joy] Using: {js.get_name()}")
+
+    # Update window with controller info
+    screen.fill((30, 30, 30))
+    screen.blit(font.render(f"Controller: {js.get_name()}", True, (100, 255, 100)), (10, 10))
+    screen.blit(font.render("L2 + Left Stick = position    D-pad = Z", True, (180, 180, 180)), (10, 35))
+    screen.blit(font.render("R2 + Right Stick = orient     L1/R1 = roll", True, (180, 180, 180)), (10, 55))
+    screen.blit(font.render("X=home  O=speed  tri=pose  sq=quit", True, (180, 180, 180)), (10, 80))
+    pygame.display.flip()
+
     return js
 
 
@@ -292,6 +327,19 @@ def run_teleop(
 
     R_current, t_current = ik.forward_kinematics(current_deg)
     print_eef_pose(ik, current_deg.tolist())
+
+    # ── Warmup IK solver for real-time use ────────────────────────────────
+    # The first solve after __init__ warmup triggers jaxls recompilation (~7s).
+    # Do it here so the teleop loop is never blocked.
+    print("[ik] Priming IK solver for real-time (one-time ~7s)...")
+    t0 = time.perf_counter()
+    ik.solve(R=R_current, t=t_current)
+    prime_ms = (time.perf_counter() - t0) * 1000
+    # Second solve should be fast — verify
+    t0 = time.perf_counter()
+    ik.solve(R=R_current, t=t_current)
+    fast_ms = (time.perf_counter() - t0) * 1000
+    print(f"[ik] Prime: {prime_ms:.0f}ms → subsequent: {fast_ms:.1f}ms  ✓")
 
     # ── Speed state ───────────────────────────────────────────────────────
     speed_idx = SPEED_ORDER.index(initial_speed)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3.10
 """
 Inverse Kinematics solver for myCobot Pro 630 using PyRoKi.
 
@@ -19,8 +19,14 @@ Usage:
 import importlib.util
 import math
 import os
+import sys
 import time
 from typing import Optional  # noqa: F401 – used in type hints
+
+# Prevent conda PYTHONPATH from injecting incompatible packages
+if "CONDA_PREFIX" in os.environ:
+    os.environ.pop("PYTHONPATH", None)
+    sys.path[:] = [p for p in sys.path if "conda" not in p and "envs" not in p]
 
 # ── JAX backend selection ──────────────────────────────────────────────────
 # Must be set BEFORE importing JAX (backend initializes on import).

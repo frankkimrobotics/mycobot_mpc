@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3.10
 """
 Desktop-side robot controller: solve IK for target eef pose, send to robot.
 
@@ -32,6 +32,12 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+
+# Prevent conda PYTHONPATH from injecting incompatible packages
+if "CONDA_PREFIX" in os.environ:
+    os.environ.pop("PYTHONPATH", None)
+    sys.path[:] = [p for p in sys.path if "conda" not in p and "envs" not in p]
+
 import numpy as np
 
 from ik_pyroki import MyCobotIK, HOME_LINUXCNC_DEG
