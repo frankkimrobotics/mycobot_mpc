@@ -30,8 +30,8 @@ except ImportError as e:
 # Constants from myCobot Pro 630
 MAX_JOINTS = 6
 MPC_PERIOD_MS = 2   # 100 Hz - HAL write is fast
-U_MAX_PER_STEP = 5.0
-KP = 0.3
+U_MAX_PER_STEP = 8.0
+KP = 0.5
 KD = 0.1
 
 # MPC parameters
@@ -219,7 +219,7 @@ def mpc_solve(q, target_angles, dt):
 
 
 def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
-                     pos_tol=0.5, vel_tol=1.0, settle_steps=50):
+                     pos_tol=0.5, vel_tol=1.0, settle_steps=10):
     """Run MPC control loop: poll -> QP solve (N-step horizon) -> HAL write.
 
     Uses OSQP to solve a QP over MPC_HORIZON steps per iteration,
@@ -375,7 +375,7 @@ def _save_log(log_rows, target_angles):
 
 
 def pd_control_loop(h, s, target_angles, duration_sec=10.0,
-                 pos_tol=0.5, vel_tol=1.0, settle_steps=50):
+                 pos_tol=0.5, vel_tol=1.0, settle_steps=10):
     """Run MPC loop: poll -> PD solve -> HAL write.
 
     Early-stops when position error norm < pos_tol (deg) AND velocity norm
@@ -870,7 +870,7 @@ def _handle_cmd_client(conn, addr):
             except socket.timeout:
                 pass
 
-            time.sleep(0.1)  # status update rate ~10 Hz
+            time.sleep(0.01)  # status update rate ~100 Hz
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
     finally:
@@ -917,7 +917,7 @@ def _update_cmd_status(state, current_deg, target_deg, error_norm, **extra):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MPC control for myCobot Pro 630")
-    parser.add_argument("--suction", action="store_true", default=True,
+    parser.add_argument("--suction", action="store_true", default=False,
                         help="Turn on suction pump during operation (default: off)")
     parser.add_argument("--stream-port", type=int, default=STREAM_PORT,
                         help=f"TCP port for rviz2 streaming server (default: {STREAM_PORT}, 0=disable)")
@@ -993,8 +993,10 @@ def main():
                 print(f"[cmd] Invalid target: {target}")
                 continue
 
-            duration = cmd.get("duration", 5.0)
+            duration = cmd.get("duration", 2.0)
             controller = cmd.get("controller", "pd")
+            pos_tol = cmd.get("pos_tol", 0.5)
+            settle = cmd.get("settle_steps", 10)
 
             t_cmd_start = time.perf_counter()
 
@@ -1002,14 +1004,17 @@ def main():
             current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
             err = sum((t - c) ** 2 for t, c in zip(target, current)) ** 0.5
             print(f"\n[cmd] Moving: {[round(v, 1) for v in current]} → {[round(v, 1) for v in target]}")
-            print(f"       distance={err:.1f}° duration={duration}s controller={controller}")
+            print(f"       distance={err:.1f}° duration={duration}s controller={controller}"
+                  f" pos_tol={pos_tol}° settle={settle}")
 
             _update_cmd_status("moving", current, target, err)
 
             if controller == "mpc":
-                mpc_control_loop(h, s, target, duration_sec=duration)
+                mpc_control_loop(h, s, target, duration_sec=duration,
+                                 pos_tol=pos_tol, settle_steps=settle)
             else:
-                pd_control_loop(h, s, target, duration_sec=duration)
+                pd_control_loop(h, s, target, duration_sec=duration,
+                                pos_tol=pos_tol, settle_steps=settle)
 
             robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
 

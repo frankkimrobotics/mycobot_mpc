@@ -19,7 +19,7 @@ Usage:
 import math
 import os
 import time
-from typing import Optional
+from typing import Optional  # noqa: F401 – used in type hints
 
 # Force JAX to use CPU (Apple Metal GPU has incomplete support)
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -49,6 +49,17 @@ JOINT_OFFSETS_DEG = [0.0, 90.0, 0.0, 90.0, 0.0, 0.0]
 
 # Home pose in LinuxCNC degrees
 HOME_LINUXCNC_DEG = [-90.0, -90.0, 0.0, -90.0, 0.0, 0.0]
+
+# LinuxCNC per-joint soft limits (degrees) from elerob_mpc.ini [JOINT_N] sections.
+# These can differ from URDF limits because of the calibration offset.
+LINUXCNC_SOFT_LIMITS_DEG = [
+    (-360.0, 360.0),   # Joint 0
+    (-360.0, 360.0),   # Joint 1
+    (-160.0, 160.0),   # Joint 2
+    (-180.0, 180.0),   # Joint 3
+    (-180.0, 180.0),   # Joint 4
+    (-180.0, 180.0),   # Joint 5
+]
 
 # URDF path (relative to this file or absolute)
 DEFAULT_URDF_PATH = os.path.join(
@@ -82,6 +93,95 @@ def urdf_rad_to_linuxcnc_deg(urdf_rad: np.ndarray) -> np.ndarray:
 #  URDF loading helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _apply_effective_joint_limits(robot: pk.Robot,
+                                  margin_deg: float = 1.0) -> None:
+    """Override robot joint limits with the intersection of URDF and LinuxCNC limits.
+
+    The URDF and LinuxCNC controller can have different limits, and the
+    calibration offset (JOINT_OFFSETS_DEG) shifts the mapping between them.
+    The IK solver must respect BOTH, so we compute the tighter envelope.
+
+    A safety margin (default 1°) is applied inward to avoid hitting the
+    exact boundary due to floating-point rounding.
+    """
+    n_act = robot.joints.num_actuated_joints
+    assert n_act == MAX_JOINTS
+
+    margin_rad = math.radians(margin_deg)
+
+    urdf_lower = np.array(robot.joints.lower_limits)
+    urdf_upper = np.array(robot.joints.upper_limits)
+
+    eff_lower = np.copy(urdf_lower)
+    eff_upper = np.copy(urdf_upper)
+
+    for i in range(n_act):
+        lcnc_lo, lcnc_hi = LINUXCNC_SOFT_LIMITS_DEG[i]
+        # Map LinuxCNC limits into URDF space:
+        #   urdf_rad = sign * deg2rad(lcnc_deg + offset)
+        mapped_lo = JOINT_SIGNS[i] * math.radians(lcnc_lo + JOINT_OFFSETS_DEG[i])
+        mapped_hi = JOINT_SIGNS[i] * math.radians(lcnc_hi + JOINT_OFFSETS_DEG[i])
+        if mapped_lo > mapped_hi:
+            mapped_lo, mapped_hi = mapped_hi, mapped_lo
+
+        old_lo, old_hi = eff_lower[i], eff_upper[i]
+        eff_lower[i] = max(float(urdf_lower[i]), mapped_lo + margin_rad)
+        eff_upper[i] = min(float(urdf_upper[i]), mapped_hi - margin_rad)
+
+        if eff_lower[i] != old_lo or eff_upper[i] != old_hi:
+            print(f"  [limits] J{i+1}: URDF [{math.degrees(old_lo):.1f}, {math.degrees(old_hi):.1f}]° "
+                  f"→ effective [{math.degrees(eff_lower[i]):.1f}, {math.degrees(eff_upper[i]):.1f}]° "
+                  f"(LinuxCNC offset {JOINT_OFFSETS_DEG[i]}°, margin {margin_deg}°)")
+
+    # Replace actuated-joint limits
+    new_lower_act = jnp.array(eff_lower, dtype=jnp.float32)
+    new_upper_act = jnp.array(eff_upper, dtype=jnp.float32)
+    object.__setattr__(robot.joints, "lower_limits", new_lower_act)
+    object.__setattr__(robot.joints, "upper_limits", new_upper_act)
+
+    # Replace all-joint limits (includes fixed joints at indices from actuated_indices)
+    new_lower_all = np.array(robot.joints.lower_limits_all)
+    new_upper_all = np.array(robot.joints.upper_limits_all)
+    for j_all in range(robot.joints.num_joints):
+        act_idx = robot.joints.actuated_indices[j_all]
+        if act_idx >= 0:
+            new_lower_all[j_all] = eff_lower[act_idx]
+            new_upper_all[j_all] = eff_upper[act_idx]
+    object.__setattr__(robot.joints, "lower_limits_all",
+                       jnp.array(new_lower_all, dtype=jnp.float32))
+    object.__setattr__(robot.joints, "upper_limits_all",
+                       jnp.array(new_upper_all, dtype=jnp.float32))
+
+
+def _scale_robot_collision(robot_coll: pk.collision.RobotCollision,
+                           scale: float) -> pk.collision.RobotCollision:
+    """Scale collision capsule geometry (e.g. 0.001 to convert mm → m).
+
+    Scales both the capsule dimensions (radius, height) and the pose
+    translation (offset from link frame). Needed because myCobot DAE
+    meshes are authored in millimeters but the URDF uses meters.
+    """
+    old_coll = robot_coll.coll
+    old_pose = old_coll.pose
+
+    # Scale translation while preserving rotation
+    scaled_pose = jaxlie.SE3.from_rotation_and_translation(
+        old_pose.rotation(),
+        old_pose.translation() * scale,
+    )
+    scaled_coll = pk.collision.Capsule(
+        pose=scaled_pose,
+        size=old_coll.size * scale,
+    )
+    return pk.collision.RobotCollision(
+        num_links=robot_coll.num_links,
+        link_names=robot_coll.link_names,
+        coll=scaled_coll,
+        active_idx_i=robot_coll.active_idx_i,
+        active_idx_j=robot_coll.active_idx_j,
+    )
+
+
 def _load_urdf(urdf_path: str) -> yourdfpy.URDF:
     """Load the myCobot URDF, resolving package:// mesh paths.
 
@@ -103,35 +203,71 @@ def _load_urdf(urdf_path: str) -> yourdfpy.URDF:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Collision geometry — ground plane and wall
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Ground at z=0 (outward normal = +z → keeps robot above ground)
+GROUND_PLANE = pk.collision.HalfSpace.from_point_and_normal(
+    point=[0.0, 0.0, 0.0], normal=[0.0, 0.0, 1.0]
+)
+# Wall at x=-0.1 (outward normal = +x → keeps robot on x > -0.1 side)
+WALL_X = pk.collision.HalfSpace.from_point_and_normal(
+    point=[-0.1, 0.0, 0.0], normal=[1.0, 0.0, 0.0]
+)
+
+# Collision margins (meters)
+SELF_COLLISION_MARGIN = 0.02   # 2 cm buffer between links
+WORLD_COLLISION_MARGIN = 0.01  # 1 cm buffer from ground / wall
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  JIT-compiled IK solver (inner loop)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @jdc.jit
 def _solve_ik_jax(
     robot: pk.Robot,
+    robot_coll: pk.collision.RobotCollision,
     target_link_index: jax.Array,
     target_wxyz: jax.Array,
     target_position: jax.Array,
+    ground: pk.collision.HalfSpace,
+    wall: pk.collision.HalfSpace,
     pos_weight: jdc.Static[float] = 50.0,
     ori_weight: jdc.Static[float] = 10.0,
+    self_coll_weight: jdc.Static[float] = 10.0,
 ) -> jax.Array:
-    """Solve IK using pyroki's Levenberg-Marquardt optimizer.
+    """Solve IK with pose, joint limits, self-collision, and world collision.
 
     Returns URDF joint configuration in radians, shape (num_actuated_joints,).
     """
     joint_var = robot.joint_var_cls(0)
+    target_se3 = jaxlie.SE3.from_rotation_and_translation(
+        jaxlie.SO3(target_wxyz), target_position
+    )
     costs = [
+        # Primary: reach the target pose
         pk.costs.pose_cost_analytic_jac(
-            robot,
-            joint_var,
-            jaxlie.SE3.from_rotation_and_translation(
-                jaxlie.SO3(target_wxyz), target_position
-            ),
-            target_link_index,
-            pos_weight=pos_weight,
-            ori_weight=ori_weight,
+            robot, joint_var, target_se3, target_link_index,
+            pos_weight=pos_weight, ori_weight=ori_weight,
         ),
+        # Joint limits (hard constraint — stay within URDF limits)
         pk.costs.limit_constraint(robot, joint_var),
+        # Self-collision avoidance (soft cost — pushes links apart)
+        pk.costs.self_collision_cost(
+            robot, robot_coll, joint_var,
+            margin=SELF_COLLISION_MARGIN, weight=self_coll_weight,
+        ),
+        # World collision: ground plane (soft cost)
+        pk.costs.world_collision_cost(
+            robot, robot_coll, joint_var, ground,
+            margin=WORLD_COLLISION_MARGIN, weight=self_coll_weight,
+        ),
+        # World collision: wall at x=-0.1 (soft cost)
+        pk.costs.world_collision_cost(
+            robot, robot_coll, joint_var, wall,
+            margin=WORLD_COLLISION_MARGIN, weight=self_coll_weight,
+        ),
     ]
     sol = (
         jaxls.LeastSquaresProblem(costs=costs, variables=[joint_var])
@@ -139,7 +275,13 @@ def _solve_ik_jax(
         .solve(
             verbose=False,
             linear_solver="dense_cholesky",
-            trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
+            trust_region=jaxls.TrustRegionConfig(),
+            termination=jaxls.TerminationConfig(
+                max_iterations=200,
+                cost_tolerance=1e-6,
+                gradient_tolerance=1e-5,
+                parameter_tolerance=1e-7,
+            ),
         )
     )
     return sol[joint_var]
@@ -176,6 +318,15 @@ class MyCobotIK:
             default_joint_cfg=linuxcnc_deg_to_urdf_rad(HOME_LINUXCNC_DEG),
         )
 
+        # Tighten joint limits to respect LinuxCNC soft limits + calibration offset
+        _apply_effective_joint_limits(self.robot)
+
+        # Build collision model from URDF meshes
+        # Scale by 0.001: myCobot DAE meshes are authored in mm, URDF uses meters
+        self.robot_coll = _scale_robot_collision(
+            pk.collision.RobotCollision.from_urdf(self.urdf), scale=0.001
+        )
+
         # Resolve target link index
         self.target_link_name = TARGET_LINK
         self.target_link_index = self.robot.links.names.index(self.target_link_name)
@@ -183,18 +334,26 @@ class MyCobotIK:
         print(f"[MyCobotIK] Target link: '{self.target_link_name}' (index {self.target_link_index})")
         print(f"[MyCobotIK] Links: {self.robot.links.names}")
         print(f"[MyCobotIK] Actuated joints: {self.robot.joints.num_actuated_joints}")
+        print(f"[MyCobotIK] Collision: self-coll margin={SELF_COLLISION_MARGIN*100:.0f}cm, "
+              f"world margin={WORLD_COLLISION_MARGIN*100:.0f}cm")
 
-        # Warm up JIT (first call is slow due to compilation)
-        print("[MyCobotIK] Warming up JIT (first IK solve)...")
+        # Default seed for IK (home pose in URDF radians)
+        self._home_urdf_rad = linuxcnc_deg_to_urdf_rad(HOME_LINUXCNC_DEG)
+
+        # Warm up JIT (first call is slow due to compilation + collision tracing)
+        print("[MyCobotIK] Warming up JIT (first IK solve with collision)...")
         t0 = time.time()
-        home_urdf = linuxcnc_deg_to_urdf_rad(HOME_LINUXCNC_DEG)
-        R, t_vec = self.forward_kinematics_urdf(home_urdf)
+        R, t_vec = self.forward_kinematics_urdf(self._home_urdf_rad)
+        print(f"[MyCobotIK] Home EEF position: {np.round(t_vec, 4).tolist()} m")
         wxyz = rotation_matrix_to_wxyz(R)
         _solve_ik_jax(
             self.robot,
+            self.robot_coll,
             jnp.array(self.target_link_index),
-            jnp.array(wxyz),
-            jnp.array(t_vec),
+            jnp.array(wxyz, dtype=jnp.float32),
+            jnp.array(t_vec, dtype=jnp.float32),
+            GROUND_PLANE,
+            WALL_X,
         )
         elapsed = time.time() - t0
         print(f"[MyCobotIK] JIT warmup done ({elapsed:.2f}s). Subsequent solves are fast.\n")
@@ -250,9 +409,12 @@ class MyCobotIK:
         wxyz = rotation_matrix_to_wxyz(R)
         cfg = _solve_ik_jax(
             self.robot,
+            self.robot_coll,
             jnp.array(self.target_link_index),
             jnp.array(wxyz, dtype=jnp.float32),
             jnp.array(t, dtype=jnp.float32),
+            GROUND_PLANE,
+            WALL_X,
             pos_weight=pos_weight,
             ori_weight=ori_weight,
         )
@@ -276,7 +438,8 @@ class MyCobotIK:
         Returns:
             linuxcnc_deg: (6,) joint angles in LinuxCNC degrees
         """
-        urdf_rad = self.solve_urdf(R, t, pos_weight, ori_weight)
+        urdf_rad = self.solve_urdf(R, t, pos_weight=pos_weight,
+                                   ori_weight=ori_weight)
         return urdf_rad_to_linuxcnc_deg(urdf_rad)
 
     def solve_from_matrix(

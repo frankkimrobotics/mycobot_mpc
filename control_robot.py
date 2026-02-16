@@ -209,8 +209,10 @@ class RobotConnection:
     def send_target(
         self,
         target_deg: list[float],
-        duration: float = 5.0,
+        duration: float = 2.0,
         controller: str = "pd",
+        pos_tol: float = 0.5,
+        settle_steps: int = 10,
     ) -> dict:
         """Send a move command and return the ack response.
 
@@ -218,6 +220,8 @@ class RobotConnection:
             target_deg: 6 joint angles in LinuxCNC degrees
             duration: Max duration for the move (seconds)
             controller: "pd" or "mpc"
+            pos_tol: Position tolerance for early stop (degrees)
+            settle_steps: Consecutive converged loops before early stop
 
         Returns:
             Ack dict from robot, or empty dict on failure
@@ -226,10 +230,13 @@ class RobotConnection:
             "target_deg": [round(float(v), 4) for v in target_deg],
             "duration": duration,
             "controller": controller,
+            "pos_tol": pos_tol,
+            "settle_steps": settle_steps,
         }
         msg = json.dumps(cmd) + "\n"
         self.sock.sendall(msg.encode("utf-8"))
-        print(f"[conn] Sent target: {[round(v, 1) for v in target_deg]} (duration={duration}s, ctrl={controller})")
+        print(f"[conn] Sent target: {[round(v, 1) for v in target_deg]} "
+              f"(dur={duration}s, ctrl={controller}, tol={pos_tol}°, settle={settle_steps})")
 
         # Read ack
         return self._read_status("ack", timeout=2.0)
@@ -296,8 +303,10 @@ class RobotConnection:
 def move_to_joints(
     conn: RobotConnection,
     target_deg: np.ndarray,
-    duration: float = 5.0,
+    duration: float = 2.0,
     controller: str = "pd",
+    pos_tol: float = 0.5,
+    settle_steps: int = 10,
     timer: PipelineTimer | None = None,
     logger: MoveLogger | None = None,
 ) -> dict:
@@ -308,6 +317,8 @@ def move_to_joints(
         target_deg: 6 joint angles in LinuxCNC degrees
         duration: Max duration for the move
         controller: "pd" or "mpc"
+        pos_tol: Position tolerance for early stop (degrees)
+        settle_steps: Consecutive converged loops before early stop
         timer: Optional PipelineTimer (will be created if None)
         logger: Optional MoveLogger to record the move
 
@@ -320,7 +331,8 @@ def move_to_joints(
     timer.start("total")
     timer.start("cmd_send")
     timer.start("ack_rtt")
-    ack = conn.send_target(list(target_deg), duration=duration, controller=controller)
+    ack = conn.send_target(list(target_deg), duration=duration, controller=controller,
+                           pos_tol=pos_tol, settle_steps=settle_steps)
     timer.stop("ack_rtt")
     timer.stop("cmd_send")
 
@@ -354,8 +366,10 @@ def move_to_pose(
     ik: MyCobotIK,
     R: np.ndarray,
     t: np.ndarray,
-    duration: float = 5.0,
+    duration: float = 2.0,
     controller: str = "pd",
+    pos_tol: float = 0.5,
+    settle_steps: int = 10,
     logger: MoveLogger | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Solve IK for (R, t) and move the robot there.
@@ -367,6 +381,8 @@ def move_to_pose(
         t: (3,) translation vector for eef (meters)
         duration: Max duration for the move
         controller: "pd" or "mpc"
+        pos_tol: Position tolerance for early stop (degrees)
+        settle_steps: Consecutive converged loops before early stop
         logger: Optional MoveLogger to record the move
 
     Returns:
@@ -389,11 +405,12 @@ def move_to_pose(
     if pos_err > 0.01:
         print(f"[ik] WARNING: FK verification error = {pos_err_mm:.2f}mm (>10mm)")
 
-    # Send + wait (timer passed through to measure cmd_send, ack_rtt, wait_done, total)
+    # Send + wait
     timer.start("total")
     timer.start("cmd_send")
     timer.start("ack_rtt")
-    conn.send_target(list(joints_deg), duration=duration, controller=controller)
+    conn.send_target(list(joints_deg), duration=duration, controller=controller,
+                     pos_tol=pos_tol, settle_steps=settle_steps)
     timer.stop("ack_rtt")
     timer.stop("cmd_send")
 
@@ -426,6 +443,8 @@ def interactive_mode(
     ik: MyCobotIK,
     controller: str,
     duration: float,
+    pos_tol: float = 0.5,
+    settle_steps: int = 10,
     logger: MoveLogger | None = None,
 ):
     """Interactive control loop: enter poses from the terminal."""
@@ -464,6 +483,7 @@ def interactive_mode(
                 print(f"Moving to home: {HOME_LINUXCNC_DEG}")
                 move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
                                duration=duration, controller=controller,
+                               pos_tol=pos_tol, settle_steps=settle_steps,
                                logger=logger)
 
             elif cmd == "xyz" and len(parts) == 4:
@@ -472,6 +492,7 @@ def interactive_mode(
                 print(f"Target position: {t_target.tolist()} m (home orientation)")
                 move_to_pose(conn, ik, R_home, t_target,
                              duration=duration, controller=controller,
+                             pos_tol=pos_tol, settle_steps=settle_steps,
                              logger=logger)
 
             elif cmd == "joints" and len(parts) == 7:
@@ -479,6 +500,7 @@ def interactive_mode(
                 print(f"Target joints: {joints} deg")
                 move_to_joints(conn, np.array(joints),
                                duration=duration, controller=controller,
+                               pos_tol=pos_tol, settle_steps=settle_steps,
                                logger=logger)
 
             elif cmd == "fk":
@@ -535,8 +557,12 @@ Examples:
         help="Robot streaming port for rviz2 (default: 9999)")
     parser.add_argument("--controller", choices=["pd", "mpc"], default="pd",
         help="Controller type (default: pd)")
-    parser.add_argument("--duration", type=float, default=5.0,
-        help="Move duration in seconds (default: 5.0)")
+    parser.add_argument("--duration", type=float, default=2.0,
+        help="Move duration in seconds (default: 2.0)")
+    parser.add_argument("--pos-tol", type=float, default=0.5,
+        help="Position tolerance for early stop in degrees (default: 0.5)")
+    parser.add_argument("--settle-steps", type=int, default=10,
+        help="Consecutive converged loops before early stop (default: 10)")
     parser.add_argument("--no-rviz", action="store_true",
         help="Don't launch rviz2 (use if it's already running)")
 
@@ -595,12 +621,15 @@ Examples:
     try:
         if args.interactive:
             interactive_mode(conn, ik, controller=args.controller,
-                             duration=args.duration, logger=logger)
+                             duration=args.duration,
+                             pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+                             logger=logger)
 
         elif args.home:
             print(f"Moving to home: {HOME_LINUXCNC_DEG}")
             move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
                            duration=args.duration, controller=args.controller,
+                           pos_tol=args.pos_tol, settle_steps=args.settle_steps,
                            logger=logger)
 
         elif args.xyz:
@@ -609,6 +638,7 @@ Examples:
             print(f"Target position: {t_target.tolist()} m")
             move_to_pose(conn, ik, R_home, t_target,
                          duration=args.duration, controller=args.controller,
+                         pos_tol=args.pos_tol, settle_steps=args.settle_steps,
                          logger=logger)
 
         elif args.joints:
@@ -616,6 +646,7 @@ Examples:
             print(f"Target joints: {target_deg.tolist()} deg")
             move_to_joints(conn, target_deg,
                            duration=args.duration, controller=args.controller,
+                           pos_tol=args.pos_tol, settle_steps=args.settle_steps,
                            logger=logger)
 
     except KeyboardInterrupt:
