@@ -13,8 +13,12 @@ Connect to the raspi via SSH with pi@10.0.0.27
 
 In raspi, run the command with 
 
-"linuxcnc /home/pi/Desktop/mpc/elerob_mpc.ini"
+'''linuxcnc /home/pi/Desktop/mpc/elerob_mpc.ini'''
 
 RVIZ2 (ros2) command to show mycobot pro 630 urdf with single suction cup gripper 
 
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate ros_env && source ~/ros2_ws/install/setup.zsh && cd ~/ros2_ws && colcon build --packages-select mycobot_description --symlink-install && source ~/ros2_ws/install/setup.zsh && ros2 launch mycobot_description display.launch.py
+'''source ~/miniconda3/etc/profile.d/conda.sh && conda activate ros_env && source ~/ros2_ws/install/setup.zsh && cd ~/ros2_ws && colcon build --packages-select mycobot_description --symlink-install && source ~/ros2_ws/install/setup.zsh && ros2 launch mycobot_description display.launch.py'''
+
+
+joystick controller 
+'''PYTHONPATH= python3.10 joystick_controller.py --host 10.0.0.27 --speed medium --hz 20'''
