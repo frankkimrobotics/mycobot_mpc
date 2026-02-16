@@ -7,6 +7,7 @@ Requires HAL setup: load mpc component and wire mpc.jointN_pos_cmd to pid.N.comm
 (via mux_generic when mpc.enable=1). See mpc_hal_setup.hal and README.
 """
 
+import queue
 import time
 import sys
 import csv
@@ -805,6 +806,112 @@ def start_stream_server(port: int = STREAM_PORT, rate_hz: float = STREAM_RATE_HZ
     return t
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Command server: receives target joint angles from desktop (control_robot.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CMD_PORT = 9998
+
+# Shared command queue: desktop sends commands, main loop consumes them
+_cmd_queue = queue.Queue()
+
+# Shared status dict: main loop writes, command server reads & sends to client
+_cmd_status = {
+    "state": "idle",        # idle | moving | done | error
+    "current_deg": [0.0] * MAX_JOINTS,
+    "target_deg": [0.0] * MAX_JOINTS,
+    "error_norm": 0.0,
+}
+_cmd_status_lock = threading.Lock()
+
+
+def _handle_cmd_client(conn, addr):
+    """Handle a single command client connection.
+
+    Protocol (JSON lines over TCP):
+      Desktop → Robot:  {"target_deg": [j1..j6], "duration": 5.0, "controller": "pd"}\n
+      Robot → Desktop:  {"state": "ack|moving|done|error", ...}\n  (periodic updates)
+    """
+    print(f"[cmd] Client connected: {addr}")
+    buffer = ""
+    conn.settimeout(1.0)
+
+    try:
+        while True:
+            # Send periodic status updates
+            with _cmd_status_lock:
+                status = dict(_cmd_status)
+            try:
+                conn.sendall((json.dumps(status) + "\n").encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+
+            # Check for incoming commands
+            try:
+                data = conn.recv(4096)
+                if not data:
+                    break
+                buffer += data.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        cmd = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if "target_deg" in cmd:
+                        print(f"[cmd] Received target: {[round(v, 1) for v in cmd['target_deg']]}")
+                        _cmd_queue.put(cmd)
+                        ack = {"state": "ack", "target_deg": cmd["target_deg"]}
+                        conn.sendall((json.dumps(ack) + "\n").encode("utf-8"))
+            except socket.timeout:
+                pass
+
+            time.sleep(0.1)  # status update rate ~10 Hz
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        conn.close()
+        print(f"[cmd] Client disconnected: {addr}")
+
+
+def _command_server_thread(port: int):
+    """Background thread: accept command connections from desktop."""
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", port))
+    server_sock.listen(2)
+    print(f"[cmd] Command server listening on 0.0.0.0:{port}")
+
+    while True:
+        try:
+            conn, addr = server_sock.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            threading.Thread(target=_handle_cmd_client, args=(conn, addr), daemon=True).start()
+        except OSError:
+            break
+
+
+def start_command_server(port: int = CMD_PORT):
+    """Launch the command server as a daemon thread (non-blocking)."""
+    t = threading.Thread(target=_command_server_thread, args=(port,), daemon=True)
+    t.start()
+    print(f"[cmd] Background command server started on port {port}")
+    return t
+
+
+def _update_cmd_status(state, current_deg, target_deg, error_norm):
+    """Update shared status dict (thread-safe)."""
+    with _cmd_status_lock:
+        _cmd_status["state"] = state
+        _cmd_status["current_deg"] = [round(v, 3) for v in current_deg]
+        _cmd_status["target_deg"] = [round(v, 3) for v in target_deg]
+        _cmd_status["error_norm"] = round(error_norm, 4)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MPC control for myCobot Pro 630")
@@ -814,6 +921,8 @@ def main():
                         help=f"TCP port for rviz2 streaming server (default: {STREAM_PORT}, 0=disable)")
     parser.add_argument("--stream-rate", type=float, default=STREAM_RATE_HZ,
                         help=f"Streaming rate in Hz (default: {STREAM_RATE_HZ})")
+    parser.add_argument("--cmd-port", type=int, default=CMD_PORT,
+                        help=f"TCP port for command server (default: {CMD_PORT}, 0=disable)")
     args = parser.parse_args()
 
     # Create HAL component
@@ -833,6 +942,10 @@ def main():
     if args.stream_port > 0:
         start_stream_server(port=args.stream_port, rate_hz=args.stream_rate)
 
+    # Start command server for desktop control (control_robot.py)
+    if args.cmd_port > 0:
+        start_command_server(port=args.cmd_port)
+
     # Initialize pins
     for i in range(MAX_JOINTS):
         h[f"joint{i}_pos_cmd"] = 0.0
@@ -850,24 +963,57 @@ def main():
     s = linuxcnc.stat()
     s.poll()
     current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
-    init = [-90,-90,0,-90,0,0]
-    target = [a + 15.0 for a in current]
     print("Current angles:", current)
-    print("Target (current + 5° each):", target)
 
     # Suction pump
     if args.suction:
         suction_pump(on=True)
 
-    # Run (Ctrl+C to stop)
+    _update_cmd_status("idle", current, current, 0.0)
+
+    # Main loop: wait for commands from the desktop (control_robot.py)
+    print("\n" + "=" * 60)
+    print("Waiting for commands from desktop (control_robot.py)...")
+    print(f"  Command port: {args.cmd_port}")
+    print(f"  Stream port:  {args.stream_port}")
+    print("  Press Ctrl+C to stop.")
+    print("=" * 60 + "\n")
+
     try:
-        init = [-90, -90, 0, -90, 0, 0]
-        for i in range(10):
-            target = [a + np.random.uniform(-20, 20) for a in init]
-            print(f"\n=== Run {i+1}/5: target={[round(t,1) for t in target]} ===")
-            
-            pd_control_loop(h, s, target, duration_sec=3.0)
-            pd_control_loop(h, s, init, duration_sec=3.0)
+        while True:
+            try:
+                cmd = _cmd_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            target = cmd.get("target_deg")
+            if target is None or len(target) != MAX_JOINTS:
+                print(f"[cmd] Invalid target: {target}")
+                continue
+
+            duration = cmd.get("duration", 5.0)
+            controller = cmd.get("controller", "pd")
+
+            s.poll()
+            current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
+            err = sum((t - c) ** 2 for t, c in zip(target, current)) ** 0.5
+            print(f"\n[cmd] Moving: {[round(v, 1) for v in current]} → {[round(v, 1) for v in target]}")
+            print(f"       distance={err:.1f}° duration={duration}s controller={controller}")
+
+            _update_cmd_status("moving", current, target, err)
+
+            if controller == "mpc":
+                mpc_control_loop(h, s, target, duration_sec=duration)
+            else:
+                pd_control_loop(h, s, target, duration_sec=duration)
+
+            s.poll()
+            final = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
+            final_err = sum((t - f) ** 2 for t, f in zip(target, final)) ** 0.5
+            _update_cmd_status("done", final, target, final_err)
+
+            print(f"[cmd] Done. Final error: {final_err:.3f}°")
+
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
