@@ -7,10 +7,14 @@ Requires HAL setup: load mpc component and wire mpc.jointN_pos_cmd to pid.N.comm
 (via mux_generic when mpc.enable=1). See mpc_hal_setup.hal and README.
 """
 
+import queue
 import time
 import sys
 import csv
+import json
 import os
+import socket
+import threading
 from datetime import datetime
 from functools import wraps
 import numpy as np
@@ -26,9 +30,15 @@ except ImportError as e:
 # Constants from myCobot Pro 630
 MAX_JOINTS = 6
 MPC_PERIOD_MS = 2   # 100 Hz - HAL write is fast
-U_MAX_PER_STEP = 5.0
-KP = 0.3
+U_MAX_PER_STEP = 8.0
+KP = 0.5
 KD = 0.1
+
+# MPC parameters
+MPC_HORIZON = 20    # prediction horizon (N steps)
+MPC_Q = 10.0        # state cost weight (tracking error)
+MPC_R = 0.1         # control effort weight
+MPC_Q_TERMINAL = 50.0  # terminal state cost weight
 
 # Suction pump
 SUCTION_PIN = "pro600.digital_out00"  # HAL pin for suction pump
@@ -37,7 +47,7 @@ SUCTION_PIN = "pro600.digital_out00"  # HAL pin for suction pump
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 # Timing
-_timing = {"poll": [], "pd_solve": [], "hal_write": [], "sleep": []}
+_timing = {"poll": [], "pd_solve": [], "mpc_solve": [], "hal_write": [], "sleep": []}
 
 
 def timed(step_name):
@@ -54,7 +64,7 @@ def timed(step_name):
 
 
 @timed("pd_solve")
-def mpc_solve_qp(q, target_angles, q_vel=None, prev_q=None, dt=None):
+def pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
     """PD controller returning (next_pos, vel_cmd).
 
     u = Kp * e - Kd * q_vel, clipped to ±U_MAX_PER_STEP.
@@ -80,6 +90,228 @@ def mpc_solve_qp(q, target_angles, q_vel=None, prev_q=None, dt=None):
     else:
         vel_cmd = np.zeros(MAX_JOINTS)
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
+
+
+# ── MPC (QP-based) solver ────────────────────────────────────────────────────
+# Uses OSQP for real-time QP solving (~0.1ms per solve on Pi).
+# Formulation per joint (independent, solved in batch):
+#   Plant:  x(k+1) = x(k) + u(k)       (single integrator, position += step)
+#   Cost:   sum_{k=0}^{N-1} [ Q * (x(k) - x_ref)^2 + R * u(k)^2 ]
+#           + Q_terminal * (x(N) - x_ref)^2
+#   Constraints: -U_MAX <= u(k) <= U_MAX  for all k
+#
+# Decision variable: u = [u(0), u(1), ..., u(N-1)]  per joint
+# State is eliminated: x(k) = x(0) + sum_{i=0}^{k-1} u(i)
+
+try:
+    import osqp
+    from scipy import sparse
+    _HAS_OSQP = True
+except ImportError:
+    _HAS_OSQP = False
+
+
+def _build_mpc_qp(N, Q, R, Q_term, u_max):
+    """Pre-build QP matrices for a single-joint MPC (reused across solves).
+
+    Returns (P, A, l_template, u_template, solver_settings) that only need
+    q-vector update per solve (depends on current state and target).
+    """
+    # State propagation: x(k) = x0 + sum_{i<k} u(i)
+    # So x(k) - x_ref = (x0 - x_ref) + sum_{i<k} u(i)
+    # Let e0 = x0 - x_ref (scalar, updated each solve)
+    #
+    # Cost = sum_{k=1}^{N} Q_k * (e0 + sum_{i<k} u(i))^2 + sum_{k=0}^{N-1} R * u(k)^2
+    # where Q_k = Q for k<N, Q_term for k=N
+    #
+    # Expanding: quadratic in u → P matrix, linear in u → q vector (depends on e0)
+
+    # Build cumulative sum matrix S: S[k,i] = 1 if i < k+1 (for k=0..N-1 representing x(1)..x(N))
+    S = np.tril(np.ones((N, N)))  # S[k,i] = 1 for i <= k
+
+    # Weight vector for states x(1)..x(N)
+    w = np.full(N, Q)
+    w[-1] = Q_term
+
+    W = np.diag(w)
+
+    # P = S^T W S + R * I  (Hessian, N x N)
+    P = S.T @ W @ S + R * np.eye(N)
+    P = sparse.csc_matrix(P)
+
+    # q = S^T W @ ones * e0  → q_vec = (S^T @ w) * e0 (computed per solve)
+    q_coeffs = S.T @ w  # N-vector, multiply by e0 each solve
+
+    # Constraints: -u_max <= u(k) <= u_max
+    A = sparse.eye(N, format="csc")
+    l_bound = np.full(N, -u_max)
+    u_bound = np.full(N, u_max)
+
+    return P, A, l_bound, u_bound, q_coeffs
+
+
+class MPCSolver:
+    """Pre-compiled OSQP solver for single-integrator MPC, one per joint.
+
+    Warm-starts between solves for speed.
+    """
+
+    def __init__(self, N=MPC_HORIZON, Q=MPC_Q, R=MPC_R, Q_term=MPC_Q_TERMINAL,
+                 u_max=U_MAX_PER_STEP):
+        self.N = N
+        self.q_coeffs = None
+        self.solvers = []  # one OSQP instance per joint
+
+        if not _HAS_OSQP:
+            raise ImportError("osqp not installed. Run: pip install osqp")
+
+        P, A, l_bound, u_bound, self.q_coeffs = _build_mpc_qp(N, Q, R, Q_term, u_max)
+
+        # Create one solver per joint (same structure, different q vector each solve)
+        for _ in range(MAX_JOINTS):
+            solver = osqp.OSQP()
+            solver.setup(P, np.zeros(N), A, l_bound, u_bound,
+                         warm_start=True, verbose=False,
+                         eps_abs=1e-4, eps_rel=1e-4,
+                         max_iter=200, polish=False)
+            self.solvers.append(solver)
+
+    def solve(self, q_current, target, dt):
+        """Solve MPC for all joints. Returns (next_pos, vel_cmd) lists."""
+        next_pos = []
+        vel_cmd = []
+        for j in range(MAX_JOINTS):
+            e0 = q_current[j] - target[j]
+            q_vec = self.q_coeffs * e0  # linear cost term
+
+            self.solvers[j].update(q=q_vec)
+            result = self.solvers[j].solve()
+
+            if result.info.status == "solved" or result.info.status == "solved_inaccurate":
+                u0 = result.x[0]
+            else:
+                # Fallback: simple proportional step
+                u0 = np.clip(-KP * e0, -U_MAX_PER_STEP, U_MAX_PER_STEP)
+
+            u0 = float(u0)
+            next_pos.append(q_current[j] + u0)
+            vel_cmd.append(u0 / dt if dt > 0 else 0.0)
+
+        return next_pos, vel_cmd
+
+
+# Global MPC solver instance (lazy init)
+_mpc_solver = None
+
+
+@timed("mpc_solve")
+def mpc_solve(q, target_angles, dt):
+    """Solve MPC QP for all joints. Returns (next_pos, vel_cmd).
+
+    Uses OSQP with warm-starting. Falls back to PD if OSQP unavailable.
+    """
+    global _mpc_solver
+    if _mpc_solver is None:
+        _mpc_solver = MPCSolver()
+    if dt is None or dt <= 0:
+        dt = MPC_PERIOD_MS / 1000.0
+    return _mpc_solver.solve(q, target_angles, dt)
+
+
+def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
+                     pos_tol=0.5, vel_tol=1.0, settle_steps=10):
+    """Run MPC control loop: poll -> QP solve (N-step horizon) -> HAL write.
+
+    Uses OSQP to solve a QP over MPC_HORIZON steps per iteration,
+    applies only the first control action (receding horizon).
+
+    Early-stops when position error norm < pos_tol (deg) AND velocity norm
+    < vel_tol (deg/s) for settle_steps consecutive iterations.
+    """
+    print("MPC control loop starting. Target:", target_angles)
+    print(f"  Horizon={MPC_HORIZON}, Q={MPC_Q}, R={MPC_R}, Q_term={MPC_Q_TERMINAL}")
+    print(f"  Early stop: pos_tol={pos_tol}°, vel_tol={vel_tol}°/s, settle={settle_steps} steps")
+    print("Press Ctrl+C to stop.\n")
+
+    # Enable MPC override
+    h["enable"] = True
+
+    t_start = time.time()
+    loop_count = 0
+    converged_count = 0
+    prev_current = None
+    t_prev = None
+    for k in _timing:
+        _timing[k] = []
+
+    # Log buffer
+    log_rows = []
+
+    while (time.time() - t_start) < duration_sec:
+        t_loop_start = time.time()
+        dt = (t_loop_start - t_prev) if t_prev is not None else None
+        t_prev = t_loop_start
+
+        # 1. Poll feedback
+        q, q_vel, t_status = _poll_feedback(s)
+
+        # 2. MPC solve (N-step QP, apply first action)
+        next_pos, vel_cmd = mpc_solve(q, target_angles,
+                                      dt if dt else MPC_PERIOD_MS / 1000.0)
+        # Estimate velocity for logging (before overwriting prev_current)
+        if prev_current is not None and dt is not None and dt > 0:
+            est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
+        else:
+            est_vel = [0.0] * MAX_JOINTS
+        prev_current = q.copy()
+
+        # 3. HAL write
+        t_cmd = _write_hal_cmd(h, next_pos, vel_cmd)
+
+        # 4. Sleep
+        elapsed = time.time() - t_loop_start
+        sleep_time = MPC_PERIOD_MS / 1000.0 - elapsed
+        if sleep_time > 0:
+            t0 = time.perf_counter()
+            time.sleep(sleep_time)
+            _timing["sleep"].append((time.perf_counter() - t0) * 1000)
+        else:
+            _timing["sleep"].append(0.0)
+
+        loop_count += 1
+        err = sum((t - a) ** 2 for t, a in zip(target_angles, q)) ** 0.5
+        vel_norm = sum(v ** 2 for v in vel_cmd) ** 0.5
+
+        # Early stop
+        if err < pos_tol and vel_norm < vel_tol:
+            converged_count += 1
+            if converged_count >= settle_steps:
+                print(f"  Converged at loop {loop_count}: err={err:.3f}° vel_norm={vel_norm:.3f}°/s")
+                break
+        else:
+            converged_count = 0
+
+        # Collect log row
+        log_rows.append([
+            t_status, loop_count,
+            *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            err,
+            _timing["poll"][-1], _timing["mpc_solve"][-1],
+            _timing["hal_write"][-1], _timing["sleep"][-1],
+        ])
+
+        if loop_count % 10 == 0 or loop_count <= 3:
+            vel_str = f" q_vel={[round(v, 3) for v in q_vel[:3]]}" if q_vel else ""
+            vcmd_str = f" vcmd={[round(v, 1) for v in vel_cmd[:3]]}"
+            print(f"Loop {loop_count}: status_recv={t_status} hal_write={t_cmd} q={q[:3]}... err={err:.3f}{vel_str}{vcmd_str}")
+            if _timing["mpc_solve"]:
+                n = len(_timing["mpc_solve"])
+                avg_ms = sum(_timing["mpc_solve"][-n:]) / n
+                print(f"  [timing] mpc_solve={avg_ms:.2f}ms")
+
+    h["enable"] = False
+    print(f"\nDone. Ran {loop_count} MPC iterations.")
+    _save_log(log_rows, target_angles)
 
 
 @timed("poll")
@@ -142,8 +374,8 @@ def _save_log(log_rows, target_angles):
     print(f"  Log saved: {filename} ({len(log_rows)} rows)")
 
 
-def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
-                 pos_tol=0.5, vel_tol=1.0, settle_steps=50):
+def pd_control_loop(h, s, target_angles, duration_sec=10.0,
+                 pos_tol=0.5, vel_tol=1.0, settle_steps=10):
     """Run MPC loop: poll -> PD solve -> HAL write.
 
     Early-stops when position error norm < pos_tol (deg) AND velocity norm
@@ -177,7 +409,7 @@ def run_mpc_loop(h, s, target_angles, duration_sec=10.0,
 
         # 2. PD solve → (position, velocity)
         # q_vel from LinuxCNC is ~0 (motion planner bypassed), use prev_q estimation instead
-        next_pos, vel_cmd = mpc_solve_qp(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
+        next_pos, vel_cmd = pd_solve(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
         # Estimate velocity for logging (before overwriting prev_current)
         if prev_current is not None and dt is not None and dt > 0:
             est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
@@ -485,11 +717,214 @@ def enable_machine(h, timeout=60.0):
     return True
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Integrated TCP streaming server (runs as background daemon thread)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+STREAM_PORT = 9999
+STREAM_RATE_HZ = 50.0
+
+
+def _stream_server_thread(port: int, rate_hz: float):
+    """Background thread: poll LinuxCNC joint positions and broadcast over TCP.
+
+    Desktop client (robot_pose_stream_ros2.py client) connects here to feed
+    rviz2 with live joint angles. Multiple clients supported.
+    """
+    stat = linuxcnc.stat()
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", port))
+    server_sock.listen(5)
+    print(f"[stream] Listening on 0.0.0.0:{port} at {rate_hz} Hz")
+
+    clients = []
+    clients_lock = threading.Lock()
+
+    def accept_loop():
+        while True:
+            try:
+                conn, addr = server_sock.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                with clients_lock:
+                    clients.append(conn)
+                print(f"[stream] Client connected: {addr} (total: {len(clients)})")
+            except OSError:
+                break
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+
+    period = 1.0 / rate_hz
+    loop_count = 0
+
+    while True:
+        t0 = time.time()
+        try:
+            stat.poll()
+            joints_deg = [round(stat.joint_actual_position[i], 4)
+                          for i in range(MAX_JOINTS)]
+        except (RuntimeError, OSError):
+            time.sleep(1.0)
+            continue
+
+        msg = json.dumps({
+            "joints_deg": joints_deg,
+            "timestamp": time.time(),
+        }) + "\n"
+        msg_bytes = msg.encode("utf-8")
+
+        dead = []
+        with clients_lock:
+            for conn in clients:
+                try:
+                    conn.sendall(msg_bytes)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    dead.append(conn)
+            for conn in dead:
+                clients.remove(conn)
+                conn.close()
+
+        if dead:
+            print(f"[stream] {len(dead)} client(s) disconnected (remaining: {len(clients)})")
+
+        loop_count += 1
+        if loop_count % (int(rate_hz) * 10) == 0:
+            print(f"[stream] loop={loop_count} q={[round(j, 1) for j in joints_deg]} clients={len(clients)}")
+
+        elapsed = time.time() - t0
+        sleep_time = period - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+def start_stream_server(port: int = STREAM_PORT, rate_hz: float = STREAM_RATE_HZ):
+    """Launch the TCP streaming server as a daemon thread (non-blocking)."""
+    t = threading.Thread(target=_stream_server_thread, args=(port, rate_hz), daemon=True)
+    t.start()
+    print(f"[stream] Background streaming server started on port {port}")
+    return t
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Command server: receives target joint angles from desktop (control_robot.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CMD_PORT = 9998
+
+# Shared command queue: desktop sends commands, main loop consumes them
+_cmd_queue = queue.Queue()
+
+# Shared status dict: main loop writes, command server reads & sends to client
+_cmd_status = {
+    "state": "idle",        # idle | moving | done | error
+    "current_deg": [0.0] * MAX_JOINTS,
+    "target_deg": [0.0] * MAX_JOINTS,
+    "error_norm": 0.0,
+}
+_cmd_status_lock = threading.Lock()
+
+
+def _handle_cmd_client(conn, addr):
+    """Handle a single command client connection.
+
+    Protocol (JSON lines over TCP):
+      Desktop → Robot:  {"target_deg": [j1..j6], "duration": 5.0, "controller": "pd"}\n
+      Robot → Desktop:  {"state": "ack|moving|done|error", ...}\n  (periodic updates)
+    """
+    print(f"[cmd] Client connected: {addr}")
+    buffer = ""
+    conn.settimeout(1.0)
+
+    try:
+        while True:
+            # Send periodic status updates
+            with _cmd_status_lock:
+                status = dict(_cmd_status)
+            try:
+                conn.sendall((json.dumps(status) + "\n").encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+
+            # Check for incoming commands
+            try:
+                data = conn.recv(4096)
+                if not data:
+                    break
+                buffer += data.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        cmd = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if "target_deg" in cmd:
+                        print(f"[cmd] Received target: {[round(v, 1) for v in cmd['target_deg']]}")
+                        _cmd_queue.put(cmd)
+                        ack = {"state": "ack", "target_deg": cmd["target_deg"]}
+                        conn.sendall((json.dumps(ack) + "\n").encode("utf-8"))
+            except socket.timeout:
+                pass
+
+            time.sleep(0.01)  # status update rate ~100 Hz
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        conn.close()
+        print(f"[cmd] Client disconnected: {addr}")
+
+
+def _command_server_thread(port: int):
+    """Background thread: accept command connections from desktop."""
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", port))
+    server_sock.listen(2)
+    print(f"[cmd] Command server listening on 0.0.0.0:{port}")
+
+    while True:
+        try:
+            conn, addr = server_sock.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            threading.Thread(target=_handle_cmd_client, args=(conn, addr), daemon=True).start()
+        except OSError:
+            break
+
+
+def start_command_server(port: int = CMD_PORT):
+    """Launch the command server as a daemon thread (non-blocking)."""
+    t = threading.Thread(target=_command_server_thread, args=(port,), daemon=True)
+    t.start()
+    print(f"[cmd] Background command server started on port {port}")
+    return t
+
+
+def _update_cmd_status(state, current_deg, target_deg, error_norm, **extra):
+    """Update shared status dict (thread-safe)."""
+    with _cmd_status_lock:
+        _cmd_status["state"] = state
+        _cmd_status["current_deg"] = [round(v, 3) for v in current_deg]
+        _cmd_status["target_deg"] = [round(v, 3) for v in target_deg]
+        _cmd_status["error_norm"] = round(error_norm, 4)
+        for k, v in extra.items():
+            _cmd_status[k] = v
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MPC control for myCobot Pro 630")
-    parser.add_argument("--suction", action="store_true", default=True,
+    parser.add_argument("--suction", action="store_true", default=False,
                         help="Turn on suction pump during operation (default: off)")
+    parser.add_argument("--stream-port", type=int, default=STREAM_PORT,
+                        help=f"TCP port for rviz2 streaming server (default: {STREAM_PORT}, 0=disable)")
+    parser.add_argument("--stream-rate", type=float, default=STREAM_RATE_HZ,
+                        help=f"Streaming rate in Hz (default: {STREAM_RATE_HZ})")
+    parser.add_argument("--cmd-port", type=int, default=CMD_PORT,
+                        help=f"TCP port for command server (default: {CMD_PORT}, 0=disable)")
     args = parser.parse_args()
 
     # Create HAL component
@@ -504,6 +939,14 @@ def main():
         print(f"HAL component creation failed: {e}")
         print("Ensure LinuxCNC is running and mpc component not already loaded.")
         sys.exit(1)
+
+    # Start integrated streaming server for rviz2 visualization
+    if args.stream_port > 0:
+        start_stream_server(port=args.stream_port, rate_hz=args.stream_rate)
+
+    # Start command server for desktop control (control_robot.py)
+    if args.cmd_port > 0:
+        start_command_server(port=args.cmd_port)
 
     # Initialize pins
     for i in range(MAX_JOINTS):
@@ -522,24 +965,84 @@ def main():
     s = linuxcnc.stat()
     s.poll()
     current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
-    init = [-90,-90,0,-90,0,0]
-    target = [a + 15.0 for a in current]
     print("Current angles:", current)
-    print("Target (current + 5° each):", target)
 
     # Suction pump
     if args.suction:
         suction_pump(on=True)
 
-    # Run (Ctrl+C to stop)
+    _update_cmd_status("idle", current, current, 0.0)
+
+    # Main loop: wait for commands from the desktop (control_robot.py)
+    print("\n" + "=" * 60)
+    print("Waiting for commands from desktop (control_robot.py)...")
+    print(f"  Command port: {args.cmd_port}")
+    print(f"  Stream port:  {args.stream_port}")
+    print("  Press Ctrl+C to stop.")
+    print("=" * 60 + "\n")
+
     try:
-        init = [-90, -90, 0, -90, 0, 0]
-        for i in range(10):
-            target = [a + np.random.uniform(-20, 20) for a in init]
-            print(f"\n=== Run {i+1}/5: target={[round(t,1) for t in target]} ===")
-            
-            run_mpc_loop(h, s, target, duration_sec=3.0)
-            run_mpc_loop(h, s, init, duration_sec=3.0)
+        while True:
+            try:
+                cmd = _cmd_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            target = cmd.get("target_deg")
+            if target is None or len(target) != MAX_JOINTS:
+                print(f"[cmd] Invalid target: {target}")
+                continue
+
+            duration = cmd.get("duration", 2.0)
+            controller = cmd.get("controller", "pd")
+            pos_tol = cmd.get("pos_tol", 0.5)
+            settle = cmd.get("settle_steps", 10)
+
+            t_cmd_start = time.perf_counter()
+
+            s.poll()
+            current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
+            err = sum((t - c) ** 2 for t, c in zip(target, current)) ** 0.5
+            print(f"\n[cmd] Moving: {[round(v, 1) for v in current]} → {[round(v, 1) for v in target]}")
+            print(f"       distance={err:.1f}° duration={duration}s controller={controller}"
+                  f" pos_tol={pos_tol}° settle={settle}")
+
+            _update_cmd_status("moving", current, target, err)
+
+            if controller == "mpc":
+                mpc_control_loop(h, s, target, duration_sec=duration,
+                                 pos_tol=pos_tol, settle_steps=settle)
+            else:
+                pd_control_loop(h, s, target, duration_sec=duration,
+                                pos_tol=pos_tol, settle_steps=settle)
+
+            robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
+
+            s.poll()
+            final = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
+            final_err = sum((t - f) ** 2 for t, f in zip(target, final)) ** 0.5
+
+            # Compute per-loop timing averages for this command
+            n_loops = len(_timing["poll"]) if _timing["poll"] else 1
+            avg_poll = sum(_timing["poll"][-n_loops:]) / n_loops if _timing["poll"] else 0
+            solve_key = "mpc_solve" if controller == "mpc" else "pd_solve"
+            avg_solve = sum(_timing[solve_key][-n_loops:]) / n_loops if _timing[solve_key] else 0
+            avg_hal = sum(_timing["hal_write"][-n_loops:]) / n_loops if _timing["hal_write"] else 0
+            avg_sleep = sum(_timing["sleep"][-n_loops:]) / n_loops if _timing["sleep"] else 0
+
+            _update_cmd_status(
+                "done", final, target, final_err,
+                robot_exec_ms=round(robot_exec_ms, 2),
+                n_loops=n_loops,
+                avg_poll_ms=round(avg_poll, 3),
+                avg_solve_ms=round(avg_solve, 3),
+                avg_hal_write_ms=round(avg_hal, 3),
+                avg_sleep_ms=round(avg_sleep, 3),
+            )
+
+            print(f"[cmd] Done. exec={robot_exec_ms:.0f}ms loops={n_loops} err={final_err:.3f}°"
+                  f" [avg poll={avg_poll:.2f} solve={avg_solve:.2f} hal={avg_hal:.2f} sleep={avg_sleep:.2f} ms]")
+
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
