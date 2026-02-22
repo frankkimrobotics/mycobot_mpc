@@ -215,9 +215,11 @@ net ctrl-enable => mux-gen.05.sel-bit-00
 net pid5-cmd mux-gen.05.out-float => pid.5.command pro600.joint5_motor_poscmd colli.qCmdVec.05
 
 
-# Velocity mux: select between PID output (in0, normal) and MPC velocity (in1, MPC active)
+# Velocity mux: select between PID output (in0, normal) and ctrl velocity (in1, ctrl active)
 # When ctrl.enable=FALSE: pro600 gets PID velocity (normal servo loop)
-# When ctrl.enable=TRUE:  pro600 gets MPC velocity directly (MPC has full control)
+# When ctrl.enable=TRUE:  pro600 gets ctrl velocity directly (robot_hal has full control)
+# Note: pro600 exposes joint*_torqfb (torque feedback) only; no torque command pins are
+# wired. Commands are position (pid.command / joint*_motor_poscmd) and velocity (joint*_poscmd).
 net sig0-vel-cmd pid.0.output => mux-gen.06.in-float-00
 net ctrl-j0-vel ctrl.joint0_vel_cmd => mux-gen.06.in-float-01
 net ctrl-enable => mux-gen.06.sel-bit-00

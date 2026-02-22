@@ -34,14 +34,18 @@ try:
     from invdyn_model import (
         load_params as load_invdyn_params,
         linuxcnc_deg_to_rad,
+        compute_MCG,
         NUM_JOINTS as MODEL_NUM_JOINTS,
     )
 except ImportError:
     load_invdyn_params = None
     linuxcnc_deg_to_rad = None
+    compute_MCG = None
     MODEL_NUM_JOINTS = 6
 
 MAX_JOINTS = 6
+# Command-loop period (ms). HAL servo can run faster (e.g. SERVO_PERIOD 10 ms or sub-3 ms);
+# this is how often we compute and write pos_cmd/vel_cmd. Overridable via --period-ms.
 PERIOD_MS = 20
 PERIOD_SEC = PERIOD_MS / 1000.0
 
@@ -53,7 +57,8 @@ INTEGRAL_CLAMP = 50.0  # anti-windup: clamp |integral| per joint
 U_MAX_PER_STEP = 8.0
 
 # InvDyn (acceleration space): qdd_d = Kp*e - Kd*qd, then integrate
-# Acceleration integration gives ~0.03° per 20 ms step → robot barely moves.
+# Acceleration integration: step = 0.5*qdd*dt^2; with qdd_max=150 deg/s^2, dt=20ms → ~0.03° per step;
+# with dt=3ms → ~0.0007° per step. So robot barely moves at any realistic loop period.
 # USE_PD_STEPS_FOR_INVDYN: use direct position-step PD for invdyn so the robot moves.
 USE_PD_STEPS_FOR_INVDYN = True
 INVDYN_KP = 144.0
@@ -62,6 +67,8 @@ QDD_MAX_DEG = 150.0
 # PD position-step gains when USE_PD_STEPS_FOR_INVDYN (same as mpc_hal / invdyn_hal pd_solve)
 KP_PD_INVDYN = 0.5
 KD_PD_INVDYN = 0.1
+# Gravity compensation from npz: vel_cmd += K_GRAV_COMP * G(q) (G in Nm; scale to deg/s)
+K_GRAV_COMP = 0.02
 
 # PD + vel feedforward: same Kp,Kd as invdyn-style for consistency
 KP_PD_VELFF = 144.0 / 90.0  # scale to deg/s² per deg error
@@ -140,8 +147,8 @@ def _invdyn_solve_fallback(q, target_angles, q_vel=None, prev_q=None, dt=None):
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
 
 
-def _invdyn_pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
-    """Direct position-step PD for invdyn path so the robot actually moves (same idea as invdyn_hal pd_solve)."""
+def _invdyn_pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None, prev_target=None, params=None):
+    """Direct position-step PD for invdyn; optional vel_ff for trajectory tracking; optional G(q) from npz."""
     current = np.array(q, dtype=float)
     target = np.array(target_angles, dtype=float)
     error = target - current
@@ -154,9 +161,24 @@ def _invdyn_pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
     if dt is None or dt <= 0:
         dt = PERIOD_SEC
     u = KP_PD_INVDYN * error - KD_PD_INVDYN * velocity
+    vel_ff = np.zeros(MAX_JOINTS)
+    if prev_target is not None and dt > 0:
+        prev_t = np.array(prev_target, dtype=float)
+        vel_ff = (target - prev_t) / dt
+    u = u + vel_ff * dt  # add velocity feedforward for trajectory tracking
     u = np.clip(u, -U_MAX_PER_STEP, U_MAX_PER_STEP)
     next_pos = current + u
     vel_cmd = (u / dt * 0.5) if dt > 0 else np.zeros(MAX_JOINTS)
+    vel_cmd = np.array(vel_cmd, dtype=float) + vel_ff
+    # Use npz model for gravity compensation: vel_cmd += K_GRAV_COMP * G(q) (G in Nm)
+    if params is not None and compute_MCG is not None and linuxcnc_deg_to_rad is not None:
+        try:
+            q_rad = linuxcnc_deg_to_rad(current)
+            qd_rad = np.deg2rad(velocity)
+            _, _, G = compute_MCG(q_rad, qd_rad, params)
+            vel_cmd = vel_cmd + K_GRAV_COMP * np.asarray(G, dtype=float)
+        except Exception:
+            pass
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
 
 
@@ -186,10 +208,11 @@ def _invdyn_model_solve_deg(q, target_angles, q_vel=None, prev_q=None, dt=None):
 
 
 @timed("solve")
-def invdyn_solve(q, target_angles, params, q_vel=None, prev_q=None, dt=None):
-    """Invdyn: use PD position steps (so robot moves) when USE_PD_STEPS_FOR_INVDYN; else acceleration integration."""
+def invdyn_solve(q, target_angles, params, q_vel=None, prev_q=None, dt=None, prev_target=None):
+    """Invdyn: use PD position steps (so robot moves) when USE_PD_STEPS_FOR_INVDYN; else acceleration integration.
+    With prev_target, adds velocity feedforward for trajectory tracking."""
     if USE_PD_STEPS_FOR_INVDYN:
-        return _invdyn_pd_solve(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
+        return _invdyn_pd_solve(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt, prev_target=prev_target, params=params)
     if params is not None and (load_invdyn_params is not None or linuxcnc_deg_to_rad is not None):
         return _invdyn_model_solve_deg(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
     return _invdyn_solve_fallback(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
@@ -400,8 +423,10 @@ def enable_machine(h, timeout=60.0):
 # Single control loop (dispatches to pid / invdyn / pd_velff)
 # ---------------------------------------------------------------------------
 def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5, vel_tol=1.0, settle_steps=10,
-                     log_dir=None, log_enabled=True):
+                     log_dir=None, log_enabled=True, period_sec=None):
     """One loop: poll -> solve (pid|invdyn|pd_velff) -> HAL write; done_reason = converged | duration."""
+    if period_sec is None:
+        period_sec = PERIOD_SEC
     h["enable"] = True
     t_start = time.time()
     loop_count = 0
@@ -414,7 +439,7 @@ def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5,
     for k in _timing:
         _timing[k] = []
     log_rows = []
-    period = PERIOD_SEC
+    period = period_sec
 
     while (time.time() - t_start) < duration_sec:
         t_loop_start = time.time()
@@ -426,7 +451,7 @@ def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5,
         if controller == "pid":
             next_pos, vel_cmd, integral = pid_solve(q, target_angles, integral, q_vel=q_vel, prev_q=prev_current, dt=dt)
         elif controller == "invdyn":
-            res = invdyn_solve(q, target_angles, _params, q_vel=q_vel, prev_q=prev_current, dt=dt)
+            res = invdyn_solve(q, target_angles, _params, q_vel=q_vel, prev_q=prev_current, dt=dt, prev_target=prev_target)
             next_pos, vel_cmd = res[0], res[1]
         else:  # pd_velff
             next_pos, vel_cmd = pd_velff_solve(q, target_angles, prev_target, q_vel=q_vel, prev_q=prev_current, dt=dt)
@@ -626,8 +651,14 @@ def main():
     parser.add_argument("--stream-rate", type=float, default=STREAM_RATE_HZ)
     parser.add_argument("--log-dir", default=None, help="Directory for CSV logs (default: script_dir/logs)")
     parser.add_argument("--no-log", action="store_true", help="Do not write CSV logs")
+    parser.add_argument("--period-ms", type=float, default=None,
+                        help="Command loop period in ms (default: 20). HAL servo can run faster (e.g. 10 ms or sub-3 ms).")
     parser.add_argument("--suction", action="store_true", default=False)
     args = parser.parse_args()
+
+    period_sec = (args.period_ms if args.period_ms is not None else PERIOD_MS) / 1000.0
+    if args.period_ms is not None:
+        print(f"  Command loop period: {args.period_ms} ms")
 
     log_dir = args.log_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
     log_enabled = not args.no_log
@@ -635,7 +666,7 @@ def main():
     if args.params and os.path.isfile(args.params) and load_invdyn_params is not None:
         _params = load_invdyn_params(args.params, urdf_path=args.urdf)
         if _params is not None:
-            print(f"  Loaded invdyn params from {args.params}")
+            print(f"  Loaded invdyn params from {args.params} (used for gravity compensation in invdyn)")
     else:
         _params = None
 
@@ -706,7 +737,8 @@ def main():
             _update_cmd_status("moving", current, target, err)
 
             done_reason = run_control_loop(h, s, target, duration_sec=duration, controller=controller,
-                                          pos_tol=pos_tol, settle_steps=settle, log_dir=log_dir, log_enabled=log_enabled)
+                                          pos_tol=pos_tol, settle_steps=settle, log_dir=log_dir, log_enabled=log_enabled,
+                                          period_sec=period_sec)
 
             robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
             s.poll()
