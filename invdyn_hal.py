@@ -29,7 +29,10 @@ except ImportError as e:
     sys.exit(1)
 
 MAX_JOINTS = 6
-INVDYN_PERIOD_MS = 2   # 100 Hz
+# InvDyn loop period. With 2 ms the position step 0.5*qdd*dt² is ~0.0003° per step, below
+# motor resolution/deadband so the robot doesn't move. Use 20 ms so the step is ~0.03° and
+# vel_cmd builds (3 deg/s per step); robot then tracks. PD uses position steps up to 8°.
+INVDYN_PERIOD_MS = 20  # 50 Hz
 # InvDyn: q̈_d = Kp*e - Kd*q̇ (deg/s²). Clip acceleration for safety.
 INVDYN_KP = 144.0      # 1/s² → ωn=12 rad/s in rad; in deg: 144 (deg/s² per deg error)
 INVDYN_KD = 24.0      # 1/s

@@ -258,7 +258,7 @@ class RobotConnection:
         }
         msg = json.dumps(cmd) + "\n"
         self.sock.sendall(msg.encode("utf-8"))
-        print(f"[conn] Sent target: {[round(v, 1) for v in target_deg]} "
+        print(f"[conn] Sent target: {[round(float(v), 1) for v in target_deg]} "
               f"(dur={duration}s, ctrl={controller}, tol={pos_tol}°, settle={settle_steps})")
 
         # Read ack

@@ -81,7 +81,40 @@ and in the code ensure the dict sent to the robot includes `"controller": args.c
 
 ---
 
+## Troubleshooting: "Robot didn't move" (status shows moving/done but joints don't change)
+
+If the desktop shows `[moving]` then `[done]` but the robot does not move (and reported `q` stays near the initial pose):
+
+1. **Confirm InvDyn HAL is active**  
+   On the Raspi you must have started LinuxCNC with **elerob_invdyn.ini** (not elerob_mpc.ini). The HAL must load `invdyn_hal.py` and wire `invdyn.jointN_pos_cmd` / `invdyn.jointN_vel_cmd` into the mux (see elerob_invdyn.hal).
+
+2. **Check invdyn.enable on the Raspi**  
+   The mux passes InvDyn commands to the PIDs only when `invdyn.enable` is TRUE. In a shell on the Raspi:
+   ```bash
+   halcmd getp invdyn.enable
+   ```
+   During a move it should be TRUE. If it is FALSE, InvDyn output is not selected and the robot will not follow invdyn commands.
+
+3. **Check that InvDyn commands are changing**  
+   While sending a move from the desktop, on the Raspi run:
+   ```bash
+   watch -n 0.5 'halcmd getp invdyn.enable; halcmd getp invdyn.joint3_pos_cmd'
+   ```
+   For a target with joint 4 = -60°, `invdyn.joint3_pos_cmd` (joint index 3) should move from ~-90 toward -60. If it never changes, the Python component may not be writing (or may have exited).
+
+4. **Compare with PID**  
+   Try the same target with PD to see if the robot moves at all:
+   ```bash
+   python control_robot.py --host 10.0.0.27 --controller pid --joints -90 -90 0 -60 0 0 --duration 3
+   ```
+   If the robot moves with `pid` but not with `invdyn`, the issue is specific to the InvDyn path (mux selection, invdyn.enable, or wiring of invdyn pins).
+
+5. **Raspi console output**  
+   In the terminal where LinuxCNC was started, check for `[cmd] Moving → ... controller=invdyn` and any Python tracebacks. If invdyn_hal.py crashes or never enters the control loop, the robot will not move.
+
+---
+
 ## Gains
 
-- **invdyn_hal.py**: `INVDYN_KP = 144`, `INVDYN_KD = 24`, `QDD_MAX_DEG = 150` (tune in the script).
+- **invdyn_hal.py**: `INVDYN_KP = 144`, `INVDYN_KD = 24`, `QDD_MAX_DEG = 150`, `INVDYN_PERIOD_MS = 20` (50 Hz). The loop period must be large enough that the position step 0.5*qdd*dt² is above the motor deadband (~20 ms works; 2 ms is too small and the robot won’t move).
 - **invdyn_linuxcnc.py**: same Kp/Kd and `QDD_MAX_DEG`.
