@@ -12,7 +12,7 @@ Usage:
   python calibrate_robot.py --host 10.0.0.27 --duration 3 --step-deg 10 --max-deg 80
   python calibrate_robot.py --host $ROBOT_IP --start -90 -90 0 -90 0 0
 
-  Phase 1: one move to rest pose (duration 3 s, so robot holds there for 3 s); then per-joint sweep ±max_deg (default ±80°); each move 3 s. No log fetch after the initial rest move so the robot does not sit with PIDs off.
+  Phase 1: one move to rest pose (duration 5 s default); then per-joint sweep ±max_deg (default ±80°); each move 5 s. PIDs stay on between moves (mpc_hal); no log fetch after initial rest move.
   Phase 2: 10 random poses — joint0 ±10°, joints 1–5 ±30° from rest pose.
 """
 
@@ -86,8 +86,8 @@ def main():
     ap.add_argument("--cmd-port", type=int, default=9998, help="Command port (default: 9998)")
     ap.add_argument("--controller", choices=["pid", "mpc", "invdyn"], default="pid",
                     help="Controller (default: pid)")
-    ap.add_argument("--duration", type=float, default=3.0,
-                    help="Move duration per waypoint in seconds (default: 3); used for every calibration move")
+    ap.add_argument("--duration", type=float, default=5.0,
+                    help="Move duration per waypoint in seconds (default: 5); longer so robot can reach pose before timeout")
     ap.add_argument("--step-deg", type=float, default=10.0,
                     help="Step size in degrees per joint (default: 10)")
     ap.add_argument("--max-deg", type=float, default=80.0,
@@ -157,7 +157,7 @@ def main():
     # Single move to rest pose (duration 3 s): robot goes there and holds for the move duration.
     # Do not fetch log after this move so the next command is sent immediately; otherwise the
     # robot sits with PIDs off (mpc.enable=False after each move) and can appear powered off.
-    print("\n--- Moving to rest pose (hold 3 s) ---")
+    print("\n--- Moving to rest pose ---")
     status = cr.move_to_joints(
         conn, start_deg,
         duration=args.duration, controller=args.controller,

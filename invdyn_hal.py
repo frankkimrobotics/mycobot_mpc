@@ -187,6 +187,7 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
     converged_count = 0
     prev_current = None
     t_prev = None
+    done_reason = "duration"
     for k in _timing:
         _timing[k] = []
     log_rows = []
@@ -228,6 +229,7 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
         if err < pos_tol and vel_norm < vel_tol:
             converged_count += 1
             if converged_count >= settle_steps:
+                done_reason = "converged"
                 print(f"  Converged at loop {loop_count}: err={err:.3f}° vel_norm={vel_norm:.3f}°/s")
                 break
         else:
@@ -245,9 +247,10 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
         if loop_count % 10 == 0 or loop_count <= 3:
             print(f"Loop {loop_count}: q={q[:3]}... err={err:.3f} vcmd={[round(v, 1) for v in vel_cmd[:3]]}")
 
-    h["enable"] = False
-    print(f"\nDone. Ran {loop_count} InvDyn iterations.")
+    # Keep PIDs on between moves; disable only on exit (main finally).
+    print(f"\nDone. Ran {loop_count} InvDyn iterations. exit_reason={done_reason}")
     _save_log(log_rows, target_angles, controller)
+    return done_reason
 
 
 def pd_control_loop(h, s, target_angles, duration_sec=10.0,
@@ -260,6 +263,7 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
     converged_count = 0
     prev_current = None
     t_prev = None
+    done_reason = "duration"
     for k in _timing:
         _timing[k] = []
     log_rows = []
@@ -292,6 +296,7 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
         if err < pos_tol and vel_norm < vel_tol:
             converged_count += 1
             if converged_count >= settle_steps:
+                done_reason = "converged"
                 break
         else:
             converged_count = 0
@@ -301,9 +306,10 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
             err, _timing["poll"][-1], _timing["pd_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
         ])
-    h["enable"] = False
-    print(f"Done. Ran {loop_count} PD iterations.")
+    # Keep PIDs on between moves; disable only on exit (main finally).
+    print(f"Done. Ran {loop_count} PD iterations. exit_reason={done_reason}")
     _save_log(log_rows, target_angles, controller)
+    return done_reason
 
 
 def _read_hal_feedback():
@@ -748,9 +754,9 @@ def main():
             print(f"\n[cmd] Moving → {[round(v, 1) for v in target]} controller={controller}")
             _update_cmd_status("moving", current, target, err)
             if controller == "invdyn":
-                invdyn_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
+                done_reason = invdyn_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
             else:
-                pd_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
+                done_reason = pd_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
             robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
             s.poll()
             final = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
@@ -760,10 +766,11 @@ def main():
             avg_solve = sum(_timing[solve_key][-n_loops:]) / n_loops if _timing[solve_key] else 0
             _update_cmd_status(
                 "done", final, target, final_err,
-                robot_exec_ms=round(robot_exec_ms, 2), n_loops=n_loops, avg_solve_ms=round(avg_solve, 3),
+                robot_exec_ms=round(robot_exec_ms, 2), n_loops=n_loops, done_reason=done_reason,
+                avg_solve_ms=round(avg_solve, 3),
                 last_log_name=_last_log_filename,
             )
-            print(f"[cmd] Done. exec={robot_exec_ms:.0f}ms err={final_err:.3f}°")
+            print(f"[cmd] Done. exit_reason={done_reason} exec={robot_exec_ms:.0f}ms err={final_err:.3f}°")
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

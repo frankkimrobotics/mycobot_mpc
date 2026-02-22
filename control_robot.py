@@ -420,6 +420,8 @@ def move_to_joints(
             timer._timings[key] = 0.0
 
     print(f"[timer] {timer.summary()}")
+    if status.get("done_reason"):
+        print(f"  exit_reason={status['done_reason']}")
 
     if logger:
         logger.log_move(
