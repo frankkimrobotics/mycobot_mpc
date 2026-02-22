@@ -8,6 +8,7 @@ Requires HAL: load invdyn component and wire invdyn.jointN_pos_cmd to pid.N.comm
 (via mux_generic when invdyn.enable=1). See elerob_invdyn.hal.
 """
 
+import base64
 import queue
 import time
 import sys
@@ -241,7 +242,11 @@ def _write_hal_cmd(h, next_pos, vel_cmd):
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
+_last_log_filename = None  # basename of last saved CSV (for desktop fetch)
+
+
 def _save_log(log_rows, target_angles):
+    global _last_log_filename
     if not log_rows:
         return
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -258,6 +263,7 @@ def _save_log(log_rows, target_angles):
     with open(filename, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(header)
         csv.writer(f).writerows(log_rows)
+    _last_log_filename = os.path.basename(filename)
     print(f"  Log saved: {filename}")
 
 
@@ -436,7 +442,13 @@ def start_stream_server(port=STREAM_PORT, rate_hz=STREAM_RATE_HZ):
 # ── Command server ───────────────────────────────────────────────────────
 CMD_PORT = 9998
 _cmd_queue = queue.Queue()
-_cmd_status = {"state": "idle", "current_deg": [0.0] * MAX_JOINTS, "target_deg": [0.0] * MAX_JOINTS, "error_norm": 0.0}
+_cmd_status = {
+    "state": "idle",
+    "current_deg": [0.0] * MAX_JOINTS,
+    "target_deg": [0.0] * MAX_JOINTS,
+    "error_norm": 0.0,
+    "last_log_name": None,
+}
 _cmd_status_lock = threading.Lock()
 
 
@@ -468,6 +480,24 @@ def _handle_cmd_client(conn, addr):
                         if "target_deg" in cmd:
                             _cmd_queue.put(cmd)
                             conn.sendall((json.dumps({"state": "ack", "target_deg": cmd["target_deg"]}) + "\n").encode("utf-8"))
+                        elif "get_log" in cmd:
+                            name = cmd.get("get_log")
+                            if name and isinstance(name, str):
+                                name = os.path.basename(name)
+                                if name.endswith(".csv"):
+                                    path = os.path.join(LOG_DIR, name)
+                                    if os.path.isfile(path):
+                                        with open(path, "rb") as f:
+                                            raw = f.read()
+                                        payload = base64.b64encode(raw).decode("ascii")
+                                        conn.sendall((json.dumps({
+                                            "state": "log", "filename": name,
+                                            "log_content_base64": payload,
+                                        }) + "\n").encode("utf-8"))
+                                    else:
+                                        conn.sendall((json.dumps({"state": "log_error", "error": "file_not_found"}) + "\n").encode("utf-8"))
+                                else:
+                                    conn.sendall((json.dumps({"state": "log_error", "error": "bad_filename"}) + "\n").encode("utf-8"))
                     except json.JSONDecodeError:
                         pass
             except socket.timeout:
@@ -589,7 +619,11 @@ def main():
             n_loops = len(_timing["poll"]) if _timing["poll"] else 1
             solve_key = "invdyn_solve" if controller == "invdyn" else "pd_solve"
             avg_solve = sum(_timing[solve_key][-n_loops:]) / n_loops if _timing[solve_key] else 0
-            _update_cmd_status("done", final, target, final_err, robot_exec_ms=round(robot_exec_ms, 2), n_loops=n_loops, avg_solve_ms=round(avg_solve, 3))
+            _update_cmd_status(
+                "done", final, target, final_err,
+                robot_exec_ms=round(robot_exec_ms, 2), n_loops=n_loops, avg_solve_ms=round(avg_solve, 3),
+                last_log_name=_last_log_filename,
+            )
             print(f"[cmd] Done. exec={robot_exec_ms:.0f}ms err={final_err:.3f}°")
     except KeyboardInterrupt:
         print("\nInterrupted.")

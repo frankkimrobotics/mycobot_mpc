@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import base64
 import csv
 import json
 import os
@@ -279,6 +280,44 @@ class RobotConnection:
         """Read one status message from the robot."""
         return self._read_status(None, timeout=2.0)
 
+    def fetch_log(self, filename: str) -> str | None:
+        """Request a log file from the robot (saved on Raspi) and save it to local logs/.
+        Returns the local path if successful, else None.
+        """
+        self.sock.sendall((json.dumps({"get_log": filename}) + "\n").encode("utf-8"))
+        self.sock.settimeout(10.0)
+        buffer = ""
+        t0 = time.time()
+        while time.time() - t0 < 10.0:
+            try:
+                data = self.sock.recv(65536)
+                if not data:
+                    return None
+                buffer += data.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get("state") == "log" and "log_content_base64" in msg:
+                        raw = base64.b64decode(msg["log_content_base64"])
+                        os.makedirs(LOG_DIR, exist_ok=True)
+                        local_path = os.path.join(LOG_DIR, msg.get("filename", filename))
+                        with open(local_path, "wb") as f:
+                            f.write(raw)
+                        print(f"[log] Saved robot log to {local_path}")
+                        return local_path
+                    if msg.get("state") == "log_error":
+                        print(f"[log] Robot error: {msg.get('error', 'unknown')}")
+                        return None
+            except (socket.timeout, OSError):
+                break
+        return None
+
     def _read_status(self, wait_for_state: str | None, timeout: float = 2.0) -> dict:
         """Read status messages, optionally waiting for a specific state."""
         self.sock.settimeout(timeout)
@@ -304,6 +343,15 @@ class RobotConnection:
             except socket.timeout:
                 break
         return {}
+
+
+def _maybe_fetch_robot_log(conn: RobotConnection, status: dict, fetch_logs: bool) -> None:
+    """If fetch_logs and robot reported last_log_name, fetch CSV and save to local logs/."""
+    if not fetch_logs or not status:
+        return
+    name = status.get("last_log_name")
+    if name:
+        conn.fetch_log(name)
 
 
 def move_to_joints(
@@ -452,6 +500,7 @@ def interactive_mode(
     pos_tol: float = 0.5,
     settle_steps: int = 10,
     logger: MoveLogger | None = None,
+    fetch_logs: bool = True,
 ):
     """Interactive control loop: enter poses from the terminal."""
     R_home, _ = ik.forward_kinematics(HOME_LINUXCNC_DEG)
@@ -487,27 +536,30 @@ def interactive_mode(
 
             elif cmd == "home":
                 print(f"Moving to home: {HOME_LINUXCNC_DEG}")
-                move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
-                               duration=duration, controller=controller,
-                               pos_tol=pos_tol, settle_steps=settle_steps,
-                               logger=logger)
+                status = move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
+                                        duration=duration, controller=controller,
+                                        pos_tol=pos_tol, settle_steps=settle_steps,
+                                        logger=logger)
+                _maybe_fetch_robot_log(conn, status, fetch_logs)
 
             elif cmd == "xyz" and len(parts) == 4:
                 x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
                 t_target = np.array([x, y, z])
                 print(f"Target position: {t_target.tolist()} m (home orientation)")
-                move_to_pose(conn, ik, R_home, t_target,
-                             duration=duration, controller=controller,
-                             pos_tol=pos_tol, settle_steps=settle_steps,
-                             logger=logger)
+                _, status = move_to_pose(conn, ik, R_home, t_target,
+                                         duration=duration, controller=controller,
+                                         pos_tol=pos_tol, settle_steps=settle_steps,
+                                         logger=logger)
+                _maybe_fetch_robot_log(conn, status, fetch_logs)
 
             elif cmd == "joints" and len(parts) == 7:
                 joints = [float(v) for v in parts[1:7]]
                 print(f"Target joints: {joints} deg")
-                move_to_joints(conn, np.array(joints),
-                               duration=duration, controller=controller,
-                               pos_tol=pos_tol, settle_steps=settle_steps,
-                               logger=logger)
+                status = move_to_joints(conn, np.array(joints),
+                                        duration=duration, controller=controller,
+                                        pos_tol=pos_tol, settle_steps=settle_steps,
+                                        logger=logger)
+                _maybe_fetch_robot_log(conn, status, fetch_logs)
 
             elif cmd == "fk":
                 timer = PipelineTimer()
@@ -570,7 +622,9 @@ Examples:
     parser.add_argument("--settle-steps", type=int, default=10,
         help="Consecutive converged loops before early stop (default: 10)")
     parser.add_argument("--no-rviz", action="store_true",
-        help="Don't launch rviz2 (use if it's already running)")
+                        help="Don't launch rviz2 (use if it's already running)")
+    parser.add_argument("--no-fetch-logs", action="store_true",
+                        help="Don't fetch robot CSV logs to local logs/ after each move")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--xyz", nargs=3, type=float, metavar=("X", "Y", "Z"),
@@ -629,31 +683,34 @@ Examples:
             interactive_mode(conn, ik, controller=args.controller,
                              duration=args.duration,
                              pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                             logger=logger)
+                             logger=logger, fetch_logs=not args.no_fetch_logs)
 
         elif args.home:
             print(f"Moving to home: {HOME_LINUXCNC_DEG}")
-            move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
-                           duration=args.duration, controller=args.controller,
-                           pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                           logger=logger)
+            status = move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
+                                    duration=args.duration, controller=args.controller,
+                                    pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+                                    logger=logger)
+            _maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
 
         elif args.xyz:
             R_home, _ = ik.forward_kinematics(HOME_LINUXCNC_DEG)
             t_target = np.array(args.xyz)
             print(f"Target position: {t_target.tolist()} m")
-            move_to_pose(conn, ik, R_home, t_target,
-                         duration=args.duration, controller=args.controller,
-                         pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                         logger=logger)
+            status = move_to_pose(conn, ik, R_home, t_target,
+                                  duration=args.duration, controller=args.controller,
+                                  pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+                                  logger=logger)
+            _maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
 
         elif args.joints:
             target_deg = np.array(args.joints)
             print(f"Target joints: {target_deg.tolist()} deg")
-            move_to_joints(conn, target_deg,
-                           duration=args.duration, controller=args.controller,
-                           pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                           logger=logger)
+            status = move_to_joints(conn, target_deg,
+                                    duration=args.duration, controller=args.controller,
+                                    pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+                                    logger=logger)
+            _maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
 
     except KeyboardInterrupt:
         print("\nInterrupted.")

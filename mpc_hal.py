@@ -7,6 +7,7 @@ Requires HAL setup: load mpc component and wire mpc.jointN_pos_cmd to pid.N.comm
 (via mux_generic when mpc.enable=1). See mpc_hal_setup.hal and README.
 """
 
+import base64
 import queue
 import time
 import sys
@@ -350,8 +351,12 @@ def _print_timing_summary(loop_count):
     print(f"  [timing] poll={poll_ms:.2f}ms pd_solve={solve_ms:.2f}ms hal_write={hal_ms:.2f}ms sleep={sleep_ms:.2f}ms total={total_ms:.2f}ms")
 
 
+_last_log_filename = None  # basename of last saved CSV (for desktop fetch)
+
+
 def _save_log(log_rows, target_angles):
-    """Write collected log rows to a timestamped CSV file."""
+    """Write collected log rows to a timestamped CSV file. Sets _last_log_filename for fetch."""
+    global _last_log_filename
     if not log_rows:
         return
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -367,10 +372,11 @@ def _save_log(log_rows, target_angles):
         + [f"cmd_vel{i}" for i in range(MAX_JOINTS)]
         + ["err_norm", "poll_ms", "pd_solve_ms", "hal_write_ms", "sleep_ms"]
     )
-    with open(filename, "w", newline="") as f:
+    with open(filename, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(log_rows)
+    _last_log_filename = os.path.basename(filename)
     print(f"  Log saved: {filename} ({len(log_rows)} rows)")
 
 
@@ -817,10 +823,11 @@ _cmd_queue = queue.Queue()
 
 # Shared status dict: main loop writes, command server reads & sends to client
 _cmd_status = {
-    "state": "idle",        # idle | moving | done | error
+    "state": "idle",
     "current_deg": [0.0] * MAX_JOINTS,
     "target_deg": [0.0] * MAX_JOINTS,
     "error_norm": 0.0,
+    "last_log_name": None,  # basename of last CSV on robot (for desktop fetch)
 }
 _cmd_status_lock = threading.Lock()
 
@@ -867,6 +874,24 @@ def _handle_cmd_client(conn, addr):
                         _cmd_queue.put(cmd)
                         ack = {"state": "ack", "target_deg": cmd["target_deg"]}
                         conn.sendall((json.dumps(ack) + "\n").encode("utf-8"))
+                    elif "get_log" in cmd:
+                        name = cmd.get("get_log")
+                        if name and isinstance(name, str):
+                            name = os.path.basename(name)
+                            if name.endswith(".csv"):
+                                path = os.path.join(LOG_DIR, name)
+                                if os.path.isfile(path):
+                                    with open(path, "rb") as f:
+                                        raw = f.read()
+                                    payload = base64.b64encode(raw).decode("ascii")
+                                    conn.sendall((json.dumps({
+                                        "state": "log", "filename": name,
+                                        "log_content_base64": payload,
+                                    }) + "\n").encode("utf-8"))
+                                else:
+                                    conn.sendall((json.dumps({"state": "log_error", "error": "file_not_found"}) + "\n").encode("utf-8"))
+                            else:
+                                conn.sendall((json.dumps({"state": "log_error", "error": "bad_filename"}) + "\n").encode("utf-8"))
             except socket.timeout:
                 pass
 
@@ -1038,6 +1063,7 @@ def main():
                 avg_solve_ms=round(avg_solve, 3),
                 avg_hal_write_ms=round(avg_hal, 3),
                 avg_sleep_ms=round(avg_sleep, 3),
+                last_log_name=_last_log_filename,
             )
 
             print(f"[cmd] Done. exec={robot_exec_ms:.0f}ms loops={n_loops} err={final_err:.3f}°"
