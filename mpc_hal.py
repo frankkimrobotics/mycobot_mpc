@@ -19,6 +19,7 @@ import threading
 from datetime import datetime
 from functools import wraps
 import numpy as np
+import hal
 
 # LinuxCNC and HAL
 try:
@@ -254,11 +255,12 @@ def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
         t_prev = t_loop_start
 
         # 1. Poll feedback
-        q, q_vel, t_status = _poll_feedback(s)
+        q, q_vel, hal_vel, hal_torq, t_status = _poll_feedback(s)
 
         # 2. MPC solve (N-step QP, apply first action)
         next_pos, vel_cmd = mpc_solve(q, target_angles,
                                       dt if dt else MPC_PERIOD_MS / 1000.0)
+        u = [next_pos[i] - q[i] for i in range(MAX_JOINTS)]
         # Estimate velocity for logging (before overwriting prev_current)
         if prev_current is not None and dt is not None and dt > 0:
             est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
@@ -296,6 +298,7 @@ def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
         log_rows.append([
             controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            *u, *hal_vel, *hal_torq,
             err,
             _timing["poll"][-1], _timing["mpc_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
@@ -315,9 +318,25 @@ def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
     _save_log(log_rows, target_angles, controller)
 
 
+def _read_hal_feedback():
+    """Read velocity and torque from pro600 HAL pins. Returns (hal_vel, hal_torq) lists."""
+    hal_vel = [0.0] * MAX_JOINTS
+    hal_torq = [0.0] * MAX_JOINTS
+    for i in range(MAX_JOINTS):
+        try:
+            hal_vel[i] = float(hal.get_value(f"pro600.joint{i}_velfb"))
+        except (NameError, TypeError, ValueError, KeyError):
+            pass
+        try:
+            hal_torq[i] = float(hal.get_value(f"pro600.joint{i}_torqfb"))
+        except (NameError, TypeError, ValueError, KeyError):
+            pass
+    return hal_vel, hal_torq
+
+
 @timed("poll")
 def _poll_feedback(s):
-    """Poll LinuxCNC and return (q, q_vel, t_status)."""
+    """Poll LinuxCNC and return (q, q_vel, hal_vel, hal_torq, t_status)."""
     s.poll()
     t_status = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     q = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
@@ -326,7 +345,8 @@ def _poll_feedback(s):
         q_vel = [s.joint[i]["velocity"] for i in range(MAX_JOINTS)]
     except (KeyError, TypeError, IndexError):
         pass
-    return q, q_vel, t_status
+    hal_vel, hal_torq = _read_hal_feedback()
+    return q, q_vel, hal_vel, hal_torq, t_status
 
 
 @timed("hal_write")
@@ -370,6 +390,8 @@ def _save_log(log_rows, target_angles, controller="pd"):
         + [f"target{i}" for i in range(MAX_JOINTS)]
         + [f"cmd_pos{i}" for i in range(MAX_JOINTS)]
         + [f"cmd_vel{i}" for i in range(MAX_JOINTS)]
+        + [f"u{i}" for i in range(MAX_JOINTS)]
+        + [f"hal_vel{i}" for i in range(MAX_JOINTS)] + [f"hal_torq{i}" for i in range(MAX_JOINTS)]
         + ["err_norm", "poll_ms", "pd_solve_ms", "hal_write_ms", "sleep_ms"]
     )
     with open(filename, "w", newline="", encoding="utf-8") as f:
@@ -411,11 +433,12 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
         t_prev = t_loop_start
 
         # 1. Poll feedback
-        q, q_vel, t_status = _poll_feedback(s)
+        q, q_vel, hal_vel, hal_torq, t_status = _poll_feedback(s)
 
         # 2. PD solve → (position, velocity)
         # q_vel from LinuxCNC is ~0 (motion planner bypassed), use prev_q estimation instead
         next_pos, vel_cmd = pd_solve(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
+        u = [next_pos[i] - q[i] for i in range(MAX_JOINTS)]
         # Estimate velocity for logging (before overwriting prev_current)
         if prev_current is not None and dt is not None and dt > 0:
             est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
@@ -454,6 +477,7 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
         log_rows.append([
             controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            *u, *hal_vel, *hal_torq,
             err,
             _timing["poll"][-1], _timing["pd_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],

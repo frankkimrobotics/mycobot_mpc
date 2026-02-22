@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-Inverse dynamics control via HAL direct write (same architecture as mpc_hal.py).
-Uses InvDyn law: q̈_d = Kp*e - Kd*q̇ (deg/s²), then next_pos = q + q̇*dt + 0.5*q̈_d*dt²,
-vel_cmd = q̇ + q̈_d*dt. Writes to HAL pins joint{i}_pos_cmd, joint{i}_vel_cmd.
+PD controller with acceleration integration (same HAL architecture as mpc_hal.py).
 
-Requires HAL: load invdyn component and wire invdyn.jointN_pos_cmd to pid.N.command
-(via mux_generic when invdyn.enable=1). See elerob_invdyn.hal.
+This is a PD law, not rigid-body inverse dynamics (no mass/inertia matrix). The law is:
+  - Desired acceleration: q̈_d = Kp*e - Kd*q̇ (deg/s²), clipped
+  - Integrate: next_pos = q + q̇*dt + 0.5*q̈_d*dt²,  vel_cmd = q̇ + q̈_d*dt
+
+So it is PD (Kp*e - Kd*q̇); the only difference from the other PD path (pd_solve) is
+that here we integrate acceleration to get position and velocity setpoints, instead of
+applying a direct position step. Both paths output pos_cmd and vel_cmd to HAL; the
+downstream PIDs/pro600 turn those into torques.
+
+Writes to HAL pins joint{i}_pos_cmd, joint{i}_vel_cmd. Requires HAL: load invdyn
+component and wire invdyn.jointN_pos_cmd to pid.N.command (via mux_generic when
+invdyn.enable=1). See elerob_invdyn.hal.
 """
 
 import base64
@@ -20,6 +28,7 @@ import threading
 from datetime import datetime
 from functools import wraps
 import numpy as np
+import hal
 
 try:
     import linuxcnc
@@ -63,7 +72,7 @@ def timed(step_name):
 
 @timed("invdyn_solve")
 def invdyn_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
-    """InvDyn in deg: q̈_d = Kp*e - Kd*q̇, next_pos = q + q̇*dt + 0.5*q̈_d*dt², vel_cmd = q̇ + q̈_d*dt."""
+    """PD in acceleration: q̈_d = Kp*e - Kd*q̇; integrate to next_pos, vel_cmd."""
     current = np.array(q, dtype=float)
     target = np.array(target_angles, dtype=float)
     error = target - current
@@ -102,11 +111,21 @@ def pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
 
 
+# Use PD solver for "invdyn" path so the robot actually moves. invdyn_solve integrates
+# acceleration and produces tiny position steps on this hardware; pd_solve uses direct
+# position steps (like mpc_hal PD) and works. Set to False to try invdyn_solve again.
+INVDYN_USE_PD_SOLVE = True
+
+
 def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
                         pos_tol=0.5, vel_tol=1.0, settle_steps=10, controller="invdyn"):
-    """Run InvDyn loop: poll -> invdyn_solve -> HAL write."""
+    """Run control loop: poll -> (pd_solve or invdyn_solve) -> HAL write."""
+    use_pd = INVDYN_USE_PD_SOLVE
     print("InvDyn control loop starting. Target:", target_angles)
-    print(f"  Kp={INVDYN_KP} Kd={INVDYN_KD} qdd_max={QDD_MAX_DEG} deg/s²")
+    if use_pd:
+        print("  Using pd_solve (direct position steps) so robot moves.")
+    else:
+        print(f"  Kp={INVDYN_KP} Kd={INVDYN_KD} qdd_max={QDD_MAX_DEG} deg/s²")
     print(f"  Early stop: pos_tol={pos_tol}° vel_tol={vel_tol}°/s settle={settle_steps} steps")
     print("Press Ctrl+C to stop.\n")
     h["enable"] = True
@@ -125,8 +144,12 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
         dt = (t_loop_start - t_prev) if t_prev is not None else period
         t_prev = t_loop_start
 
-        q, q_vel, t_status = _poll_feedback(s)
-        next_pos, vel_cmd = invdyn_solve(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
+        q, q_vel, hal_vel, hal_torq, t_status = _poll_feedback(s)
+        if use_pd:
+            next_pos, vel_cmd = pd_solve(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
+        else:
+            next_pos, vel_cmd = invdyn_solve(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
+        u = [next_pos[i] - q[i] for i in range(MAX_JOINTS)]
         if prev_current is not None and dt and dt > 0:
             prev = prev_current
             est_vel = [(q[i] - prev[i]) / dt for i in range(MAX_JOINTS)]
@@ -155,11 +178,13 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
         else:
             converged_count = 0
 
+        solve_key = "pd_solve" if use_pd else "invdyn_solve"
         log_rows.append([
             controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            *u, *hal_vel, *hal_torq,
             err,
-            _timing["poll"][-1], _timing["invdyn_solve"][-1],
+            _timing["poll"][-1], _timing[solve_key][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
         ])
         if loop_count % 10 == 0 or loop_count <= 3:
@@ -189,8 +214,9 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
         t_loop_start = time.time()
         dt = (t_loop_start - t_prev) if t_prev is not None else period
         t_prev = t_loop_start
-        q, _q_vel, t_status = _poll_feedback(s)
+        q, _q_vel, hal_vel, hal_torq, t_status = _poll_feedback(s)
         next_pos, vel_cmd = pd_solve(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
+        u = [next_pos[i] - q[i] for i in range(MAX_JOINTS)]
         if prev_current is not None and dt and dt > 0:
             prev = prev_current
             est_vel = [(q[i] - prev[i]) / dt for i in range(MAX_JOINTS)]
@@ -216,12 +242,29 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
             converged_count = 0
         log_rows.append([
             controller, t_status, loop_count, *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            *u, *hal_vel, *hal_torq,
             err, _timing["poll"][-1], _timing["pd_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
         ])
     h["enable"] = False
     print(f"Done. Ran {loop_count} PD iterations.")
     _save_log(log_rows, target_angles, controller)
+
+
+def _read_hal_feedback():
+    """Read velocity and torque from pro600 HAL pins. Returns (hal_vel, hal_torq) lists."""
+    hal_vel = [0.0] * MAX_JOINTS
+    hal_torq = [0.0] * MAX_JOINTS
+    for i in range(MAX_JOINTS):
+        try:
+            hal_vel[i] = float(hal.get_value(f"pro600.joint{i}_velfb"))
+        except (NameError, TypeError, ValueError, KeyError):
+            pass
+        try:
+            hal_torq[i] = float(hal.get_value(f"pro600.joint{i}_torqfb"))
+        except (NameError, TypeError, ValueError, KeyError):
+            pass
+    return hal_vel, hal_torq
 
 
 @timed("poll")
@@ -234,7 +277,8 @@ def _poll_feedback(s):
         q_vel = [s.joint[i]["velocity"] for i in range(MAX_JOINTS)]
     except (KeyError, TypeError, IndexError):
         pass
-    return q, q_vel, t_status
+    hal_vel, hal_torq = _read_hal_feedback()
+    return q, q_vel, hal_vel, hal_torq, t_status
 
 
 @timed("hal_write")
@@ -261,6 +305,8 @@ def _save_log(log_rows, target_angles, controller="invdyn"):
         + [f"q{i}" for i in range(MAX_JOINTS)] + [f"qvel{i}" for i in range(MAX_JOINTS)]
         + [f"target{i}" for i in range(MAX_JOINTS)] + [f"cmd_pos{i}" for i in range(MAX_JOINTS)]
         + [f"cmd_vel{i}" for i in range(MAX_JOINTS)]
+        + [f"u{i}" for i in range(MAX_JOINTS)]
+        + [f"hal_vel{i}" for i in range(MAX_JOINTS)] + [f"hal_torq{i}" for i in range(MAX_JOINTS)]
         + ["err_norm", "poll_ms", "invdyn_solve_ms", "hal_write_ms", "sleep_ms"]
     )
     with open(filename, "w", newline="", encoding="utf-8") as f:

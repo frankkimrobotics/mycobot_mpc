@@ -10,10 +10,23 @@ Inverse-dynamics control using the same Raspi/LinuxCNC + HAL architecture as MPC
 
 ## Files
 
-- **invdyn_hal.py** — HAL component `invdyn`: runs on the robot (Raspi). Control law: desired acceleration `q̈_d = Kp*e - Kd*q̇` (deg/s²), then `next_pos = q + q̇*dt + 0.5*q̈_d*dt²`, `vel_cmd = q̇ + q̈_d*dt`. Writes to `invdyn.joint{i}_pos_cmd` and `invdyn.joint{i}_vel_cmd`. Same command server (port 9998) and streaming server (port 9999) as `mpc_hal.py`.
+- **invdyn_hal.py** — HAL component `invdyn`: runs on the robot (Raspi). **It is a PD controller**: desired acceleration `q̈_d = Kp*e - Kd*q̇`, then integrated to `next_pos` and `vel_cmd`. No mass/inertia matrix. The only difference from the `pd_solve` path is that this one integrates acceleration (smaller steps per cycle); both output pos/vel setpoints to the PIDs. Same command server (port 9998) and streaming server (port 9999) as `mpc_hal.py`.
 - **invdyn_linuxcnc.py** — Optional: InvDyn loop via MDI (G-code waypoints), like `mpc_linuxcnc.py`. Use when not using HAL direct write.
 - **elerob_invdyn.hal** — HAL config that loads `invdyn_hal.py` and wires `invdyn.*` pins to the mux/PID.
 - **elerob_invdyn.ini** — LinuxCNC config that uses `elerob_invdyn.hal` (same as `elerob_mpc.ini` but with InvDyn HAL).
+
+---
+
+## How elerob_invdyn.ini works (which script runs?)
+
+**elerob_invdyn.ini uses invdyn_hal.py, not invdyn_linuxcnc.py.**
+
+1. You run: `linuxcnc elerob_invdyn.ini`.
+2. LinuxCNC reads `[HAL] HALFILE = elerob_invdyn.hal`.
+3. **elerob_invdyn.hal** runs: `loadusr -Wn invdyn python /home/pi/Desktop/mpc/invdyn_hal.py`  
+   So **invdyn_hal.py** is loaded as the HAL component named `invdyn`. It creates pins `invdyn.joint0_pos_cmd`, `invdyn.enable`, etc., and starts the command server (port 9998) and stream server (port 9999). When the desktop sends a target, invdyn_hal.py runs the InvDyn (or PD) control loop and writes to those pins; the mux passes them to the PIDs when `invdyn.enable` is TRUE.
+
+**invdyn_linuxcnc.py** is a different, optional path: a standalone script you run manually (`python invdyn_linuxcnc.py`). It drives the robot by sending G-code waypoints via LinuxCNC MDI. It is **not** loaded by the INI. Use it only if you want InvDyn without the HAL component (e.g. with a config that doesn’t load invdyn_hal.py).
 
 ---
 
