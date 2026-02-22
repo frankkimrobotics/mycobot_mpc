@@ -9,10 +9,10 @@ estimate M, C, G.
 
 Usage:
   python calibrate_robot.py --host $ROBOT_IP --controller pid
-  python calibrate_robot.py --host 10.0.0.27 --duration 3 --step-deg 10 --max-deg 90
+  python calibrate_robot.py --host 10.0.0.27 --duration 3 --step-deg 10 --max-deg 80
   python calibrate_robot.py --host $ROBOT_IP --start -90 -90 0 -90 0 0
 
-  Phase 1: per-joint sweep within ±max_deg (default ±90°) of rest pose.
+  Phase 1: move to rest pose, hold 3 s; per-joint sweep within ±max_deg (default ±80°) of rest pose; each move duration 3 s.
   Phase 2: 10 random poses — joint0 ±10°, joints 1–5 ±30° from rest pose.
 """
 
@@ -87,11 +87,11 @@ def main():
     ap.add_argument("--controller", choices=["pid", "mpc", "invdyn"], default="pid",
                     help="Controller (default: pid)")
     ap.add_argument("--duration", type=float, default=3.0,
-                    help="Move duration per waypoint in seconds (default: 3)")
+                    help="Move duration per waypoint in seconds (default: 3); used for every calibration move")
     ap.add_argument("--step-deg", type=float, default=10.0,
                     help="Step size in degrees per joint (default: 10)")
-    ap.add_argument("--max-deg", type=float, default=90.0,
-                    help="Max joint offset in degrees per joint (symmetric ±) for sweep phase (default: 90)")
+    ap.add_argument("--max-deg", type=float, default=80.0,
+                    help="Max joint offset in degrees per joint (symmetric ±) for sweep phase (default: 80, stay within limits)")
     ap.add_argument("--pos-tol", type=float, default=0.5, help="Position tolerance for early stop (deg)")
     ap.add_argument("--settle-steps", type=int, default=10, help="Settle steps for early stop")
     ap.add_argument("--no-fetch-logs", action="store_true",
@@ -154,11 +154,24 @@ def main():
     logger = cr.MoveLogger()
     current_deg = start_deg.copy()
 
-    # First move: go to start pose
-    print("\n--- Moving to start pose ---")
+    # First move: go to rest pose
+    print("\n--- Moving to rest pose ---")
     status = cr.move_to_joints(
-        conn, current_deg,
+        conn, start_deg,
         duration=args.duration, controller=args.controller,
+        pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+        logger=logger,
+    )
+    cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
+    if status.get("current_deg"):
+        current_deg = np.array(status["current_deg"])
+
+    # Hold at rest pose for 3 seconds
+    print("\n--- Holding at rest pose for 3 s ---")
+    hold_duration = 3.0
+    status = cr.move_to_joints(
+        conn, start_deg,
+        duration=hold_duration, controller=args.controller,
         pos_tol=args.pos_tol, settle_steps=args.settle_steps,
         logger=logger,
     )
