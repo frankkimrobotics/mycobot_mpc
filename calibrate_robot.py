@@ -12,7 +12,7 @@ Usage:
   python calibrate_robot.py --host 10.0.0.27 --duration 3 --step-deg 10 --max-deg 80
   python calibrate_robot.py --host $ROBOT_IP --start -90 -90 0 -90 0 0
 
-  Phase 1: one move to rest pose (duration 5 s default); then per-joint sweep ±max_deg (default ±80°); each move 5 s. PIDs stay on between moves (mpc_hal); no log fetch after initial rest move.
+  Phase 1: one move to rest pose (duration 5 s default); then per-joint sweep ±max_deg (default ±80°); each move 5 s. PIDs stay on between moves (robot_hal); no log fetch after initial rest move.
   Phase 2: 10 random poses — joint0 ±10°, joints 1–5 ±30° from rest pose.
 """
 
@@ -84,8 +84,8 @@ def main():
     ap.add_argument("--host", default=os.environ.get("ROBOT_IP", "").strip(),
                     help="Robot IP (default: ROBOT_IP)")
     ap.add_argument("--cmd-port", type=int, default=9998, help="Command port (default: 9998)")
-    ap.add_argument("--controller", choices=["pid", "mpc", "invdyn"], default="pid",
-                    help="Controller (default: pid)")
+    ap.add_argument("--controller", choices=["pid", "invdyn", "pd_velff"], default="pid",
+                    help="Controller: pid, invdyn, or pd_velff (default: pid)")
     ap.add_argument("--duration", type=float, default=5.0,
                     help="Move duration per waypoint in seconds (default: 5); longer so robot can reach pose before timeout")
     ap.add_argument("--step-deg", type=float, default=10.0,
@@ -221,7 +221,8 @@ def main():
     logger.save(tag="calibrate")
     print(f"\nCalibration done. Desktop log in {cr.LOG_DIR}/ (control_calibrate_*.csv)")
     print("Fetch robot CSVs (if not auto-fetched) with: python fetch_robot_logs.py")
-    print("Then run: python identify_invdyn_from_log.py logs/mpc_*.csv logs/invdyn_*.csv")
+    print("Then run: python identify_invdyn_from_log.py -o logs/invdyn_params.npz")
+    print("         (Copy logs/invdyn_params.npz to Raspi; robot_hal uses it with --params for invdyn.)")
 
 
 if __name__ == "__main__":

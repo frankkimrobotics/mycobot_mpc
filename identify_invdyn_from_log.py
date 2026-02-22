@@ -26,8 +26,8 @@ Usage:
   python identify_invdyn_from_log.py --csv logs/mpc_latest.csv --out params.npz
   python identify_invdyn_from_log.py logs/mpc_*.csv -o logs/invdyn_params.npz   # invdyn_hal picks this up by default
 
-Note: Use robot logs (mpc_*.csv or invdyn_*.csv), not desktop control_calibrate_*.csv.
-      The latter has one row per move and no hal_torq; fetch robot CSVs with fetch_robot_logs.py.
+Note: Use robot logs (mpc_*.csv, invdyn_*.csv, or robot_hal_*.csv), not desktop control_calibrate_*.csv.
+      The latter has one row per move and no hal_torq; fetch robot CSVs from the Raspi after calibration.
 """
 
 from __future__ import annotations
@@ -179,7 +179,7 @@ def fit_simple_model(df: pd.DataFrame, torque_scale_init: float = 1.0) -> dict:
     tau_pred = (W @ theta).reshape(n, NUM_JOINTS)
     tau_vec_sq = np.dot(tau_vec, tau_vec)
     if tau_vec_sq > 1e-20:
-        torque_scale = np.dot(tau_pred, tau_vec) / tau_vec_sq
+        torque_scale = np.dot(tau_pred.ravel(), tau_vec) / tau_vec_sq
     else:
         torque_scale = float(torque_scale_init)
     # Alternating LS: refine torque_scale and theta so that torque_scale * hal_torq ≈ W @ theta
@@ -349,9 +349,10 @@ def main():
         import glob
         mpc_files = sorted(glob.glob(os.path.join(log_dir, "mpc_*.csv")))
         inv_files = sorted(glob.glob(os.path.join(log_dir, "invdyn_*.csv")))
-        files = mpc_files + inv_files
+        robot_hal_files = sorted(glob.glob(os.path.join(log_dir, "robot_hal_*.csv")))
+        files = mpc_files + inv_files + robot_hal_files
         if not files:
-            print("No CSV given and no mpc_*.csv / invdyn_*.csv in logs/. Use: identify_invdyn_from_log.py <file.csv>")
+            print("No CSV given and no mpc_*.csv / invdyn_*.csv / robot_hal_*.csv in logs/. Use: identify_invdyn_from_log.py <file.csv>")
             sys.exit(1)
         files = files[-3:]  # last 3
 
@@ -419,7 +420,7 @@ def main():
         np.savez(args.out, **out)
         print(f"\nSaved to {args.out}")
         if args.out.endswith("invdyn_params.npz") or "invdyn_params" in args.out:
-            print("  invdyn_hal.py and invdyn_linuxcnc.py use logs/invdyn_params.npz by default.")
+            print("  robot_hal.py: run with --params logs/invdyn_params.npz for model-based invdyn.")
 
 
 if __name__ == "__main__":
