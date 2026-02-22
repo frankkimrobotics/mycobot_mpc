@@ -1,12 +1,16 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3.10
 """
 Desktop-side robot controller: solve IK for target eef pose, send to robot.
 
 Pipeline:
-  Target (R, t) → IK (pyroki) → joint angles (deg) → TCP → robot (mpc_hal.py)
+  Target (R, t) → IK (pyroki) → joint angles (deg) → TCP → robot (mpc_hal or invdyn_hal)
 
-The robot must be running mpc_hal.py (via linuxcnc elerob_mpc.ini) which
-listens for commands on port 9998 and streams joint feedback on port 9999.
+The robot runs one of two HAL components depending on the LinuxCNC config:
+  - elerob_mpc.ini  → mpc_hal.py  → honors --controller pid or mpc  (sends "pd" or "mpc")
+  - elerob_invdyn.ini → invdyn_hal.py → honors --controller pid or invdyn (sends "pd" or "invdyn")
+
+The robot uses the received controller value to choose the control law; the desktop
+choice is reflected. Use the INI that matches the controller you want (mpc vs invdyn).
 
 Usage:
     # Move to a Cartesian position (uses home orientation):
@@ -22,7 +26,10 @@ Usage:
     python3.10 control_robot.py --host 10.0.0.27 --home
 """
 
+from __future__ import annotations
+
 import argparse
+import base64
 import csv
 import json
 import os
@@ -32,9 +39,23 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ik_pyroki import MyCobotIK
+
+# When conda is active but we're running a different Python (e.g. homebrew), avoid
+# conda's PYTHONPATH so it doesn't inject incompatible packages. If we're running
+# the active conda env's Python, leave sys.path alone so its site-packages (numpy, etc.) work.
+_conda_prefix = os.environ.get("CONDA_PREFIX", "")
+if _conda_prefix and not sys.executable.startswith(_conda_prefix):
+    os.environ.pop("PYTHONPATH", None)
+    sys.path[:] = [p for p in sys.path if "conda" not in p and "envs" not in p]
+
 import numpy as np
 
-from ik_pyroki import MyCobotIK, HOME_LINUXCNC_DEG
+# Home pose in LinuxCNC degrees (same as ik_pyroki). IK is imported only when needed (--xyz / --interactive).
+HOME_LINUXCNC_DEG = [-90.0, -90.0, 0.0, -90.0, 0.0, 0.0]
 
 MAX_JOINTS = 6
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -210,7 +231,7 @@ class RobotConnection:
         self,
         target_deg: list[float],
         duration: float = 2.0,
-        controller: str = "pd",
+        controller: str = "pid",
         pos_tol: float = 0.5,
         settle_steps: int = 10,
     ) -> dict:
@@ -219,23 +240,25 @@ class RobotConnection:
         Args:
             target_deg: 6 joint angles in LinuxCNC degrees
             duration: Max duration for the move (seconds)
-            controller: "pd" or "mpc"
+            controller: "pid", "mpc", or "invdyn"
             pos_tol: Position tolerance for early stop (degrees)
             settle_steps: Consecutive converged loops before early stop
 
         Returns:
             Ack dict from robot, or empty dict on failure
         """
+        # Robot HAL expects "pd" for PID/PD; user-facing option is "pid"
+        robot_controller = "pd" if controller == "pid" else controller
         cmd = {
             "target_deg": [round(float(v), 4) for v in target_deg],
             "duration": duration,
-            "controller": controller,
+            "controller": robot_controller,
             "pos_tol": pos_tol,
             "settle_steps": settle_steps,
         }
         msg = json.dumps(cmd) + "\n"
         self.sock.sendall(msg.encode("utf-8"))
-        print(f"[conn] Sent target: {[round(v, 1) for v in target_deg]} "
+        print(f"[conn] Sent target: {[round(float(v), 1) for v in target_deg]} "
               f"(dur={duration}s, ctrl={controller}, tol={pos_tol}°, settle={settle_steps})")
 
         # Read ack
@@ -273,6 +296,44 @@ class RobotConnection:
         """Read one status message from the robot."""
         return self._read_status(None, timeout=2.0)
 
+    def fetch_log(self, filename: str) -> str | None:
+        """Request a log file from the robot (saved on Raspi) and save it to local logs/.
+        Returns the local path if successful, else None.
+        """
+        self.sock.sendall((json.dumps({"get_log": filename}) + "\n").encode("utf-8"))
+        self.sock.settimeout(10.0)
+        buffer = ""
+        t0 = time.time()
+        while time.time() - t0 < 10.0:
+            try:
+                data = self.sock.recv(65536)
+                if not data:
+                    return None
+                buffer += data.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get("state") == "log" and "log_content_base64" in msg:
+                        raw = base64.b64decode(msg["log_content_base64"])
+                        os.makedirs(LOG_DIR, exist_ok=True)
+                        local_path = os.path.join(LOG_DIR, msg.get("filename", filename))
+                        with open(local_path, "wb") as f:
+                            f.write(raw)
+                        print(f"[log] Saved robot log to {local_path}")
+                        return local_path
+                    if msg.get("state") == "log_error":
+                        print(f"[log] Robot error: {msg.get('error', 'unknown')}")
+                        return None
+            except (socket.timeout, OSError):
+                break
+        return None
+
     def _read_status(self, wait_for_state: str | None, timeout: float = 2.0) -> dict:
         """Read status messages, optionally waiting for a specific state."""
         self.sock.settimeout(timeout)
@@ -300,11 +361,20 @@ class RobotConnection:
         return {}
 
 
+def _maybe_fetch_robot_log(conn: RobotConnection, status: dict, fetch_logs: bool) -> None:
+    """If fetch_logs and robot reported last_log_name, fetch CSV and save to local logs/."""
+    if not fetch_logs or not status:
+        return
+    name = status.get("last_log_name")
+    if name:
+        conn.fetch_log(name)
+
+
 def move_to_joints(
     conn: RobotConnection,
     target_deg: np.ndarray,
     duration: float = 2.0,
-    controller: str = "pd",
+    controller: str = "pid",
     pos_tol: float = 0.5,
     settle_steps: int = 10,
     timer: PipelineTimer | None = None,
@@ -316,7 +386,7 @@ def move_to_joints(
         conn: Robot connection
         target_deg: 6 joint angles in LinuxCNC degrees
         duration: Max duration for the move
-        controller: "pd" or "mpc"
+        controller: "pid", "mpc", or "invdyn"
         pos_tol: Position tolerance for early stop (degrees)
         settle_steps: Consecutive converged loops before early stop
         timer: Optional PipelineTimer (will be created if None)
@@ -367,7 +437,7 @@ def move_to_pose(
     R: np.ndarray,
     t: np.ndarray,
     duration: float = 2.0,
-    controller: str = "pd",
+    controller: str = "pid",
     pos_tol: float = 0.5,
     settle_steps: int = 10,
     logger: MoveLogger | None = None,
@@ -380,7 +450,7 @@ def move_to_pose(
         R: (3,3) rotation matrix for eef
         t: (3,) translation vector for eef (meters)
         duration: Max duration for the move
-        controller: "pd" or "mpc"
+        controller: "pid", "mpc", or "invdyn"
         pos_tol: Position tolerance for early stop (degrees)
         settle_steps: Consecutive converged loops before early stop
         logger: Optional MoveLogger to record the move
@@ -446,6 +516,7 @@ def interactive_mode(
     pos_tol: float = 0.5,
     settle_steps: int = 10,
     logger: MoveLogger | None = None,
+    fetch_logs: bool = True,
 ):
     """Interactive control loop: enter poses from the terminal."""
     R_home, _ = ik.forward_kinematics(HOME_LINUXCNC_DEG)
@@ -481,27 +552,30 @@ def interactive_mode(
 
             elif cmd == "home":
                 print(f"Moving to home: {HOME_LINUXCNC_DEG}")
-                move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
-                               duration=duration, controller=controller,
-                               pos_tol=pos_tol, settle_steps=settle_steps,
-                               logger=logger)
+                status = move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
+                                        duration=duration, controller=controller,
+                                        pos_tol=pos_tol, settle_steps=settle_steps,
+                                        logger=logger)
+                _maybe_fetch_robot_log(conn, status, fetch_logs)
 
             elif cmd == "xyz" and len(parts) == 4:
                 x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
                 t_target = np.array([x, y, z])
                 print(f"Target position: {t_target.tolist()} m (home orientation)")
-                move_to_pose(conn, ik, R_home, t_target,
-                             duration=duration, controller=controller,
-                             pos_tol=pos_tol, settle_steps=settle_steps,
-                             logger=logger)
+                _, status = move_to_pose(conn, ik, R_home, t_target,
+                                         duration=duration, controller=controller,
+                                         pos_tol=pos_tol, settle_steps=settle_steps,
+                                         logger=logger)
+                _maybe_fetch_robot_log(conn, status, fetch_logs)
 
             elif cmd == "joints" and len(parts) == 7:
                 joints = [float(v) for v in parts[1:7]]
                 print(f"Target joints: {joints} deg")
-                move_to_joints(conn, np.array(joints),
-                               duration=duration, controller=controller,
-                               pos_tol=pos_tol, settle_steps=settle_steps,
-                               logger=logger)
+                status = move_to_joints(conn, np.array(joints),
+                                        duration=duration, controller=controller,
+                                        pos_tol=pos_tol, settle_steps=settle_steps,
+                                        logger=logger)
+                _maybe_fetch_robot_log(conn, status, fetch_logs)
 
             elif cmd == "fk":
                 timer = PipelineTimer()
@@ -549,22 +623,25 @@ Examples:
   python3.10 control_robot.py --host 10.0.0.27 --interactive
 """,
     )
-    parser.add_argument("--host", required=True,
-        help="Robot controller IP (e.g., 10.0.0.27)")
+    default_host = os.environ.get("ROBOT_IP")
+    parser.add_argument("--host", default=default_host,
+        help="Robot controller IP (default: ROBOT_IP env, e.g. 10.0.0.27)")
     parser.add_argument("--cmd-port", type=int, default=9998,
         help="Robot command port (default: 9998)")
     parser.add_argument("--stream-port", type=int, default=9999,
         help="Robot streaming port for rviz2 (default: 9999)")
-    parser.add_argument("--controller", choices=["pd", "mpc"], default="pd",
-        help="Controller type (default: pd)")
+    parser.add_argument("--controller", choices=["pid", "mpc", "invdyn"], default="pid",
+        help="Controller type: pid, mpc, or invdyn (default: pid)")
     parser.add_argument("--duration", type=float, default=2.0,
         help="Move duration in seconds (default: 2.0)")
     parser.add_argument("--pos-tol", type=float, default=0.5,
         help="Position tolerance for early stop in degrees (default: 0.5)")
     parser.add_argument("--settle-steps", type=int, default=10,
         help="Consecutive converged loops before early stop (default: 10)")
-    parser.add_argument("--no-rviz", action="store_true",
-        help="Don't launch rviz2 (use if it's already running)")
+    parser.add_argument("--rviz", action="store_true",
+                        help="Launch rviz2 + pose stream (default: do not launch)")
+    parser.add_argument("--no-fetch-logs", action="store_true",
+                        help="Don't fetch robot CSV logs to local logs/ after each move")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--xyz", nargs=3, type=float, metavar=("X", "Y", "Z"),
@@ -578,6 +655,18 @@ Examples:
         help="Interactive control mode")
 
     args = parser.parse_args()
+
+    # If --host $ROBOT_IP was used and ROBOT_IP is unset, host can be "" or the next arg (e.g. "--controller")
+    host = (args.host or "").strip()
+    if not host or host.startswith("-"):
+        host = os.environ.get("ROBOT_IP") or ""
+    if not host:
+        parser.error(
+            "Robot host not set. Use either:\n"
+            "  (1) ./setup_robot_ip.sh 10.0.0.27  then  conda activate ros_env  (no --host needed)\n"
+            "  (2)  python control_robot.py --host 10.0.0.27 ...  (use your Raspi IP)"
+        )
+    args.host = host
 
     rviz_proc = None
 
@@ -594,16 +683,19 @@ Examples:
                 except ProcessLookupError:
                     pass
 
-    # Launch rviz2 + streaming client (before IK init, so rviz2 loads in parallel)
-    if not args.no_rviz:
+    # Launch rviz2 + streaming client only if requested
+    if args.rviz:
         rviz_proc = launch_rviz_streamer(args.host, args.stream_port)
 
-    # Initialize IK solver (JIT warmup happens here, ~2s)
-    print("Initializing IK solver...")
-    t_ik_init = time.perf_counter()
-    ik = MyCobotIK()
-    ik_init_ms = (time.perf_counter() - t_ik_init) * 1000
-    print(f"IK solver ready ({ik_init_ms:.0f}ms)")
+    # IK solver only needed for --xyz and --interactive (uses JAX/pyroki)
+    ik = None
+    if args.xyz or args.interactive:
+        print("Initializing IK solver...")
+        from ik_pyroki import MyCobotIK
+        t_ik_init = time.perf_counter()
+        ik = MyCobotIK()
+        ik_init_ms = (time.perf_counter() - t_ik_init) * 1000
+        print(f"IK solver ready ({ik_init_ms:.0f}ms)")
 
     # Per-session move logger
     logger = MoveLogger()
@@ -614,7 +706,7 @@ Examples:
         conn.connect()
     except (ConnectionRefusedError, socket.timeout, OSError) as e:
         print(f"ERROR: Cannot connect to robot at {args.host}:{args.cmd_port}: {e}")
-        print("Make sure mpc_hal.py is running on the robot (via linuxcnc elerob_mpc.ini).")
+        print("Make sure mpc_hal.py or invdyn_hal.py is running on the robot (via linuxcnc elerob_mpc.ini or elerob_invdyn.ini).")
         cleanup()
         sys.exit(1)
 
@@ -623,31 +715,34 @@ Examples:
             interactive_mode(conn, ik, controller=args.controller,
                              duration=args.duration,
                              pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                             logger=logger)
+                             logger=logger, fetch_logs=not args.no_fetch_logs)
 
         elif args.home:
             print(f"Moving to home: {HOME_LINUXCNC_DEG}")
-            move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
-                           duration=args.duration, controller=args.controller,
-                           pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                           logger=logger)
+            status = move_to_joints(conn, np.array(HOME_LINUXCNC_DEG),
+                                    duration=args.duration, controller=args.controller,
+                                    pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+                                    logger=logger)
+            _maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
 
         elif args.xyz:
             R_home, _ = ik.forward_kinematics(HOME_LINUXCNC_DEG)
             t_target = np.array(args.xyz)
             print(f"Target position: {t_target.tolist()} m")
-            move_to_pose(conn, ik, R_home, t_target,
-                         duration=args.duration, controller=args.controller,
-                         pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                         logger=logger)
+            status = move_to_pose(conn, ik, R_home, t_target,
+                                  duration=args.duration, controller=args.controller,
+                                  pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+                                  logger=logger)
+            _maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
 
         elif args.joints:
             target_deg = np.array(args.joints)
             print(f"Target joints: {target_deg.tolist()} deg")
-            move_to_joints(conn, target_deg,
-                           duration=args.duration, controller=args.controller,
-                           pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                           logger=logger)
+            status = move_to_joints(conn, target_deg,
+                                    duration=args.duration, controller=args.controller,
+                                    pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+                                    logger=logger)
+            _maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
 
     except KeyboardInterrupt:
         print("\nInterrupted.")

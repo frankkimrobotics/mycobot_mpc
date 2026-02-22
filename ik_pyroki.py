@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3.10
 """
 Inverse Kinematics solver for myCobot Pro 630 using PyRoKi.
 
@@ -19,8 +19,14 @@ Usage:
 import importlib.util
 import math
 import os
+import sys
 import time
 from typing import Optional  # noqa: F401 – used in type hints
+
+# Prevent conda PYTHONPATH from injecting incompatible packages
+if "CONDA_PREFIX" in os.environ:
+    os.environ.pop("PYTHONPATH", None)
+    sys.path[:] = [p for p in sys.path if "conda" not in p and "envs" not in p]
 
 # ── JAX backend selection ──────────────────────────────────────────────────
 # Must be set BEFORE importing JAX (backend initializes on import).
@@ -41,14 +47,20 @@ from typing import Optional  # noqa: F401 – used in type hints
 if "JAX_PLATFORMS" not in os.environ:
     _use_gpu = False
 
+    def _has_spec(name):
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ModuleNotFoundError, ValueError):
+            return False
+
     # Check for jax-metallib (JAX 0.9.x — registers as 'mps')
-    if importlib.util.find_spec("jax_plugins.silicon") is not None:
+    if _has_spec("jax_plugins.silicon"):
         _use_gpu = True
         os.environ["JAX_PLATFORMS"] = "mps"
 
     # Check for jax-metal (Apple official — registers as 'METAL')
     # Only usable with jaxlib < 0.5 due to API changes
-    elif importlib.util.find_spec("jax_plugins.metal") is not None:
+    elif _has_spec("jax_plugins.metal"):
         try:
             from importlib.metadata import version as _pkg_version
             _jaxlib_ver = tuple(int(x) for x in _pkg_version("jaxlib").split(".")[:2])

@@ -171,14 +171,16 @@ Examples:
   python3 robot_pose_stream_ros2.py --host 10.0.0.27 --port 8888
 """,
     )
-    parser.add_argument("--host", required=True,
-        help="Robot controller IP address (e.g., 10.0.0.27)")
+    parser.add_argument("--host", default=os.environ.get("ROBOT_IP"),
+        help="Robot IP (default: ROBOT_IP env, e.g. 10.0.0.27)")
     parser.add_argument("--port", type=int, default=9999,
         help="TCP port for streaming (default: 9999)")
     parser.add_argument("--no-rviz", action="store_true",
         help="Don't launch rviz2 (use if it's already running)")
 
     args = parser.parse_args()
+    if not args.host:
+        parser.error("Robot host not set. Set ROBOT_IP (e.g. run ./setup_robot_ip.sh) or pass --host <ip>.")
 
     rviz_proc = None
 

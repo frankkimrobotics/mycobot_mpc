@@ -347,8 +347,8 @@ def main():
         print(f"No CSV files found in {LOG_DIR}")
         sys.exit(1)
 
-    # Split into robot and control logs
-    robot_files = [f for f in all_files if os.path.basename(f).startswith("mpc_")]
+    # Split into robot and control logs (robot: mpc_*.csv or invdyn_*.csv)
+    robot_files = [f for f in all_files if os.path.basename(f).startswith(("mpc_", "invdyn_"))]
     control_files = [f for f in all_files if os.path.basename(f).startswith("control_")]
 
     if args.latest is not None:

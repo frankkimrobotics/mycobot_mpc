@@ -7,6 +7,7 @@ Requires HAL setup: load mpc component and wire mpc.jointN_pos_cmd to pid.N.comm
 (via mux_generic when mpc.enable=1). See mpc_hal_setup.hal and README.
 """
 
+import base64
 import queue
 import time
 import sys
@@ -18,6 +19,7 @@ import threading
 from datetime import datetime
 from functools import wraps
 import numpy as np
+import hal
 
 # LinuxCNC and HAL
 try:
@@ -219,7 +221,7 @@ def mpc_solve(q, target_angles, dt):
 
 
 def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
-                     pos_tol=0.5, vel_tol=1.0, settle_steps=10):
+                     pos_tol=0.5, vel_tol=1.0, settle_steps=10, controller="mpc"):
     """Run MPC control loop: poll -> QP solve (N-step horizon) -> HAL write.
 
     Uses OSQP to solve a QP over MPC_HORIZON steps per iteration,
@@ -253,11 +255,12 @@ def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
         t_prev = t_loop_start
 
         # 1. Poll feedback
-        q, q_vel, t_status = _poll_feedback(s)
+        q, q_vel, hal_vel, hal_torq, t_status = _poll_feedback(s)
 
         # 2. MPC solve (N-step QP, apply first action)
         next_pos, vel_cmd = mpc_solve(q, target_angles,
                                       dt if dt else MPC_PERIOD_MS / 1000.0)
+        u = [next_pos[i] - q[i] for i in range(MAX_JOINTS)]
         # Estimate velocity for logging (before overwriting prev_current)
         if prev_current is not None and dt is not None and dt > 0:
             est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
@@ -293,8 +296,9 @@ def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
 
         # Collect log row
         log_rows.append([
-            t_status, loop_count,
+            controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            *u, *hal_vel, *hal_torq,
             err,
             _timing["poll"][-1], _timing["mpc_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
@@ -311,12 +315,28 @@ def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
 
     h["enable"] = False
     print(f"\nDone. Ran {loop_count} MPC iterations.")
-    _save_log(log_rows, target_angles)
+    _save_log(log_rows, target_angles, controller)
+
+
+def _read_hal_feedback():
+    """Read velocity and torque from pro600 HAL pins. Returns (hal_vel, hal_torq) lists."""
+    hal_vel = [0.0] * MAX_JOINTS
+    hal_torq = [0.0] * MAX_JOINTS
+    for i in range(MAX_JOINTS):
+        try:
+            hal_vel[i] = float(hal.get_value(f"pro600.joint{i}_velfb"))
+        except (NameError, TypeError, ValueError, KeyError):
+            pass
+        try:
+            hal_torq[i] = float(hal.get_value(f"pro600.joint{i}_torqfb"))
+        except (NameError, TypeError, ValueError, KeyError):
+            pass
+    return hal_vel, hal_torq
 
 
 @timed("poll")
 def _poll_feedback(s):
-    """Poll LinuxCNC and return (q, q_vel, t_status)."""
+    """Poll LinuxCNC and return (q, q_vel, hal_vel, hal_torq, t_status)."""
     s.poll()
     t_status = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     q = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
@@ -325,7 +345,8 @@ def _poll_feedback(s):
         q_vel = [s.joint[i]["velocity"] for i in range(MAX_JOINTS)]
     except (KeyError, TypeError, IndexError):
         pass
-    return q, q_vel, t_status
+    hal_vel, hal_torq = _read_hal_feedback()
+    return q, q_vel, hal_vel, hal_torq, t_status
 
 
 @timed("hal_write")
@@ -350,8 +371,12 @@ def _print_timing_summary(loop_count):
     print(f"  [timing] poll={poll_ms:.2f}ms pd_solve={solve_ms:.2f}ms hal_write={hal_ms:.2f}ms sleep={sleep_ms:.2f}ms total={total_ms:.2f}ms")
 
 
-def _save_log(log_rows, target_angles):
-    """Write collected log rows to a timestamped CSV file."""
+_last_log_filename = None  # basename of last saved CSV (for desktop fetch)
+
+
+def _save_log(log_rows, target_angles, controller="pd"):
+    """Write collected log rows to a timestamped CSV file. Sets _last_log_filename for fetch."""
+    global _last_log_filename
     if not log_rows:
         return
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -359,24 +384,27 @@ def _save_log(log_rows, target_angles):
     target_str = "_".join(str(int(a)) for a in target_angles)
     filename = os.path.join(LOG_DIR, f"mpc_{stamp}_t{target_str}.csv")
     header = (
-        ["timestamp", "loop"]
+        ["controller", "timestamp", "loop"]
         + [f"q{i}" for i in range(MAX_JOINTS)]
         + [f"qvel{i}" for i in range(MAX_JOINTS)]
         + [f"target{i}" for i in range(MAX_JOINTS)]
         + [f"cmd_pos{i}" for i in range(MAX_JOINTS)]
         + [f"cmd_vel{i}" for i in range(MAX_JOINTS)]
+        + [f"u{i}" for i in range(MAX_JOINTS)]
+        + [f"hal_vel{i}" for i in range(MAX_JOINTS)] + [f"hal_torq{i}" for i in range(MAX_JOINTS)]
         + ["err_norm", "poll_ms", "pd_solve_ms", "hal_write_ms", "sleep_ms"]
     )
-    with open(filename, "w", newline="") as f:
+    with open(filename, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(log_rows)
+    _last_log_filename = os.path.basename(filename)
     print(f"  Log saved: {filename} ({len(log_rows)} rows)")
 
 
 def pd_control_loop(h, s, target_angles, duration_sec=10.0,
-                 pos_tol=0.5, vel_tol=1.0, settle_steps=10):
-    """Run MPC loop: poll -> PD solve -> HAL write.
+                 pos_tol=0.5, vel_tol=1.0, settle_steps=10, controller="pd"):
+    """Run PD loop: poll -> PD solve -> HAL write.
 
     Early-stops when position error norm < pos_tol (deg) AND velocity norm
     < vel_tol (deg/s) for settle_steps consecutive iterations.
@@ -405,11 +433,12 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
         t_prev = t_loop_start
 
         # 1. Poll feedback
-        q, q_vel, t_status = _poll_feedback(s)
+        q, q_vel, hal_vel, hal_torq, t_status = _poll_feedback(s)
 
         # 2. PD solve → (position, velocity)
         # q_vel from LinuxCNC is ~0 (motion planner bypassed), use prev_q estimation instead
         next_pos, vel_cmd = pd_solve(q, target_angles, q_vel=None, prev_q=prev_current, dt=dt)
+        u = [next_pos[i] - q[i] for i in range(MAX_JOINTS)]
         # Estimate velocity for logging (before overwriting prev_current)
         if prev_current is not None and dt is not None and dt > 0:
             est_vel = [(q[i] - prev_current[i]) / dt for i in range(MAX_JOINTS)]
@@ -446,8 +475,9 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
 
         # Collect log row (no file I/O in the control loop)
         log_rows.append([
-            t_status, loop_count,
+            controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            *u, *hal_vel, *hal_torq,
             err,
             _timing["poll"][-1], _timing["pd_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
@@ -464,7 +494,7 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
     _print_timing_summary(loop_count)
 
     # Flush log to CSV
-    _save_log(log_rows, target_angles)
+    _save_log(log_rows, target_angles, controller)
 
 
 import subprocess
@@ -817,10 +847,11 @@ _cmd_queue = queue.Queue()
 
 # Shared status dict: main loop writes, command server reads & sends to client
 _cmd_status = {
-    "state": "idle",        # idle | moving | done | error
+    "state": "idle",
     "current_deg": [0.0] * MAX_JOINTS,
     "target_deg": [0.0] * MAX_JOINTS,
     "error_norm": 0.0,
+    "last_log_name": None,  # basename of last CSV on robot (for desktop fetch)
 }
 _cmd_status_lock = threading.Lock()
 
@@ -867,6 +898,24 @@ def _handle_cmd_client(conn, addr):
                         _cmd_queue.put(cmd)
                         ack = {"state": "ack", "target_deg": cmd["target_deg"]}
                         conn.sendall((json.dumps(ack) + "\n").encode("utf-8"))
+                    elif "get_log" in cmd:
+                        name = cmd.get("get_log")
+                        if name and isinstance(name, str):
+                            name = os.path.basename(name)
+                            if name.endswith(".csv"):
+                                path = os.path.join(LOG_DIR, name)
+                                if os.path.isfile(path):
+                                    with open(path, "rb") as f:
+                                        raw = f.read()
+                                    payload = base64.b64encode(raw).decode("ascii")
+                                    conn.sendall((json.dumps({
+                                        "state": "log", "filename": name,
+                                        "log_content_base64": payload,
+                                    }) + "\n").encode("utf-8"))
+                                else:
+                                    conn.sendall((json.dumps({"state": "log_error", "error": "file_not_found"}) + "\n").encode("utf-8"))
+                            else:
+                                conn.sendall((json.dumps({"state": "log_error", "error": "bad_filename"}) + "\n").encode("utf-8"))
             except socket.timeout:
                 pass
 
@@ -995,6 +1044,10 @@ def main():
 
             duration = cmd.get("duration", 2.0)
             controller = cmd.get("controller", "pd")
+            # This HAL only supports pd and mpc; normalize so CSV matches actual control
+            if controller not in ("pd", "mpc"):
+                print(f"[cmd] controller={controller} not supported by mpc_hal, using pd")
+                controller = "pd"
             pos_tol = cmd.get("pos_tol", 0.5)
             settle = cmd.get("settle_steps", 10)
 
@@ -1011,10 +1064,10 @@ def main():
 
             if controller == "mpc":
                 mpc_control_loop(h, s, target, duration_sec=duration,
-                                 pos_tol=pos_tol, settle_steps=settle)
+                                 pos_tol=pos_tol, settle_steps=settle, controller=controller)
             else:
                 pd_control_loop(h, s, target, duration_sec=duration,
-                                pos_tol=pos_tol, settle_steps=settle)
+                                pos_tol=pos_tol, settle_steps=settle, controller=controller)
 
             robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
 
@@ -1038,6 +1091,7 @@ def main():
                 avg_solve_ms=round(avg_solve, 3),
                 avg_hal_write_ms=round(avg_hal, 3),
                 avg_sleep_ms=round(avg_sleep, 3),
+                last_log_name=_last_log_filename,
             )
 
             print(f"[cmd] Done. exec={robot_exec_ms:.0f}ms loops={n_loops} err={final_err:.3f}°"
