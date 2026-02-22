@@ -12,7 +12,7 @@ Usage:
   python calibrate_robot.py --host 10.0.0.27 --duration 3 --step-deg 10 --max-deg 80
   python calibrate_robot.py --host $ROBOT_IP --start -90 -90 0 -90 0 0
 
-  Phase 1: move to rest pose, hold 3 s; per-joint sweep within ±max_deg (default ±80°) of rest pose; each move duration 3 s.
+  Phase 1: one move to rest pose (duration 3 s, so robot holds there for 3 s); then per-joint sweep ±max_deg (default ±80°); each move 3 s. No log fetch after the initial rest move so the robot does not sit with PIDs off.
   Phase 2: 10 random poses — joint0 ±10°, joints 1–5 ±30° from rest pose.
 """
 
@@ -154,28 +154,17 @@ def main():
     logger = cr.MoveLogger()
     current_deg = start_deg.copy()
 
-    # First move: go to rest pose
-    print("\n--- Moving to rest pose ---")
+    # Single move to rest pose (duration 3 s): robot goes there and holds for the move duration.
+    # Do not fetch log after this move so the next command is sent immediately; otherwise the
+    # robot sits with PIDs off (mpc.enable=False after each move) and can appear powered off.
+    print("\n--- Moving to rest pose (hold 3 s) ---")
     status = cr.move_to_joints(
         conn, start_deg,
         duration=args.duration, controller=args.controller,
         pos_tol=args.pos_tol, settle_steps=args.settle_steps,
         logger=logger,
     )
-    cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
-    if status.get("current_deg"):
-        current_deg = np.array(status["current_deg"])
-
-    # Hold at rest pose for 3 seconds
-    print("\n--- Holding at rest pose for 3 s ---")
-    hold_duration = 3.0
-    status = cr.move_to_joints(
-        conn, start_deg,
-        duration=hold_duration, controller=args.controller,
-        pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-        logger=logger,
-    )
-    cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
+    # Skip fetch after rest move to avoid long gap with robot PIDs off
     if status.get("current_deg"):
         current_deg = np.array(status["current_deg"])
 
