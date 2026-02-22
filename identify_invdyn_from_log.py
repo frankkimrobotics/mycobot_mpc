@@ -14,10 +14,11 @@ then either:
       (G from cos/sin basis per joint, M diagonal constant) from the same data.
 
 Units: CSV q in degrees, qvel in deg/s; internally we convert to rad, rad/s, rad/s².
-Torque (hal_torq) is in pro600 driver units by default. Use --torque-scale to convert
-to Nm so M comes out in kg·m² and G in Nm. The robot total mass (e.g. 8.8 kg) is not
-the diagonal of M(q): M(q) is joint-space inertia matrix; total mass is from the full
-inertial parameter vector (e.g. Pinocchio theta), not from M_diag.
+Torque (hal_torq) is in driver units. We estimate M, G, viscous friction (Fv), Coulomb
+friction (Fc), and a force/torque scaling factor (torque_scale) so that
+  torque_scale * hal_torq ≈ M q̈ + G(q) + Fv*q̇ + Fc*sign(q̇).
+All terms needed for the inverse-dynamics controller are identified. Use --torque-scale
+as an initial guess when loading data; the script refines or estimates the scale.
 
 Usage:
   python identify_invdyn_from_log.py logs/mpc_20260211_*.csv
@@ -126,51 +127,83 @@ def load_robot_log(
     return df
 
 
-def fit_simple_model(df: pd.DataFrame) -> dict:
+def _sign_smooth(qd: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Smooth sign for Coulomb friction; sign(0)=0."""
+    return np.tanh(qd / eps)
+
+
+def fit_simple_model(df: pd.DataFrame, torque_scale_init: float = 1.0) -> dict:
     """
-    Fit a simple inverse-dynamics model without Pinocchio:
-      τ ≈ M_diag @ q̈ + G(q)
-    with G(q) = g_coeff @ [cos(q); sin(q)] per-joint basis (10 params per joint),
-    and M_diag a constant diagonal (6 params). Total 6*10 + 6 = 66 params for G + M.
-    Simplified: G_i(q) ≈ a_i cos(q_i) + b_i sin(q_i) + c_i (3 per joint), M diagonal (6).
-    So τ_i ≈ M_ii q̈_i + a_i cos(q_i) + b_i sin(q_i) + c_i.
+    Fit inverse-dynamics model: τ = M_diag @ q̈ + G(q) + Fv*q̇ + Fc*sign(q̇).
+
+    G_i(q) = a_i cos(q_i) + b_i sin(q_i) + c_i. Friction: viscous Fv_j * qd_j,
+    Coulomb Fc_j * sign(qd_j) per joint. We fit tau (in loaded units) = W @ theta,
+    then estimate torque_scale so that torque_scale * hal_torq ≈ W @ theta (best
+    scalar fit). All terms needed for the inverse-dynamics controller are identified.
     """
-    q = np.array(df["q_rad_urdf"].tolist())   # use URDF convention for consistency
+    q = np.array(df["q_rad_urdf"].tolist())
     qd = np.array(df["qd_rad"].tolist())
     qdd = np.array(df["qdd_rad"].tolist())
     tau = np.array(df["tau"].tolist())
     n = len(q)
 
-    # Regressor: for each sample, row i is [q̈_i, cos(q_i), sin(q_i), 1] for joint i (block diagonal)
-    # τ_i = M_ii q̈_i + a_i cos(q_i) + b_i sin(q_i) + c_i
-    # Stack: tau_vec = W @ theta, theta = [M_00, M_11, ..., M_55, a_0, b_0, c_0, ..., a_5, b_5, c_5]
-    nparams = 6 + 6 * 3  # 6 M_ii + 6*(a,b,c)
+    # theta = [M_00..M_55, a_0,b_0,c_0, ..., a_5,b_5,c_5, Fv_0..Fv_5, Fc_0..Fc_5]
+    nparams = 6 + 6 * 3 + 6 + 6  # M_diag + G_coeff(3 per joint) + Fv + Fc
     W = np.zeros((n * NUM_JOINTS, nparams))
     tau_vec = tau.ravel()
     for k in range(n):
         for j in range(NUM_JOINTS):
             row = k * NUM_JOINTS + j
-            # M_ii column
+            # M_ii
             W[row, j] = qdd[k, j]
-            # a_j cos(q_j), b_j sin(q_j), c_j for joint j
-            base = 6 + j * 3
-            W[row, base] = math.cos(q[k, j])
-            W[row, base + 1] = math.sin(q[k, j])
-            W[row, base + 2] = 1.0
+            # G: a_j cos(q_j), b_j sin(q_j), c_j
+            base_g = 6 + j * 3
+            W[row, base_g] = math.cos(q[k, j])
+            W[row, base_g + 1] = math.sin(q[k, j])
+            W[row, base_g + 2] = 1.0
+            # Friction: Fv_j * qd_j, Fc_j * sign(qd_j)
+            W[row, 6 + 18 + j] = qd[k, j]
+            W[row, 6 + 18 + 6 + j] = _sign_smooth(qd[k, j])
 
-    # Least squares with small regularization
+    # Regularization: small for M/G, slightly larger for Fv/Fc to avoid runaway
     reg = 1e-6 * np.eye(nparams)
+    for j in range(6):
+        reg[6 + 18 + j, 6 + 18 + j] = 1e-4
+        reg[6 + 18 + 6 + j, 6 + 18 + 6 + j] = 1e-4
     theta = np.linalg.lstsq(W.T @ W + reg, W.T @ tau_vec, rcond=None)[0]
-    M_diag = np.maximum(theta[:6], 1e-8)  # clamp to positive (inertia must be > 0)
-    g_params = theta[6:].reshape(NUM_JOINTS, 3)  # (a, b, c) per joint
+    M_diag = np.maximum(theta[:6], 1e-8)
+    g_params = theta[6 : 6 + 18].reshape(NUM_JOINTS, 3)
+    Fv = theta[6 + 18 : 6 + 24]
+    Fc = theta[6 + 24 : 6 + 30]
 
-    # Residual
     tau_pred = (W @ theta).reshape(n, NUM_JOINTS)
-    err = tau - tau_pred
+    tau_vec_sq = np.dot(tau_vec, tau_vec)
+    if tau_vec_sq > 1e-20:
+        torque_scale = np.dot(tau_pred, tau_vec) / tau_vec_sq
+    else:
+        torque_scale = float(torque_scale_init)
+    # Alternating LS: refine torque_scale and theta so that torque_scale * hal_torq ≈ W @ theta
+    for _ in range(3):
+        # Fix theta, fit torque_scale: torque_scale * tau_vec = tau_pred
+        tau_pred_flat = (W @ theta).ravel()
+        if tau_vec_sq > 1e-20:
+            torque_scale = np.dot(tau_pred_flat, tau_vec) / tau_vec_sq
+        # Fix torque_scale, fit theta: W @ theta = torque_scale * tau_vec
+        target = torque_scale * tau_vec
+        theta = np.linalg.lstsq(W.T @ W + reg, W.T @ target, rcond=None)[0]
+        M_diag = np.maximum(theta[:6], 1e-8)
+        g_params = theta[6 : 6 + 18].reshape(NUM_JOINTS, 3)
+        Fv = theta[6 + 18 : 6 + 24]
+        Fc = theta[6 + 24 : 6 + 30]
+    tau_pred = (W @ theta).reshape(n, NUM_JOINTS)
+    err = tau - (tau_pred / torque_scale) if torque_scale != 0 else tau - tau_pred
     rmse = np.sqrt(np.mean(err ** 2))
     return {
         "M_diag": M_diag,
         "G_coeff": g_params,
+        "Fv": Fv,
+        "Fc": Fc,
+        "torque_scale": torque_scale,
         "tau_pred": tau_pred,
         "rmse": rmse,
         "theta": theta,
@@ -178,7 +211,7 @@ def fit_simple_model(df: pd.DataFrame) -> dict:
 
 
 def eval_simple_MCG(q_rad: np.ndarray, qd_rad: np.ndarray, res: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Evaluate M (diagonal), C (zero in this simple model), G from fitted simple model."""
+    """Evaluate M (diagonal), C (zero in this simple model), G from fitted simple model. Friction is applied separately at tau level."""
     M = np.diag(res["M_diag"])
     C = np.zeros((NUM_JOINTS, NUM_JOINTS))
     G = np.zeros(NUM_JOINTS)
@@ -186,6 +219,13 @@ def eval_simple_MCG(q_rad: np.ndarray, qd_rad: np.ndarray, res: dict) -> tuple[n
     for j in range(NUM_JOINTS):
         G[j] = coeff[j, 0] * math.cos(q_rad[j]) + coeff[j, 1] * math.sin(q_rad[j]) + coeff[j, 2]
     return M, C, G
+
+
+def eval_simple_friction(qd_rad: np.ndarray, res: dict) -> np.ndarray:
+    """Evaluate friction torque: Fv*qd + Fc*sign(qd)."""
+    Fv = res.get("Fv", np.zeros(NUM_JOINTS))
+    Fc = res.get("Fc", np.zeros(NUM_JOINTS))
+    return Fv * qd_rad + Fc * _sign_smooth(qd_rad)
 
 
 def eval_pinocchio_MCG(
@@ -300,7 +340,7 @@ def main():
     ap.add_argument("--no-pinocchio", action="store_true", help="Skip Pinocchio even if installed")
     ap.add_argument("--out", "-o", help="Save identified params to this .npz file (e.g. logs/invdyn_params.npz for invdyn_hal default)")
     ap.add_argument("--torque-scale", type=float, default=1.0,
-                    help="Scale hal_torq to Nm: tau_Nm = hal_torq * scale (then M is in kg·m²)")
+                    help="Initial scale when loading: tau = hal_torq * scale. Script also estimates torque_scale jointly with M, G, Fv, Fc.")
     args = ap.parse_args()
 
     files = args.csv or args.csv_single
@@ -334,14 +374,15 @@ def main():
     q_all = np.array(df["q_rad"].tolist())
     print(f"  q range (rad): {q_all.min():.3f} – {q_all.max():.3f}")
 
-    # Simple model (always)
-    print("\n--- Simple model (M diagonal + G cos/sin per joint) ---")
-    simple = fit_simple_model(df)
-    print(f"  M_diag (diagonal inertia, clamped ≥ 0): {simple['M_diag']}")
+    # Simple model (M, G, Fv, Fc) and torque_scale
+    print("\n--- Simple model (M, G, viscous Fv, Coulomb Fc, torque_scale) ---")
+    simple = fit_simple_model(df, torque_scale_init=args.torque_scale)
+    print(f"  M_diag (diagonal inertia, ≥ 0): {simple['M_diag']}")
     print(f"  G coeffs (a*cos+b*sin+c per joint):\n{simple['G_coeff']}")
+    print(f"  Fv (viscous, per joint): {simple['Fv']}")
+    print(f"  Fc (Coulomb, per joint): {simple['Fc']}")
+    print(f"  torque_scale (hal_torq * torque_scale ≈ model torque): {simple['torque_scale']:.6f}")
     print(f"  RMSE torque: {simple['rmse']:.6f}")
-    print("  Note: M(q) is joint-space inertia (kg·m² if --torque-scale gives Nm), not total mass.")
-    print("  Robot total mass (e.g. 8.8 kg) is in the full inertial params (Pinocchio theta), not M_diag.")
 
     # Pinocchio if available
     pin_result = None
@@ -354,10 +395,9 @@ def main():
         else:
             print("  Pinocchio not used (not installed or URDF not found)")
 
-    # Summary: how to get M, C, G
+    # Summary: how to get M, C, G, friction
     print("\n--- Using the identified model ---")
-    print("  Simple model: M = np.diag(M_diag), C = 0, G = G_coeff[:,0]*cos(q) + G_coeff[:,1]*sin(q) + G_coeff[:,2]")
-    print("  Inverse dynamics (simple): tau = M @ qdd + G(q)")
+    print("  tau = M @ qdd + G(q) + Fv*qd + Fc*sign(qd); torque_scale converts hal_torq to model units.")
     if pin_result:
         print("  Pinocchio: tau = Phi(q,qd,qdd)*theta. To get M,C,G: use pin.computeMassMatrix(model,data,q),")
         print("            pin.computeCoriolisMatrix(model,data,q,v), pin.computeGeneralizedGravity(model,data,q)")
@@ -367,8 +407,10 @@ def main():
         out = {
             "M_diag": simple["M_diag"],
             "G_coeff": simple["G_coeff"],
+            "Fv": simple["Fv"],
+            "Fc": simple["Fc"],
+            "torque_scale": np.float64(simple["torque_scale"]),
             "simple_rmse": simple["rmse"],
-            "torque_scale": np.float64(args.torque_scale),
         }
         if pin_result:
             out["pin_theta"] = pin_result["theta"]

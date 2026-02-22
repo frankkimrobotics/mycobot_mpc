@@ -96,6 +96,9 @@ def load_params(
             return None
         params["M_diag"] = np.asarray(data["M_diag"])
         params["G_coeff"] = np.asarray(data["G_coeff"])
+    # Friction (optional; from identify_invdyn_from_log with Fv/Fc)
+    params["Fv"] = np.asarray(data["Fv"]) if "Fv" in data else np.zeros(NUM_JOINTS)
+    params["Fc"] = np.asarray(data["Fc"]) if "Fc" in data else np.zeros(NUM_JOINTS)
 
     return params
 
@@ -166,6 +169,14 @@ def _compute_MCG_pinocchio(
     return M, C, G
 
 
+def _friction_torque(qd_rad: np.ndarray, params: dict[str, Any]) -> np.ndarray:
+    """Fv*qd + Fc*sign(qd) from identified params."""
+    Fv = params.get("Fv", np.zeros(NUM_JOINTS))
+    Fc = params.get("Fc", np.zeros(NUM_JOINTS))
+    qd = np.asarray(qd_rad, dtype=float)
+    return Fv * qd + Fc * np.tanh(qd / 1e-6)
+
+
 def compute_tau_from_desired_acceleration(
     q_rad: np.ndarray,
     qd_rad: np.ndarray,
@@ -173,12 +184,14 @@ def compute_tau_from_desired_acceleration(
     params: dict[str, Any],
 ) -> np.ndarray:
     """
-    Drake-style inverse dynamics: generalized_force = M(q)*vd_command + C(q,qd)*qd + G(q).
+    Inverse dynamics: tau = M(q)*vd + C(q,qd)*qd + G(q) + Fv*qd + Fc*sign(qd).
 
-    Same as Drake's InverseDynamics::CalcOutputForce. Returns tau in Nm.
+    Same idea as Drake's InverseDynamics; includes identified friction. Returns tau in model units (use params['torque_scale'] for hal_torq conversion).
     """
     M, C, G = compute_MCG(q_rad, qd_rad, params)
-    return (M @ vd_command_rad + C @ qd_rad + G).astype(float)
+    tau = M @ vd_command_rad + C @ qd_rad + G
+    tau = tau + _friction_torque(qd_rad, params)
+    return tau.astype(float)
 
 
 def compute_qdd_d(
@@ -188,11 +201,12 @@ def compute_qdd_d(
     params: dict[str, Any],
 ) -> np.ndarray:
     """
-    Solve for qdd_d such that M*qdd_d + C*qd + G = tau_pd.
+    Solve for qdd_d such that M*qdd_d + C*qd + G + friction = tau_pd.
     Drake-aligned controller uses vd_command (PID as acceleration) as qdd_d instead.
     """
     M, C, G = compute_MCG(q_rad, qd_rad, params)
-    rhs = tau_pd_Nm - C @ qd_rad - G
+    friction = _friction_torque(qd_rad, params)
+    rhs = tau_pd_Nm - C @ qd_rad - G - friction
     try:
         qdd_d = np.linalg.solve(M, rhs)
     except np.linalg.LinAlgError:
