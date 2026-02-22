@@ -12,6 +12,7 @@ Usage:
     python plot_log.py --latest 3               # plot the 3 most recent files
     python plot_log.py --pipeline               # plot only desktop pipeline logs
     python plot_log.py --robot                  # plot only robot-side logs
+    python plot_log.py --single logs/mpc_20260211_142830_t-120_-90_0_-90_0_0.csv  # one file: pos/vel vs cmd, HAL vel/torq, avg step time
 """
 
 import sys
@@ -106,6 +107,76 @@ def plot_robot_timing_bar(df, title, ax):
             bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
             f"{mean:.3f}", ha="center", va="bottom", fontsize=8,
         )
+
+
+def plot_single_mpc_log(csv_path):
+    """Plot one MPC CSV: (1) position & velocity robot vs cmd, (2) HAL vel & torq, (3) avg step time."""
+    df = load_robot_csv(csv_path)
+    t = df["elapsed_s"].values
+    joint_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+
+    # (1) Position & velocity: robot vs cmd over time
+    fig1, axes1 = plt.subplots(2, NUM_JOINTS, figsize=(18, 6), sharex=True)
+    fig1.suptitle(f"Position & velocity — robot vs cmd — {os.path.basename(csv_path)}", fontsize=12, fontweight="bold")
+    for j in range(NUM_JOINTS):
+        ax = axes1[0, j]
+        ax.plot(t, df[f"q{j}"], color=joint_colors[j], label="robot", linewidth=1)
+        ax.plot(t, df[f"cmd_pos{j}"], color=joint_colors[j], linestyle="--", label="cmd", linewidth=0.8)
+        ax.set_title(f"J{j} pos (deg)")
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.set_ylabel("Position (deg)")
+            ax.legend(fontsize=7)
+        ax = axes1[1, j]
+        ax.plot(t, df[f"qvel{j}"], color=joint_colors[j], label="robot", linewidth=1)
+        ax.plot(t, df[f"cmd_vel{j}"], color=joint_colors[j], linestyle="--", label="cmd", linewidth=0.8)
+        ax.set_title(f"J{j} vel (deg/s)")
+        ax.set_xlabel("Time (s)")
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.set_ylabel("Velocity (deg/s)")
+            ax.legend(fontsize=7)
+    fig1.tight_layout(rect=[0, 0, 1, 0.92])
+    _save_fig(fig1, "single_pos_vel")
+
+    # (2) HAL velocity and torque command
+    fig2, (ax_vel, ax_torq) = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    fig2.suptitle(f"HAL velocity & torque command — {os.path.basename(csv_path)}", fontsize=12, fontweight="bold")
+    for j in range(NUM_JOINTS):
+        ax_vel.plot(t, df[f"hal_vel{j}"], color=joint_colors[j], label=f"J{j}", linewidth=0.9)
+        ax_torq.plot(t, df[f"hal_torq{j}"], color=joint_colors[j], label=f"J{j}", linewidth=0.9)
+    ax_vel.set_ylabel("HAL velocity")
+    ax_vel.legend(ncol=6, fontsize=8)
+    ax_vel.grid(True, alpha=0.3)
+    ax_torq.set_ylabel("HAL torque")
+    ax_torq.set_xlabel("Time (s)")
+    ax_torq.legend(ncol=6, fontsize=8)
+    ax_torq.grid(True, alpha=0.3)
+    fig2.tight_layout(rect=[0, 0, 1, 0.92])
+    _save_fig(fig2, "single_hal_vel_torq")
+
+    # (3) Average time per step
+    steps = ["poll_ms", "pd_solve_ms", "hal_write_ms", "sleep_ms"]
+    labels = ["Poll", "PD Solve", "HAL Write", "Sleep"]
+    means = [df[s].mean() for s in steps]
+    total_avg = sum(means)
+    fig3, ax3 = plt.subplots(figsize=(6, 4))
+    colors = ["#4C72B0", "#55A868", "#C44E52", "#8172B2"]
+    bars = ax3.bar(labels, means, color=colors, edgecolor="black", linewidth=0.5)
+    ax3.set_ylabel("Time (ms)")
+    ax3.set_title(f"Average time per step — {os.path.basename(csv_path)}\n(total avg = {total_avg:.3f} ms)", fontsize=11, fontweight="bold")
+    ax3.grid(True, axis="y", alpha=0.3)
+    for bar, mean in zip(bars, means):
+        ax3.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+                 f"{mean:.3f}", ha="center", va="bottom", fontsize=9)
+    fig3.tight_layout(rect=[0, 0, 1, 0.88])
+    _save_fig(fig3, "single_step_timing")
+
+    print(f"\n  Average time per step: {total_avg:.3f} ms")
+    for s, lab in zip(steps, labels):
+        print(f"    {lab}: {df[s].mean():.3f} ms")
+
+    return fig1, fig2, fig3
 
 
 def plot_robot_logs(csv_files):
@@ -335,7 +406,24 @@ def main():
                         help="Plot only desktop pipeline logs (control_*.csv)")
     parser.add_argument("--robot", action="store_true",
                         help="Plot only robot-side logs (mpc_*.csv)")
+    parser.add_argument("--single", metavar="CSV",
+                        help="Plot one MPC CSV: pos/vel vs cmd, HAL vel/torq, avg step time")
+    parser.add_argument("--no-show", action="store_true",
+                        help="Save figures only, do not open interactive window")
     args = parser.parse_args()
+
+    # Single-file mode (one MPC log)
+    if args.single:
+        path = args.single
+        if not os.path.exists(path):
+            path = os.path.join(LOG_DIR, os.path.basename(path))
+        if not os.path.exists(path):
+            print(f"File not found: {args.single}", file=sys.stderr)
+            sys.exit(1)
+        plot_single_mpc_log(path)
+        if not args.no_show:
+            plt.show()
+        return
 
     # Resolve file lists
     if args.files:
@@ -371,7 +459,8 @@ def main():
         print(f"No {kind} log files found in {LOG_DIR}")
         sys.exit(1)
 
-    plt.show()
+    if not args.no_show:
+        plt.show()
 
 
 if __name__ == "__main__":

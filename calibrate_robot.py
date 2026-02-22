@@ -9,8 +9,11 @@ estimate M, C, G.
 
 Usage:
   python calibrate_robot.py --host $ROBOT_IP --controller pid
-  python calibrate_robot.py --host 10.0.0.27 --duration 3 --step-deg 10 --max-deg 30
+  python calibrate_robot.py --host 10.0.0.27 --duration 3 --step-deg 10 --max-deg 90
   python calibrate_robot.py --host $ROBOT_IP --start -90 -90 0 -90 0 0
+
+  Phase 1: per-joint sweep within ±max_deg (default ±90°) of rest pose.
+  Phase 2: 10 random poses — joint0 ±10°, joints 1–5 ±30° from rest pose.
 """
 
 from __future__ import annotations
@@ -27,6 +30,23 @@ import control_robot as cr
 
 MAX_JOINTS = cr.MAX_JOINTS
 HOME_LINUXCNC_DEG = np.array(cr.HOME_LINUXCNC_DEG)
+
+# Phase 2: random poses (without joint0) — joint0 ±10°, joints 1–5 ±30° from rest
+RANDOM_POSES = 10
+JOINT0_RANGE_DEG = 10.0
+OTHER_JOINTS_RANGE_DEG = 30.0
+
+
+def sample_random_poses(rest_deg: np.ndarray, n_poses: int, rng: np.random.Generator) -> list[np.ndarray]:
+    """Sample n_poses random joint angles: joint0 within ±JOINT0_RANGE_DEG, joints 1–5 within ±OTHER_JOINTS_RANGE_DEG of rest_deg."""
+    poses = []
+    for _ in range(n_poses):
+        target = rest_deg.copy().astype(float)
+        target[0] = rest_deg[0] + rng.uniform(-JOINT0_RANGE_DEG, JOINT0_RANGE_DEG)
+        for j in range(1, MAX_JOINTS):
+            target[j] = rest_deg[j] + rng.uniform(-OTHER_JOINTS_RANGE_DEG, OTHER_JOINTS_RANGE_DEG)
+        poses.append(target)
+    return poses
 
 
 def build_sweep_offsets(step_deg: float, max_deg: float) -> list[float]:
@@ -70,8 +90,8 @@ def main():
                     help="Move duration per waypoint in seconds (default: 3)")
     ap.add_argument("--step-deg", type=float, default=10.0,
                     help="Step size in degrees per joint (default: 10)")
-    ap.add_argument("--max-deg", type=float, default=30.0,
-                    help="Max joint offset in degrees, symmetric ± (default: 30)")
+    ap.add_argument("--max-deg", type=float, default=90.0,
+                    help="Max joint offset in degrees per joint (symmetric ±) for sweep phase (default: 90)")
     ap.add_argument("--pos-tol", type=float, default=0.5, help="Position tolerance for early stop (deg)")
     ap.add_argument("--settle-steps", type=int, default=10, help="Settle steps for early stop")
     ap.add_argument("--no-fetch-logs", action="store_true",
@@ -83,6 +103,10 @@ def main():
                              help="Start from home pose (-90 -90 0 -90 0 0) (default)")
     ap.add_argument("--dry-run", action="store_true",
                      help="Print planned moves only, do not connect or move")
+    ap.add_argument("--random-poses", type=int, default=RANDOM_POSES,
+                    help=f"Number of random poses after sweep (joint0 ±{JOINT0_RANGE_DEG}°, others ±{OTHER_JOINTS_RANGE_DEG}°) (default: {RANDOM_POSES})")
+    ap.add_argument("--no-random-poses", action="store_true",
+                    help="Skip the random-pose phase after the per-joint sweep")
     args = ap.parse_args()
 
     if not args.host:
@@ -99,9 +123,12 @@ def main():
     offsets = build_sweep_offsets(args.step_deg, args.max_deg)
     n_waypoints = len(offsets)
     n_moves_total = MAX_JOINTS * n_waypoints
-    print(f"Calibration plan: {MAX_JOINTS} joints × {n_waypoints} waypoints = {n_moves_total} moves")
+    n_random = 0 if args.no_random_poses else args.random_poses
+    print(f"Calibration plan: {MAX_JOINTS} joints × {n_waypoints} waypoints = {n_moves_total} moves (sweep ±{args.max_deg}°)")
+    if n_random:
+        print(f"  Then {n_random} random poses: J0 ±{JOINT0_RANGE_DEG}°, J1–J5 ±{OTHER_JOINTS_RANGE_DEG}°")
     print(f"  Offsets (deg): {offsets}")
-    print(f"  Start pose: {start_deg.tolist()} deg")
+    print(f"  Start/rest pose: {start_deg.tolist()} deg")
     print(f"  Duration per move: {args.duration}s, controller: {args.controller}")
     if args.dry_run:
         for j in range(MAX_JOINTS):
@@ -111,6 +138,10 @@ def main():
                 t[j] = start_deg[j] + off
                 print(f"{t[j]:.0f}°", end=("\n    " if (i + 1) % 6 == 0 and i else " "))
             print()
+        if n_random:
+            rng = np.random.default_rng(42)
+            for i, p in enumerate(sample_random_poses(start_deg, n_random, rng)):
+                print(f"  Random pose {i+1}: {p.tolist()}")
         return
 
     conn = cr.RobotConnection(host=args.host, cmd_port=args.cmd_port)
@@ -164,6 +195,23 @@ def main():
         current_deg = start_deg.copy()
         if status.get("current_deg"):
             current_deg = np.array(status["current_deg"])
+
+    # Phase 2: random poses — joint0 ±10°, joints 1–5 ±30° from rest (start_deg)
+    if not args.no_random_poses and args.random_poses > 0:
+        rng = np.random.default_rng()
+        random_poses = sample_random_poses(start_deg, args.random_poses, rng)
+        print(f"\n--- Random poses ({len(random_poses)} poses, J0 ±{JOINT0_RANGE_DEG}°, J1–J5 ±{OTHER_JOINTS_RANGE_DEG}°) ---")
+        for i, target in enumerate(random_poses):
+            print(f"  [{i+1}/{len(random_poses)}] {target.tolist()}")
+            status = cr.move_to_joints(
+                conn, target,
+                duration=args.duration, controller=args.controller,
+                pos_tol=args.pos_tol, settle_steps=args.settle_steps,
+                logger=logger,
+            )
+            cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
+            if status.get("current_deg"):
+                current_deg = np.array(status["current_deg"])
 
     conn.close()
 

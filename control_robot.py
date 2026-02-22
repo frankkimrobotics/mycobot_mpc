@@ -249,12 +249,15 @@ class RobotConnection:
         """
         # Robot HAL expects "pd" for PID/PD; user-facing option is "pid"
         robot_controller = "pd" if controller == "pid" else controller
+        # Send desktop timestamp so Raspi uses it for CSV filename (Raspi clock may be wrong)
+        log_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         cmd = {
             "target_deg": [round(float(v), 4) for v in target_deg],
             "duration": duration,
             "controller": robot_controller,
             "pos_tol": pos_tol,
             "settle_steps": settle_steps,
+            "log_stamp": log_stamp,
         }
         msg = json.dumps(cmd) + "\n"
         self.sock.sendall(msg.encode("utf-8"))

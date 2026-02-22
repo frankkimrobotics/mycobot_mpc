@@ -14,13 +14,19 @@ then either:
       (G from cos/sin basis per joint, M diagonal constant) from the same data.
 
 Units: CSV q in degrees, qvel in deg/s; internally we convert to rad, rad/s, rad/s².
-Torque (hal_torq) is used as logged (driver units); identified params are in
-the same unit system unless you provide a torque scale.
+Torque (hal_torq) is in pro600 driver units by default. Use --torque-scale to convert
+to Nm so M comes out in kg·m² and G in Nm. The robot total mass (e.g. 8.8 kg) is not
+the diagonal of M(q): M(q) is joint-space inertia matrix; total mass is from the full
+inertial parameter vector (e.g. Pinocchio theta), not from M_diag.
 
 Usage:
-  python identify_invdyn_from_log.py logs/invdyn_20260211_*.csv
-  python identify_invdyn_from_log.py --csv logs/mpc_latest.csv --period-ms 20
-  python identify_invdyn_from_log.py --csv logs/invdyn_1.csv --urdf /path/to/robot.urdf
+  python identify_invdyn_from_log.py logs/mpc_20260211_*.csv
+  python identify_invdyn_from_log.py logs/invdyn_*.csv --period-ms 20
+  python identify_invdyn_from_log.py --csv logs/mpc_latest.csv --out params.npz
+  python identify_invdyn_from_log.py logs/mpc_*.csv -o logs/invdyn_params.npz   # invdyn_hal picks this up by default
+
+Note: Use robot logs (mpc_*.csv or invdyn_*.csv), not desktop control_calibrate_*.csv.
+      The latter has one row per move and no hal_torq; fetch robot CSVs with fetch_robot_logs.py.
 """
 
 from __future__ import annotations
@@ -59,10 +65,15 @@ def linuxcnc_deg_to_rad(deg: np.ndarray) -> np.ndarray:
     ])
 
 
-def load_robot_log(csv_path: str, period_ms: float = DEFAULT_PERIOD_MS) -> pd.DataFrame:
+def load_robot_log(
+    csv_path: str,
+    period_ms: float = DEFAULT_PERIOD_MS,
+    torque_scale: float = 1.0,
+) -> pd.DataFrame:
     """
     Load robot CSV and add columns: elapsed_s, q_rad, qd_rad, qdd_rad, tau.
     Prefers hal_vel over qvel; requires hal_torq for tau.
+    torque_scale: multiply hal_torq by this to get Nm (e.g. from pro600 datasheet).
     """
     df = pd.read_csv(csv_path)
 
@@ -104,12 +115,12 @@ def load_robot_log(csv_path: str, period_ms: float = DEFAULT_PERIOD_MS) -> pd.Da
             qdd_rad[i] = qdd_rad[i - 1]
     df["qdd_rad"] = list(qdd_rad)
 
-    # Torque (required)
+    # Torque (required); optional scale to convert to Nm
     if not all(f"hal_torq{i}" in df.columns for i in range(NUM_JOINTS)):
         raise ValueError(
             f"CSV must contain hal_torq0..hal_torq5 for dynamics ID. Columns: {list(df.columns)}"
         )
-    tau = np.column_stack([df[f"hal_torq{i}"].values for i in range(NUM_JOINTS)])
+    tau = np.column_stack([df[f"hal_torq{i}"].values for i in range(NUM_JOINTS)]) * torque_scale
     df["tau"] = list(tau)
 
     return df
@@ -150,7 +161,7 @@ def fit_simple_model(df: pd.DataFrame) -> dict:
     # Least squares with small regularization
     reg = 1e-6 * np.eye(nparams)
     theta = np.linalg.lstsq(W.T @ W + reg, W.T @ tau_vec, rcond=None)[0]
-    M_diag = theta[:6]
+    M_diag = np.maximum(theta[:6], 1e-8)  # clamp to positive (inertia must be > 0)
     g_params = theta[6:].reshape(NUM_JOINTS, 3)  # (a, b, c) per joint
 
     # Residual
@@ -287,7 +298,9 @@ def main():
                     help="Control loop period in ms (for time from loop index)")
     ap.add_argument("--urdf", default=DEFAULT_URDF_PATH, help="URDF for Pinocchio (if available)")
     ap.add_argument("--no-pinocchio", action="store_true", help="Skip Pinocchio even if installed")
-    ap.add_argument("--out", "-o", help="Save identified params to this .npz file")
+    ap.add_argument("--out", "-o", help="Save identified params to this .npz file (e.g. logs/invdyn_params.npz for invdyn_hal default)")
+    ap.add_argument("--torque-scale", type=float, default=1.0,
+                    help="Scale hal_torq to Nm: tau_Nm = hal_torq * scale (then M is in kg·m²)")
     args = ap.parse_args()
 
     files = args.csv or args.csv_single
@@ -308,12 +321,14 @@ def main():
     else:
         csv_path = files[0]
     print(f"Loading: {csv_path}")
-    df = load_robot_log(csv_path, period_ms=args.period_ms)
+    df = load_robot_log(csv_path, period_ms=args.period_ms, torque_scale=args.torque_scale)
     if len(files) > 1:
         for f in files[1:]:
-            df2 = load_robot_log(f, period_ms=args.period_ms)
+            df2 = load_robot_log(f, period_ms=args.period_ms, torque_scale=args.torque_scale)
             df = pd.concat([df, df2], ignore_index=True)
         print(f"Merged {len(files)} files → {len(df)} rows")
+    if args.torque_scale != 1.0:
+        print(f"  Torque scale: {args.torque_scale} (tau in Nm → M in kg·m²)")
 
     print(f"  Rows: {len(df)}, time span: {df['elapsed_s'].min():.3f} – {df['elapsed_s'].max():.3f} s")
     q_all = np.array(df["q_rad"].tolist())
@@ -322,9 +337,11 @@ def main():
     # Simple model (always)
     print("\n--- Simple model (M diagonal + G cos/sin per joint) ---")
     simple = fit_simple_model(df)
-    print(f"  M_diag (diagonal inertia): {simple['M_diag']}")
+    print(f"  M_diag (diagonal inertia, clamped ≥ 0): {simple['M_diag']}")
     print(f"  G coeffs (a*cos+b*sin+c per joint):\n{simple['G_coeff']}")
     print(f"  RMSE torque: {simple['rmse']:.6f}")
+    print("  Note: M(q) is joint-space inertia (kg·m² if --torque-scale gives Nm), not total mass.")
+    print("  Robot total mass (e.g. 8.8 kg) is in the full inertial params (Pinocchio theta), not M_diag.")
 
     # Pinocchio if available
     pin_result = None
@@ -351,6 +368,7 @@ def main():
             "M_diag": simple["M_diag"],
             "G_coeff": simple["G_coeff"],
             "simple_rmse": simple["rmse"],
+            "torque_scale": np.float64(args.torque_scale),
         }
         if pin_result:
             out["pin_theta"] = pin_result["theta"]
@@ -358,6 +376,8 @@ def main():
             out["pin_nparams"] = pin_result["nparams"]
         np.savez(args.out, **out)
         print(f"\nSaved to {args.out}")
+        if args.out.endswith("invdyn_params.npz") or "invdyn_params" in args.out:
+            print("  invdyn_hal.py and invdyn_linuxcnc.py use logs/invdyn_params.npz by default.")
 
 
 if __name__ == "__main__":

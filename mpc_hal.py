@@ -372,15 +372,17 @@ def _print_timing_summary(loop_count):
 
 
 _last_log_filename = None  # basename of last saved CSV (for desktop fetch)
+_desktop_log_stamp = None  # optional YYYYMMDD_HHMMSS from desktop (Raspi clock may be wrong)
 
 
 def _save_log(log_rows, target_angles, controller="pd"):
     """Write collected log rows to a timestamped CSV file. Sets _last_log_filename for fetch."""
-    global _last_log_filename
+    global _last_log_filename, _desktop_log_stamp
     if not log_rows:
         return
     os.makedirs(LOG_DIR, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = _desktop_log_stamp if _desktop_log_stamp else datetime.now().strftime("%Y%m%d_%H%M%S")
+    _desktop_log_stamp = None  # use once per save
     target_str = "_".join(str(int(a)) for a in target_angles)
     filename = os.path.join(LOG_DIR, f"mpc_{stamp}_t{target_str}.csv")
     header = (
@@ -1050,6 +1052,9 @@ def main():
                 controller = "pd"
             pos_tol = cmd.get("pos_tol", 0.5)
             settle = cmd.get("settle_steps", 10)
+            # Use desktop timestamp for CSV filename (Raspi system date may be wrong)
+            global _desktop_log_stamp
+            _desktop_log_stamp = cmd.get("log_stamp") if isinstance(cmd.get("log_stamp"), str) else None
 
             t_cmd_start = time.perf_counter()
 
