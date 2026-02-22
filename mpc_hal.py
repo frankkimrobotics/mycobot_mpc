@@ -220,7 +220,7 @@ def mpc_solve(q, target_angles, dt):
 
 
 def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
-                     pos_tol=0.5, vel_tol=1.0, settle_steps=10):
+                     pos_tol=0.5, vel_tol=1.0, settle_steps=10, controller="mpc"):
     """Run MPC control loop: poll -> QP solve (N-step horizon) -> HAL write.
 
     Uses OSQP to solve a QP over MPC_HORIZON steps per iteration,
@@ -294,7 +294,7 @@ def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
 
         # Collect log row
         log_rows.append([
-            t_status, loop_count,
+            controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
             err,
             _timing["poll"][-1], _timing["mpc_solve"][-1],
@@ -312,7 +312,7 @@ def mpc_control_loop(h, s, target_angles, duration_sec=10.0,
 
     h["enable"] = False
     print(f"\nDone. Ran {loop_count} MPC iterations.")
-    _save_log(log_rows, target_angles)
+    _save_log(log_rows, target_angles, controller)
 
 
 @timed("poll")
@@ -354,7 +354,7 @@ def _print_timing_summary(loop_count):
 _last_log_filename = None  # basename of last saved CSV (for desktop fetch)
 
 
-def _save_log(log_rows, target_angles):
+def _save_log(log_rows, target_angles, controller="pd"):
     """Write collected log rows to a timestamped CSV file. Sets _last_log_filename for fetch."""
     global _last_log_filename
     if not log_rows:
@@ -364,7 +364,7 @@ def _save_log(log_rows, target_angles):
     target_str = "_".join(str(int(a)) for a in target_angles)
     filename = os.path.join(LOG_DIR, f"mpc_{stamp}_t{target_str}.csv")
     header = (
-        ["timestamp", "loop"]
+        ["controller", "timestamp", "loop"]
         + [f"q{i}" for i in range(MAX_JOINTS)]
         + [f"qvel{i}" for i in range(MAX_JOINTS)]
         + [f"target{i}" for i in range(MAX_JOINTS)]
@@ -381,8 +381,8 @@ def _save_log(log_rows, target_angles):
 
 
 def pd_control_loop(h, s, target_angles, duration_sec=10.0,
-                 pos_tol=0.5, vel_tol=1.0, settle_steps=10):
-    """Run MPC loop: poll -> PD solve -> HAL write.
+                 pos_tol=0.5, vel_tol=1.0, settle_steps=10, controller="pd"):
+    """Run PD loop: poll -> PD solve -> HAL write.
 
     Early-stops when position error norm < pos_tol (deg) AND velocity norm
     < vel_tol (deg/s) for settle_steps consecutive iterations.
@@ -452,7 +452,7 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
 
         # Collect log row (no file I/O in the control loop)
         log_rows.append([
-            t_status, loop_count,
+            controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
             err,
             _timing["poll"][-1], _timing["pd_solve"][-1],
@@ -470,7 +470,7 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
     _print_timing_summary(loop_count)
 
     # Flush log to CSV
-    _save_log(log_rows, target_angles)
+    _save_log(log_rows, target_angles, controller)
 
 
 import subprocess
@@ -1036,10 +1036,10 @@ def main():
 
             if controller == "mpc":
                 mpc_control_loop(h, s, target, duration_sec=duration,
-                                 pos_tol=pos_tol, settle_steps=settle)
+                                 pos_tol=pos_tol, settle_steps=settle, controller=controller)
             else:
                 pd_control_loop(h, s, target, duration_sec=duration,
-                                pos_tol=pos_tol, settle_steps=settle)
+                                pos_tol=pos_tol, settle_steps=settle, controller=controller)
 
             robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
 

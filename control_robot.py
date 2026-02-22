@@ -22,6 +22,8 @@ Usage:
     python3.10 control_robot.py --host 10.0.0.27 --home
 """
 
+from __future__ import annotations
+
 import argparse
 import base64
 import csv
@@ -33,15 +35,23 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
-# Prevent conda PYTHONPATH from injecting incompatible packages
-if "CONDA_PREFIX" in os.environ:
+if TYPE_CHECKING:
+    from ik_pyroki import MyCobotIK
+
+# When conda is active but we're running a different Python (e.g. homebrew), avoid
+# conda's PYTHONPATH so it doesn't inject incompatible packages. If we're running
+# the active conda env's Python, leave sys.path alone so its site-packages (numpy, etc.) work.
+_conda_prefix = os.environ.get("CONDA_PREFIX", "")
+if _conda_prefix and not sys.executable.startswith(_conda_prefix):
     os.environ.pop("PYTHONPATH", None)
     sys.path[:] = [p for p in sys.path if "conda" not in p and "envs" not in p]
 
 import numpy as np
 
-from ik_pyroki import MyCobotIK, HOME_LINUXCNC_DEG
+# Home pose in LinuxCNC degrees (same as ik_pyroki). IK is imported only when needed (--xyz / --interactive).
+HOME_LINUXCNC_DEG = [-90.0, -90.0, 0.0, -90.0, 0.0, 0.0]
 
 MAX_JOINTS = 6
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -217,7 +227,7 @@ class RobotConnection:
         self,
         target_deg: list[float],
         duration: float = 2.0,
-        controller: str = "pd",
+        controller: str = "pid",
         pos_tol: float = 0.5,
         settle_steps: int = 10,
     ) -> dict:
@@ -226,17 +236,19 @@ class RobotConnection:
         Args:
             target_deg: 6 joint angles in LinuxCNC degrees
             duration: Max duration for the move (seconds)
-            controller: "pd" or "mpc"
+            controller: "pid", "mpc", or "invdyn"
             pos_tol: Position tolerance for early stop (degrees)
             settle_steps: Consecutive converged loops before early stop
 
         Returns:
             Ack dict from robot, or empty dict on failure
         """
+        # Robot HAL expects "pd" for PID/PD; user-facing option is "pid"
+        robot_controller = "pd" if controller == "pid" else controller
         cmd = {
             "target_deg": [round(float(v), 4) for v in target_deg],
             "duration": duration,
-            "controller": controller,
+            "controller": robot_controller,
             "pos_tol": pos_tol,
             "settle_steps": settle_steps,
         }
@@ -358,7 +370,7 @@ def move_to_joints(
     conn: RobotConnection,
     target_deg: np.ndarray,
     duration: float = 2.0,
-    controller: str = "pd",
+    controller: str = "pid",
     pos_tol: float = 0.5,
     settle_steps: int = 10,
     timer: PipelineTimer | None = None,
@@ -370,7 +382,7 @@ def move_to_joints(
         conn: Robot connection
         target_deg: 6 joint angles in LinuxCNC degrees
         duration: Max duration for the move
-        controller: "pd" or "mpc"
+        controller: "pid", "mpc", or "invdyn"
         pos_tol: Position tolerance for early stop (degrees)
         settle_steps: Consecutive converged loops before early stop
         timer: Optional PipelineTimer (will be created if None)
@@ -421,7 +433,7 @@ def move_to_pose(
     R: np.ndarray,
     t: np.ndarray,
     duration: float = 2.0,
-    controller: str = "pd",
+    controller: str = "pid",
     pos_tol: float = 0.5,
     settle_steps: int = 10,
     logger: MoveLogger | None = None,
@@ -434,7 +446,7 @@ def move_to_pose(
         R: (3,3) rotation matrix for eef
         t: (3,) translation vector for eef (meters)
         duration: Max duration for the move
-        controller: "pd" or "mpc"
+        controller: "pid", "mpc", or "invdyn"
         pos_tol: Position tolerance for early stop (degrees)
         settle_steps: Consecutive converged loops before early stop
         logger: Optional MoveLogger to record the move
@@ -613,16 +625,16 @@ Examples:
         help="Robot command port (default: 9998)")
     parser.add_argument("--stream-port", type=int, default=9999,
         help="Robot streaming port for rviz2 (default: 9999)")
-    parser.add_argument("--controller", choices=["pd", "mpc", "invdyn"], default="pd",
-        help="Controller type (default: pd)")
+    parser.add_argument("--controller", choices=["pid", "mpc", "invdyn"], default="pid",
+        help="Controller type: pid, mpc, or invdyn (default: pid)")
     parser.add_argument("--duration", type=float, default=2.0,
         help="Move duration in seconds (default: 2.0)")
     parser.add_argument("--pos-tol", type=float, default=0.5,
         help="Position tolerance for early stop in degrees (default: 0.5)")
     parser.add_argument("--settle-steps", type=int, default=10,
         help="Consecutive converged loops before early stop (default: 10)")
-    parser.add_argument("--no-rviz", action="store_true",
-                        help="Don't launch rviz2 (use if it's already running)")
+    parser.add_argument("--rviz", action="store_true",
+                        help="Launch rviz2 + pose stream (default: do not launch)")
     parser.add_argument("--no-fetch-logs", action="store_true",
                         help="Don't fetch robot CSV logs to local logs/ after each move")
 
@@ -654,16 +666,19 @@ Examples:
                 except ProcessLookupError:
                     pass
 
-    # Launch rviz2 + streaming client (before IK init, so rviz2 loads in parallel)
-    if not args.no_rviz:
+    # Launch rviz2 + streaming client only if requested
+    if args.rviz:
         rviz_proc = launch_rviz_streamer(args.host, args.stream_port)
 
-    # Initialize IK solver (JIT warmup happens here, ~2s)
-    print("Initializing IK solver...")
-    t_ik_init = time.perf_counter()
-    ik = MyCobotIK()
-    ik_init_ms = (time.perf_counter() - t_ik_init) * 1000
-    print(f"IK solver ready ({ik_init_ms:.0f}ms)")
+    # IK solver only needed for --xyz and --interactive (uses JAX/pyroki)
+    ik = None
+    if args.xyz or args.interactive:
+        print("Initializing IK solver...")
+        from ik_pyroki import MyCobotIK
+        t_ik_init = time.perf_counter()
+        ik = MyCobotIK()
+        ik_init_ms = (time.perf_counter() - t_ik_init) * 1000
+        print(f"IK solver ready ({ik_init_ms:.0f}ms)")
 
     # Per-session move logger
     logger = MoveLogger()

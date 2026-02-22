@@ -47,7 +47,7 @@ Same idea as MPC: start LinuxCNC on the **Raspi** with the InvDyn config; then f
   ```
   The Raspi runs the InvDyn loop and drives the robot to the target.
 
-- **ROS2 rviz:** By default, `control_robot.py` also launches **rviz2** and **robot_pose_stream_ros2.py**. The streamer connects to the robot’s **port 9999** (same as with MPC). `invdyn_hal.py` runs the same streaming server on 9999, so rviz2 will show the robot motion when using InvDyn. Use `--no-rviz` if you don’t want to start rviz2.
+- **ROS2 rviz:** By default, `control_robot.py` does not launch rviz2. Use `--rviz` to launch **rviz2** and **robot_pose_stream_ros2.py**. The streamer connects to the robot’s **port 9999** (same as with MPC). `invdyn_hal.py` runs the same streaming server on 9999, so rviz2 will show the robot motion when using InvDyn.
 
 ### 3. Optional: InvDyn via MDI (like mpc_linuxcnc.py)
 

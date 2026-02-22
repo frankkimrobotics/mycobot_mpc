@@ -100,7 +100,7 @@ def pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
 
 
 def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
-                        pos_tol=0.5, vel_tol=1.0, settle_steps=10):
+                        pos_tol=0.5, vel_tol=1.0, settle_steps=10, controller="invdyn"):
     """Run InvDyn loop: poll -> invdyn_solve -> HAL write."""
     print("InvDyn control loop starting. Target:", target_angles)
     print(f"  Kp={INVDYN_KP} Kd={INVDYN_KD} qdd_max={QDD_MAX_DEG} deg/s²")
@@ -153,7 +153,7 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
             converged_count = 0
 
         log_rows.append([
-            t_status, loop_count,
+            controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
             err,
             _timing["poll"][-1], _timing["invdyn_solve"][-1],
@@ -164,11 +164,11 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
 
     h["enable"] = False
     print(f"\nDone. Ran {loop_count} InvDyn iterations.")
-    _save_log(log_rows, target_angles)
+    _save_log(log_rows, target_angles, controller)
 
 
 def pd_control_loop(h, s, target_angles, duration_sec=10.0,
-                    pos_tol=0.5, vel_tol=1.0, settle_steps=10):
+                    pos_tol=0.5, vel_tol=1.0, settle_steps=10, controller="pd"):
     """Run PD loop (fallback): poll -> pd_solve -> HAL write."""
     print("PD control loop starting. Target:", target_angles)
     h["enable"] = True
@@ -212,13 +212,13 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
         else:
             converged_count = 0
         log_rows.append([
-            t_status, loop_count, *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
+            controller, t_status, loop_count, *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
             err, _timing["poll"][-1], _timing["pd_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
         ])
     h["enable"] = False
     print(f"Done. Ran {loop_count} PD iterations.")
-    _save_log(log_rows, target_angles)
+    _save_log(log_rows, target_angles, controller)
 
 
 @timed("poll")
@@ -245,7 +245,7 @@ def _write_hal_cmd(h, next_pos, vel_cmd):
 _last_log_filename = None  # basename of last saved CSV (for desktop fetch)
 
 
-def _save_log(log_rows, target_angles):
+def _save_log(log_rows, target_angles, controller="invdyn"):
     global _last_log_filename
     if not log_rows:
         return
@@ -254,7 +254,7 @@ def _save_log(log_rows, target_angles):
     target_str = "_".join(str(int(a)) for a in target_angles)
     filename = os.path.join(LOG_DIR, f"invdyn_{stamp}_t{target_str}.csv")
     header = (
-        ["timestamp", "loop"]
+        ["controller", "timestamp", "loop"]
         + [f"q{i}" for i in range(MAX_JOINTS)] + [f"qvel{i}" for i in range(MAX_JOINTS)]
         + [f"target{i}" for i in range(MAX_JOINTS)] + [f"cmd_pos{i}" for i in range(MAX_JOINTS)]
         + [f"cmd_vel{i}" for i in range(MAX_JOINTS)]
@@ -609,9 +609,9 @@ def main():
             print(f"\n[cmd] Moving → {[round(v, 1) for v in target]} controller={controller}")
             _update_cmd_status("moving", current, target, err)
             if controller == "invdyn":
-                invdyn_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle)
+                invdyn_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
             else:
-                pd_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle)
+                pd_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
             robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
             s.poll()
             final = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
