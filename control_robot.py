@@ -561,7 +561,7 @@ Examples:
         help="Robot command port (default: 9998)")
     parser.add_argument("--stream-port", type=int, default=9999,
         help="Robot streaming port for rviz2 (default: 9999)")
-    parser.add_argument("--controller", choices=["pd", "mpc"], default="pd",
+    parser.add_argument("--controller", choices=["pd", "mpc", "invdyn"], default="pd",
         help="Controller type (default: pd)")
     parser.add_argument("--duration", type=float, default=2.0,
         help="Move duration in seconds (default: 2.0)")
@@ -620,7 +620,7 @@ Examples:
         conn.connect()
     except (ConnectionRefusedError, socket.timeout, OSError) as e:
         print(f"ERROR: Cannot connect to robot at {args.host}:{args.cmd_port}: {e}")
-        print("Make sure mpc_hal.py is running on the robot (via linuxcnc elerob_mpc.ini).")
+        print("Make sure mpc_hal.py or invdyn_hal.py is running on the robot (via linuxcnc elerob_mpc.ini or elerob_invdyn.ini).")
         cleanup()
         sys.exit(1)
 
