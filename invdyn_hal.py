@@ -600,6 +600,10 @@ def main():
                 continue
             duration = cmd.get("duration", 2.0)
             controller = cmd.get("controller", "invdyn")
+            # This HAL only supports pd and invdyn; normalize so CSV matches actual control
+            if controller not in ("pd", "invdyn"):
+                print(f"[cmd] controller={controller} not supported by invdyn_hal, using pd")
+                controller = "pd"
             pos_tol = cmd.get("pos_tol", 0.5)
             settle = cmd.get("settle_steps", 10)
             t_cmd_start = time.perf_counter()

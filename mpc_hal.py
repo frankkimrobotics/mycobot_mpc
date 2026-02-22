@@ -1020,6 +1020,10 @@ def main():
 
             duration = cmd.get("duration", 2.0)
             controller = cmd.get("controller", "pd")
+            # This HAL only supports pd and mpc; normalize so CSV matches actual control
+            if controller not in ("pd", "mpc"):
+                print(f"[cmd] controller={controller} not supported by mpc_hal, using pd")
+                controller = "pd"
             pos_tol = cmd.get("pos_tol", 0.5)
             settle = cmd.get("settle_steps", 10)
 

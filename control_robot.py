@@ -3,10 +3,14 @@
 Desktop-side robot controller: solve IK for target eef pose, send to robot.
 
 Pipeline:
-  Target (R, t) → IK (pyroki) → joint angles (deg) → TCP → robot (mpc_hal.py)
+  Target (R, t) → IK (pyroki) → joint angles (deg) → TCP → robot (mpc_hal or invdyn_hal)
 
-The robot must be running mpc_hal.py (via linuxcnc elerob_mpc.ini) which
-listens for commands on port 9998 and streams joint feedback on port 9999.
+The robot runs one of two HAL components depending on the LinuxCNC config:
+  - elerob_mpc.ini  → mpc_hal.py  → honors --controller pid or mpc  (sends "pd" or "mpc")
+  - elerob_invdyn.ini → invdyn_hal.py → honors --controller pid or invdyn (sends "pd" or "invdyn")
+
+The robot uses the received controller value to choose the control law; the desktop
+choice is reflected. Use the INI that matches the controller you want (mpc vs invdyn).
 
 Usage:
     # Move to a Cartesian position (uses home orientation):
