@@ -2,6 +2,12 @@
 
 Inverse-dynamics control using the same Raspi/LinuxCNC + HAL architecture as MPC.
 
+## Dependencies
+
+- **Robot (invdyn_hal.py):** numpy, linuxcnc, hal (no MuJoCo). Runs on the Raspi under LinuxCNC.
+- **Desktop (control_robot.py):** numpy, optional IK (pyroki/jax for --xyz and --interactive). **No MuJoCo needed** for `--controller invdyn`; the desktop only sends targets to the robot.
+- **Optional:** To run **mujoco_viewer.py** or **mycobot_pro630_streaming** invdyn streaming on the desktop, install MuJoCo in ros_env: `pip install -r requirements-ros_env.txt`.
+
 ## Files
 
 - **invdyn_hal.py** — HAL component `invdyn`: runs on the robot (Raspi). Control law: desired acceleration `q̈_d = Kp*e - Kd*q̇` (deg/s²), then `next_pos = q + q̇*dt + 0.5*q̈_d*dt²`, `vel_cmd = q̇ + q̈_d*dt`. Writes to `invdyn.joint{i}_pos_cmd` and `invdyn.joint{i}_vel_cmd`. Same command server (port 9998) and streaming server (port 9999) as `mpc_hal.py`.

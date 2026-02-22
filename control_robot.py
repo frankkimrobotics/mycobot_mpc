@@ -623,8 +623,9 @@ Examples:
   python3.10 control_robot.py --host 10.0.0.27 --interactive
 """,
     )
-    parser.add_argument("--host", required=True,
-        help="Robot controller IP (e.g., 10.0.0.27)")
+    default_host = os.environ.get("ROBOT_IP")
+    parser.add_argument("--host", default=default_host,
+        help="Robot controller IP (default: ROBOT_IP env, e.g. 10.0.0.27)")
     parser.add_argument("--cmd-port", type=int, default=9998,
         help="Robot command port (default: 9998)")
     parser.add_argument("--stream-port", type=int, default=9999,
@@ -654,6 +655,18 @@ Examples:
         help="Interactive control mode")
 
     args = parser.parse_args()
+
+    # If --host $ROBOT_IP was used and ROBOT_IP is unset, host can be "" or the next arg (e.g. "--controller")
+    host = (args.host or "").strip()
+    if not host or host.startswith("-"):
+        host = os.environ.get("ROBOT_IP") or ""
+    if not host:
+        parser.error(
+            "Robot host not set. Use either:\n"
+            "  (1) ./setup_robot_ip.sh 10.0.0.27  then  conda activate ros_env  (no --host needed)\n"
+            "  (2)  python control_robot.py --host 10.0.0.27 ...  (use your Raspi IP)"
+        )
+    args.host = host
 
     rviz_proc = None
 

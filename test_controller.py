@@ -211,8 +211,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--host",
-                        help="Robot IP (e.g., 10.0.0.27). Omit with --local to use mock.")
+    parser.add_argument("--host", default=os.environ.get("ROBOT_IP"),
+                        help="Robot IP (default: ROBOT_IP env). Omit with --local to use mock.")
     parser.add_argument("--local", action="store_true",
                         help="Run without robot: start local mock server (command + stream) for debugging.")
     parser.add_argument("--cmd-port", type=int, default=9998,
@@ -233,7 +233,7 @@ def main():
         start_mock_robot(cmd_port=args.cmd_port, stream_port=args.stream_port)
         print("[mock] Mock robot ready.")
     elif not args.host:
-        parser.error("Either --host <ip> or --local is required.")
+        parser.error("Either set ROBOT_IP / pass --host <ip>, or use --local for mock.")
 
     rviz_proc = None
 

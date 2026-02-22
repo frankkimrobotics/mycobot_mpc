@@ -1,0 +1,8 @@
+# Optional deps for ros_env: MuJoCo + inverse-dynamics (mujoco_viewer, mycobot_pro630_streaming invdyn mode).
+# Install in ros_env if you run:  python mujoco_viewer.py  or  mycobot_pro630_streaming invdyn streaming.
+#
+# control_robot.py --controller invdyn  does NOT need these: it only sends commands to the robot;
+# the robot runs invdyn_hal.py (elerob_invdyn.ini) which uses only numpy + LinuxCNC/HAL.
+mujoco>=3.0.0
+trimesh
+numpy
