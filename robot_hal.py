@@ -53,9 +53,15 @@ INTEGRAL_CLAMP = 50.0  # anti-windup: clamp |integral| per joint
 U_MAX_PER_STEP = 8.0
 
 # InvDyn (acceleration space): qdd_d = Kp*e - Kd*qd, then integrate
+# Acceleration integration gives ~0.03° per 20 ms step → robot barely moves.
+# USE_PD_STEPS_FOR_INVDYN: use direct position-step PD for invdyn so the robot moves.
+USE_PD_STEPS_FOR_INVDYN = True
 INVDYN_KP = 144.0
 INVDYN_KD = 24.0
 QDD_MAX_DEG = 150.0
+# PD position-step gains when USE_PD_STEPS_FOR_INVDYN (same as mpc_hal / invdyn_hal pd_solve)
+KP_PD_INVDYN = 0.5
+KD_PD_INVDYN = 0.1
 
 # PD + vel feedforward: same Kp,Kd as invdyn-style for consistency
 KP_PD_VELFF = 144.0 / 90.0  # scale to deg/s² per deg error
@@ -134,6 +140,26 @@ def _invdyn_solve_fallback(q, target_angles, q_vel=None, prev_q=None, dt=None):
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
 
 
+def _invdyn_pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
+    """Direct position-step PD for invdyn path so the robot actually moves (same idea as invdyn_hal pd_solve)."""
+    current = np.array(q, dtype=float)
+    target = np.array(target_angles, dtype=float)
+    error = target - current
+    if q_vel is not None:
+        velocity = np.array(q_vel, dtype=float)
+    elif prev_q is not None and dt and dt > 0:
+        velocity = (current - np.array(prev_q, dtype=float)) / dt
+    else:
+        velocity = np.zeros(MAX_JOINTS)
+    if dt is None or dt <= 0:
+        dt = PERIOD_SEC
+    u = KP_PD_INVDYN * error - KD_PD_INVDYN * velocity
+    u = np.clip(u, -U_MAX_PER_STEP, U_MAX_PER_STEP)
+    next_pos = current + u
+    vel_cmd = (u / dt * 0.5) if dt > 0 else np.zeros(MAX_JOINTS)
+    return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
+
+
 def _invdyn_model_solve_deg(q, target_angles, q_vel=None, prev_q=None, dt=None):
     """Model-aware invdyn in deg: vd_command in rad/s² from Kp*(target_rad - q_rad) - Kd*qd_rad; integrate in deg."""
     if linuxcnc_deg_to_rad is None:
@@ -161,7 +187,9 @@ def _invdyn_model_solve_deg(q, target_angles, q_vel=None, prev_q=None, dt=None):
 
 @timed("solve")
 def invdyn_solve(q, target_angles, params, q_vel=None, prev_q=None, dt=None):
-    """Invdyn: use rad-space PD (model-style) when params loaded, else acceleration PD in deg."""
+    """Invdyn: use PD position steps (so robot moves) when USE_PD_STEPS_FOR_INVDYN; else acceleration integration."""
+    if USE_PD_STEPS_FOR_INVDYN:
+        return _invdyn_pd_solve(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
     if params is not None and (load_invdyn_params is not None or linuxcnc_deg_to_rad is not None):
         return _invdyn_model_solve_deg(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
     return _invdyn_solve_fallback(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
@@ -646,6 +674,8 @@ def main():
         _halcmd_set(SUCTION_PIN, 1)
     _update_cmd_status("idle", current, current, 0.0)
 
+    if USE_PD_STEPS_FOR_INVDYN:
+        print("  invdyn: using PD position steps (robot will move)")
     print("\n" + "=" * 60)
     print("Waiting for commands. Controller: pid | invdyn | pd_velff")
     print("=" * 60 + "\n")
