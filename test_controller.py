@@ -8,7 +8,7 @@ Steps:
   3. Send target joint angles; controller outputs control; stream feeds /joint_states → RViz.
 
 Prerequisites:
-  - On Raspi: LinuxCNC running with mpc_hal or invdyn_hal (elerob_mpc.ini or elerob_invdyn.ini).
+  - On Raspi: LinuxCNC running with robot_hal.py (elerob.ini).
   - On desktop: ROS2 env sourced if using RViz (see Usage).
 
 Usage:
@@ -269,7 +269,7 @@ def main():
         conn.connect()
     except (ConnectionRefusedError, OSError) as e:
         print(f"ERROR: Cannot connect to robot at {args.host}:{args.cmd_port}: {e}")
-        print("       Ensure LinuxCNC + mpc_hal or invdyn_hal is running on the robot.")
+        print("       Ensure LinuxCNC + robot_hal.py is running on the robot.")
         cleanup()
         sys.exit(1)
 

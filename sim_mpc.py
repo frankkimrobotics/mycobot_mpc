@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Offline simulation of the PD and MPC controllers from mpc_hal.py.
+Offline simulation of the PD and MPC controllers from controller_solvers.py.
 
 Simulates the closed-loop response to a target joint pose using the same
-control law and constants as the real controller. No LinuxCNC/HAL needed.
+shared solvers and gains (from controller_params.yaml) as the real robot
+(robot_hal.py) and the MuJoCo viewer. No LinuxCNC/HAL needed.
 
 Usage:
     python sim_mpc.py                           # default (PD) demo
@@ -14,22 +15,26 @@ Usage:
 """
 
 import argparse
-import sys
-import types
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Stub out linuxcnc and hal so mpc_hal can be imported without the real hardware
-for mod_name in ("linuxcnc", "hal"):
-    if mod_name not in sys.modules:
-        sys.modules[mod_name] = types.ModuleType(mod_name)
-
-from mpc_hal import (  # noqa: E402
-    pd_solve as _pd_solve,
-    mpc_solve as _mpc_solve,
-    MAX_JOINTS, MPC_PERIOD_MS, U_MAX_PER_STEP, KP, KD,
+from controller_solvers import (
+    pd_velff_solve,
+    mpc_solve,
+    MAX_JOINTS, PERIOD_MS as MPC_PERIOD_MS,
+    U_MAX_PER_STEP_MPC as U_MAX_PER_STEP,
+    KP_PD_VELFF as KP, KD_PD_VELFF as KD,
     MPC_HORIZON, MPC_Q, MPC_R, MPC_Q_TERMINAL,
 )
+
+
+def _mpc_solve(q, target, dt):
+    return mpc_solve(q, target, dt)
+
+
+def _pd_solve(q, target, q_vel=None, prev_q=None, dt=None):
+    # Pure PD position step: prev_target = target → zero velocity feedforward.
+    return pd_velff_solve(q, target, prev_target=target, q_vel=q_vel, prev_q=prev_q, dt=dt)
 
 
 def simulate(q0, target, duration_sec, period_ms, mode="pd"):
@@ -88,7 +93,7 @@ def simulate(q0, target, duration_sec, period_ms, mode="pd"):
 
 def plot_results(results_list):
     """Plot results for one or more controllers (PD, MPC, or both)."""
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+    from plot_common import JOINT_COLORS as colors
     n_modes = len(results_list)
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
@@ -160,7 +165,7 @@ def main():
 
     modes = ["pd", "mpc"] if args.mode == "both" else [args.mode]
 
-    print(f"Simulation (params from mpc_hal.py):")
+    print(f"Simulation (params from controller_params.yaml):")
     print(f"  q0     = {args.q0}")
     print(f"  target = {args.target}")
     print(f"  period = {args.period}ms, U_max={U_MAX_PER_STEP} deg/step")

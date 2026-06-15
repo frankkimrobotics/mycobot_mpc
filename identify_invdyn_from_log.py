@@ -24,7 +24,7 @@ Usage:
   python identify_invdyn_from_log.py logs/mpc_20260211_*.csv
   python identify_invdyn_from_log.py logs/invdyn_*.csv --period-ms 20
   python identify_invdyn_from_log.py --csv logs/mpc_latest.csv --out params.npz
-  python identify_invdyn_from_log.py logs/mpc_*.csv -o logs/invdyn_params.npz   # invdyn_hal picks this up by default
+  python identify_invdyn_from_log.py logs/mpc_*.csv -o logs/invdyn_params.npz   # robot_hal --controller invdyn picks this up by default
 
 Note: Use robot logs (mpc_*.csv, invdyn_*.csv, or robot_hal_*.csv), not desktop control_calibrate_*.csv.
       The latter has one row per move and no hal_torq; fetch robot CSVs from the Raspi after calibration.
@@ -40,30 +40,19 @@ import sys
 import numpy as np
 import pandas as pd
 
-NUM_JOINTS = 6
+# Joint conventions (counts, LinuxCNC↔URDF calibration, conversions) are shared.
+from joint_conventions import (
+    NUM_JOINTS,
+    JOINT_SIGNS,
+    JOINT_OFFSETS_DEG,
+    DEFAULT_URDF_PATH,
+    linuxcnc_deg_to_rad,
+)
+
 DEG2RAD = math.pi / 180.0
 
 # Default control period (ms) for building time from loop index if no elapsed_s
 DEFAULT_PERIOD_MS = 20.0
-
-# URDF path (same default as ik_pyroki)
-DEFAULT_URDF_PATH = os.path.join(
-    os.path.expanduser("~"),
-    "ros2_ws/src/mycobot_description/urdf/mycobot_pro_630.urdf",
-)
-
-# LinuxCNC ↔ URDF calibration (same as ik_pyroki)
-JOINT_SIGNS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-JOINT_OFFSETS_DEG = [0.0, 90.0, 0.0, 90.0, 0.0, 0.0]
-
-
-def linuxcnc_deg_to_rad(deg: np.ndarray) -> np.ndarray:
-    """LinuxCNC joint angles (deg) → URDF/convention (rad)."""
-    deg = np.asarray(deg, dtype=float)
-    return np.array([
-        JOINT_SIGNS[i] * np.deg2rad(deg[i] + JOINT_OFFSETS_DEG[i])
-        for i in range(NUM_JOINTS)
-    ])
 
 
 def load_robot_log(
@@ -338,7 +327,7 @@ def main():
                     help="Control loop period in ms (for time from loop index)")
     ap.add_argument("--urdf", default=DEFAULT_URDF_PATH, help="URDF for Pinocchio (if available)")
     ap.add_argument("--no-pinocchio", action="store_true", help="Skip Pinocchio even if installed")
-    ap.add_argument("--out", "-o", help="Save identified params to this .npz file (e.g. logs/invdyn_params.npz for invdyn_hal default)")
+    ap.add_argument("--out", "-o", help="Save identified params to this .npz file (e.g. logs/invdyn_params.npz for robot_hal --controller invdyn)")
     ap.add_argument("--torque-scale", type=float, default=1.0,
                     help="Initial scale when loading: tau = hal_torq * scale. Script also estimates torque_scale jointly with M, G, Fv, Fc.")
     args = ap.parse_args()

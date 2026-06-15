@@ -24,24 +24,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-FIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
-NUM_JOINTS = 6
-
-
-def load_robot_csv(filepath):
-    """Load a robot log CSV and add elapsed_s (seconds from start)."""
-    df = pd.read_csv(filepath)
-    t0_parts = df["timestamp"].iloc[0].split(":")
-    t0_sec = int(t0_parts[0]) * 3600 + int(t0_parts[1]) * 60 + float(t0_parts[2])
-
-    def to_elapsed(ts):
-        p = ts.split(":")
-        sec = int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2])
-        return sec - t0_sec
-
-    df["elapsed_s"] = df["timestamp"].apply(to_elapsed)
-    return df
+# Shared dirs, palette, and CSV loader.
+from plot_common import LOG_DIR, FIG_DIR, NUM_JOINTS, JOINT_COLORS, load_robot_csv
 
 
 def plot_hal_all(csv_files, no_show=False):

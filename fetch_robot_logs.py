@@ -25,7 +25,7 @@ import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 
-# Default Raspi path (from README_invdyn / elerob_mpc.hal)
+# Default Raspi path (from elerob.hal)
 DEFAULT_REMOTE_DIR = "/home/pi/Desktop/mpc"
 DEFAULT_SSH_USER = "pi"
 

@@ -40,7 +40,7 @@ KNOWN_MASS_INERTIA_PATTERNS = [
     "pro600.tchp.loadmass",
 ]
 
-# Explicit list to probe when we know the config (elerob_mpc.hal / elerob_invdyn.hal)
+# Explicit list to probe when we know the config (elerob.hal)
 # So we report them even if show param/pin parsing misses some
 KNOWN_PARAMS_TO_PROBE = [
     "colli.gravity",

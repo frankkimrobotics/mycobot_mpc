@@ -50,10 +50,9 @@ if _conda_prefix and not sys.executable.startswith(_conda_prefix):
 
 import numpy as np
 
-# Home pose in LinuxCNC degrees (same as ik_pyroki). IK is imported only when needed (--xyz / --interactive).
-HOME_LINUXCNC_DEG = [-90.0, -90.0, 0.0, -90.0, 0.0, 0.0]
+# Joint conventions are shared. IK is imported only when needed (--xyz / --interactive).
+from joint_conventions import HOME_LINUXCNC_DEG, MAX_JOINTS
 
-MAX_JOINTS = 6
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 

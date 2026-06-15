@@ -21,34 +21,15 @@ from typing import Any
 
 import numpy as np
 
-NUM_JOINTS = 6
-
-# Same as identify_invdyn_from_log.py (LinuxCNC ↔ URDF)
-JOINT_SIGNS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-JOINT_OFFSETS_DEG = [0.0, 90.0, 0.0, 90.0, 0.0, 0.0]
-
-DEFAULT_URDF_PATH = os.path.join(
-    os.path.expanduser("~"),
-    "ros2_ws/src/mycobot_description/urdf/mycobot_pro_630.urdf",
+# Joint conventions (counts, LinuxCNC↔URDF calibration, conversions) are shared.
+from joint_conventions import (
+    NUM_JOINTS,
+    JOINT_SIGNS,
+    JOINT_OFFSETS_DEG,
+    DEFAULT_URDF_PATH,
+    linuxcnc_deg_to_rad,
+    rad_to_linuxcnc_deg,
 )
-
-
-def linuxcnc_deg_to_rad(deg: np.ndarray) -> np.ndarray:
-    """LinuxCNC joint angles (deg) → URDF/convention (rad)."""
-    deg = np.asarray(deg, dtype=float)
-    return np.array([
-        JOINT_SIGNS[i] * np.deg2rad(deg[i] + JOINT_OFFSETS_DEG[i])
-        for i in range(NUM_JOINTS)
-    ])
-
-
-def rad_to_linuxcnc_deg(rad: np.ndarray) -> np.ndarray:
-    """URDF/convention (rad) → LinuxCNC joint angles (deg)."""
-    rad = np.asarray(rad, dtype=float)
-    return np.array([
-        np.rad2deg(rad[i]) / JOINT_SIGNS[i] - JOINT_OFFSETS_DEG[i]
-        for i in range(NUM_JOINTS)
-    ])
 
 
 def load_params(

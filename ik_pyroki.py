@@ -92,51 +92,20 @@ _JAX_BACKEND = jax.default_backend()
 #  Robot upright pose:  LinuxCNC = [-90, -90,  0, -90, 0, 0] deg
 #                       URDF     = [-90,   0,  0,   0, 0, 0] deg
 
-MAX_JOINTS = 6
-JOINT_NAMES = [f"joint{i+1}" for i in range(MAX_JOINTS)]
-JOINT_SIGNS = [+1, +1, +1, +1, +1, +1]
-JOINT_OFFSETS_DEG = [0.0, 90.0, 0.0, 90.0, 0.0, 0.0]
-
-# Home pose in LinuxCNC degrees
-HOME_LINUXCNC_DEG = [-90.0, -90.0, 0.0, -90.0, 0.0, 0.0]
-
-# LinuxCNC per-joint soft limits (degrees) from elerob_mpc.ini [JOINT_N] sections.
-# These can differ from URDF limits because of the calibration offset.
-LINUXCNC_SOFT_LIMITS_DEG = [
-    (-360.0, 360.0),   # Joint 0
-    (-360.0, 360.0),   # Joint 1
-    (-160.0, 160.0),   # Joint 2
-    (-180.0, 180.0),   # Joint 3
-    (-180.0, 180.0),   # Joint 4
-    (-180.0, 180.0),   # Joint 5
-]
-
-# URDF path (relative to this file or absolute)
-DEFAULT_URDF_PATH = os.path.join(
-    os.path.expanduser("~"),
-    "ros2_ws/src/mycobot_description/urdf/mycobot_pro_630.urdf",
+# Joint conventions (counts, names, LinuxCNC↔URDF calibration, limits, paths,
+# and the deg↔rad conversions) are shared in joint_conventions.py.
+from joint_conventions import (
+    MAX_JOINTS,
+    JOINT_NAMES,
+    JOINT_SIGNS,
+    JOINT_OFFSETS_DEG,
+    HOME_LINUXCNC_DEG,
+    LINUXCNC_SOFT_LIMITS_DEG,
+    DEFAULT_URDF_PATH,
+    TARGET_LINK,
+    linuxcnc_deg_to_urdf_rad,
+    urdf_rad_to_linuxcnc_deg,
 )
-
-# Target link for IK
-TARGET_LINK = "eef"
-
-
-def linuxcnc_deg_to_urdf_rad(linuxcnc_deg: np.ndarray) -> np.ndarray:
-    """Convert LinuxCNC joint angles (degrees) → URDF joint angles (radians)."""
-    linuxcnc_deg = np.asarray(linuxcnc_deg, dtype=np.float64)
-    return np.array([
-        JOINT_SIGNS[i] * math.radians(linuxcnc_deg[i] + JOINT_OFFSETS_DEG[i])
-        for i in range(MAX_JOINTS)
-    ])
-
-
-def urdf_rad_to_linuxcnc_deg(urdf_rad: np.ndarray) -> np.ndarray:
-    """Convert URDF joint angles (radians) → LinuxCNC joint angles (degrees)."""
-    urdf_rad = np.asarray(urdf_rad, dtype=np.float64)
-    return np.array([
-        math.degrees(urdf_rad[i]) / JOINT_SIGNS[i] - JOINT_OFFSETS_DEG[i]
-        for i in range(MAX_JOINTS)
-    ])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
