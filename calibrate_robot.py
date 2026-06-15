@@ -84,8 +84,8 @@ def main():
     ap.add_argument("--host", default=os.environ.get("ROBOT_IP", "").strip(),
                     help="Robot IP (default: ROBOT_IP)")
     ap.add_argument("--cmd-port", type=int, default=9998, help="Command port (default: 9998)")
-    ap.add_argument("--controller", choices=["pid", "invdyn", "pd_velff"], default="pid",
-                    help="Controller: pid, invdyn, or pd_velff (default: pid)")
+    ap.add_argument("--controller", choices=["pid", "invdyn", "pd_velff", "mpc"], default="pid",
+                    help="Controller: pid, invdyn, pd_velff, or mpc (default: pid)")
     ap.add_argument("--duration", type=float, default=5.0,
                     help="Move duration per waypoint in seconds (default: 5); longer so robot can reach pose before timeout")
     ap.add_argument("--step-deg", type=float, default=10.0,

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Unified robot HAL: single component "ctrl" with selectable control law (pid, invdyn, pd_velff).
+Unified robot HAL: single component "ctrl" with selectable control law (pid, invdyn, pd_velff, mpc).
 
 Run on Raspi with LinuxCNC: linuxcnc elerob.ini (loads elerob.hal which runs this script).
-Control law: --controller pid|invdyn|pd_velff at startup; can be overridden per move via JSON from desktop.
+Control law: --controller pid|invdyn|pd_velff|mpc at startup; can be overridden per move via JSON from desktop.
+MPC uses TinyMPC (pip install tinympc) when available; else falls back to OSQP-based QP.
 
 HAL pins: ctrl.joint{i}_pos_cmd, ctrl.joint{i}_vel_cmd, ctrl.enable (same as mpc/invdyn).
 """
@@ -43,37 +44,17 @@ except ImportError:
     compute_MCG = None
     MODEL_NUM_JOINTS = 6
 
-MAX_JOINTS = 6
-# Command-loop period (ms). HAL servo can run faster (e.g. SERVO_PERIOD 10 ms or sub-3 ms);
-# this is how often we compute and write pos_cmd/vel_cmd. Overridable via --period-ms.
-PERIOD_MS = 20
-PERIOD_SEC = PERIOD_MS / 1000.0
+from controller_solvers import (
+    MAX_JOINTS,
+    PERIOD_MS,
+    PERIOD_SEC,
+    pid_solve as _pid_solve_raw,
+    invdyn_solve as _invdyn_solve_raw,
+    pd_velff_solve as _pd_velff_solve_raw,
+    mpc_solve as _mpc_solve_raw,
+)
 
-# PID gains (position space: u = Kp*e - Kd*qd + Ki*integral)
-KP_PID = 0.5
-KD_PID = 0.1
-KI_PID = 0.05
-INTEGRAL_CLAMP = 50.0  # anti-windup: clamp |integral| per joint
-U_MAX_PER_STEP = 8.0
-
-# InvDyn (acceleration space): qdd_d = Kp*e - Kd*qd, then integrate
-# Acceleration integration: step = 0.5*qdd*dt^2; with qdd_max=150 deg/s^2, dt=20ms → ~0.03° per step;
-# with dt=3ms → ~0.0007° per step. So robot barely moves at any realistic loop period.
-# USE_PD_STEPS_FOR_INVDYN: use direct position-step PD for invdyn so the robot moves.
-USE_PD_STEPS_FOR_INVDYN = True
-INVDYN_KP = 144.0
-INVDYN_KD = 24.0
-QDD_MAX_DEG = 150.0
-# PD position-step gains when USE_PD_STEPS_FOR_INVDYN (same as mpc_hal / invdyn_hal pd_solve)
-KP_PD_INVDYN = 0.5
-KD_PD_INVDYN = 0.1
-# Gravity compensation from npz: vel_cmd += K_GRAV_COMP * G(q) (G in Nm; scale to deg/s)
-K_GRAV_COMP = 0.02
-
-# PD + vel feedforward: same Kp,Kd as invdyn-style for consistency
-KP_PD_VELFF = 144.0 / 90.0  # scale to deg/s² per deg error
-KD_PD_VELFF = 24.0 / 90.0
-
+# Command-loop period overridable via --period-ms
 SUCTION_PIN = "pro600.digital_out00"
 CMD_PORT = 9998
 STREAM_PORT = 9999
@@ -98,152 +79,26 @@ def timed(step_name):
 
 
 # ---------------------------------------------------------------------------
-# Control law: PID (with integral, anti-windup)
+# Control law wrappers (timed; solvers live in controller_solvers)
 # ---------------------------------------------------------------------------
 @timed("solve")
 def pid_solve(q, target_angles, integral, q_vel=None, prev_q=None, dt=None):
-    """PID: u = Kp*e - Kd*qd + Ki*integral; next_pos = q + u, vel_cmd = u/dt. Returns (next_pos, vel_cmd, new_integral)."""
-    current = np.array(q, dtype=float)
-    target = np.array(target_angles, dtype=float)
-    error = target - current
-    if q_vel is not None:
-        velocity = np.array(q_vel, dtype=float)
-    elif prev_q is not None and dt is not None and dt > 0:
-        velocity = (current - np.array(prev_q, dtype=float)) / dt
-    else:
-        velocity = np.zeros(MAX_JOINTS)
-    if dt is None or dt <= 0:
-        dt = PERIOD_SEC
-    integ = np.array(integral, dtype=float)
-    integ += error * dt
-    integ = np.clip(integ, -INTEGRAL_CLAMP, INTEGRAL_CLAMP)
-    u = KP_PID * error - KD_PID * velocity + KI_PID * integ
-    u = np.clip(u, -U_MAX_PER_STEP, U_MAX_PER_STEP)
-    next_pos = current + u
-    vel_cmd = (u / dt * 0.5) if dt > 0 else np.zeros(MAX_JOINTS)
-    return [float(x) for x in next_pos], [float(x) for x in vel_cmd], integ.tolist()
-
-
-# ---------------------------------------------------------------------------
-# Control law: InvDyn (model-based when params loaded, else acceleration PD)
-# ---------------------------------------------------------------------------
-def _invdyn_solve_fallback(q, target_angles, q_vel=None, prev_q=None, dt=None):
-    """PD in acceleration: qdd_d = Kp*e - Kd*qd; integrate to next_pos, vel_cmd."""
-    current = np.array(q, dtype=float)
-    target = np.array(target_angles, dtype=float)
-    error = target - current
-    if q_vel is not None:
-        velocity = np.array(q_vel, dtype=float)
-    elif prev_q is not None and dt and dt > 0:
-        velocity = (current - np.array(prev_q, dtype=float)) / dt
-    else:
-        velocity = np.zeros(MAX_JOINTS)
-    if dt is None or dt <= 0:
-        dt = PERIOD_SEC
-    qdd_d = INVDYN_KP * error - INVDYN_KD * velocity
-    qdd_d = np.clip(qdd_d, -QDD_MAX_DEG, QDD_MAX_DEG)
-    next_pos = current + velocity * dt + 0.5 * qdd_d * (dt ** 2)
-    vel_cmd = velocity + qdd_d * dt
-    return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
-
-
-def _invdyn_pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None, prev_target=None, params=None):
-    """Direct position-step PD for invdyn; optional vel_ff for trajectory tracking; optional G(q) from npz."""
-    current = np.array(q, dtype=float)
-    target = np.array(target_angles, dtype=float)
-    error = target - current
-    if q_vel is not None:
-        velocity = np.array(q_vel, dtype=float)
-    elif prev_q is not None and dt and dt > 0:
-        velocity = (current - np.array(prev_q, dtype=float)) / dt
-    else:
-        velocity = np.zeros(MAX_JOINTS)
-    if dt is None or dt <= 0:
-        dt = PERIOD_SEC
-    u = KP_PD_INVDYN * error - KD_PD_INVDYN * velocity
-    vel_ff = np.zeros(MAX_JOINTS)
-    if prev_target is not None and dt > 0:
-        prev_t = np.array(prev_target, dtype=float)
-        vel_ff = (target - prev_t) / dt
-    u = u + vel_ff * dt  # add velocity feedforward for trajectory tracking
-    u = np.clip(u, -U_MAX_PER_STEP, U_MAX_PER_STEP)
-    next_pos = current + u
-    vel_cmd = (u / dt * 0.5) if dt > 0 else np.zeros(MAX_JOINTS)
-    vel_cmd = np.array(vel_cmd, dtype=float) + vel_ff
-    # Use npz model for gravity compensation: vel_cmd += K_GRAV_COMP * G(q) (G in Nm)
-    if params is not None and compute_MCG is not None and linuxcnc_deg_to_rad is not None:
-        try:
-            q_rad = linuxcnc_deg_to_rad(current)
-            qd_rad = np.deg2rad(velocity)
-            _, _, G = compute_MCG(q_rad, qd_rad, params)
-            vel_cmd = vel_cmd + K_GRAV_COMP * np.asarray(G, dtype=float)
-        except Exception:
-            pass
-    return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
-
-
-def _invdyn_model_solve_deg(q, target_angles, q_vel=None, prev_q=None, dt=None):
-    """Model-aware invdyn in deg: vd_command in rad/s² from Kp*(target_rad - q_rad) - Kd*qd_rad; integrate in deg."""
-    if linuxcnc_deg_to_rad is None:
-        return _invdyn_solve_fallback(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
-    current = np.array(q, dtype=float)
-    target = np.array(target_angles, dtype=float)
-    if q_vel is not None:
-        velocity_deg = np.array(q_vel, dtype=float)
-    elif prev_q is not None and dt and dt > 0:
-        velocity_deg = (current - np.array(prev_q, dtype=float)) / dt
-    else:
-        velocity_deg = np.zeros(MAX_JOINTS)
-    if dt is None or dt <= 0:
-        dt = PERIOD_SEC
-    q_rad = linuxcnc_deg_to_rad(current)
-    target_rad = linuxcnc_deg_to_rad(target)
-    qd_rad = np.deg2rad(velocity_deg)
-    vd_command_rad = INVDYN_KP * (target_rad - q_rad) - INVDYN_KD * qd_rad
-    qdd_d_deg = np.rad2deg(vd_command_rad)
-    qdd_d_deg = np.clip(qdd_d_deg, -QDD_MAX_DEG, QDD_MAX_DEG)
-    next_pos = current + velocity_deg * dt + 0.5 * qdd_d_deg * (dt ** 2)
-    vel_cmd = velocity_deg + qdd_d_deg * dt
-    return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
+    return _pid_solve_raw(q, target_angles, integral, q_vel=q_vel, prev_q=prev_q, dt=dt)
 
 
 @timed("solve")
 def invdyn_solve(q, target_angles, params, q_vel=None, prev_q=None, dt=None, prev_target=None):
-    """Invdyn: use PD position steps (so robot moves) when USE_PD_STEPS_FOR_INVDYN; else acceleration integration.
-    With prev_target, adds velocity feedforward for trajectory tracking."""
-    if USE_PD_STEPS_FOR_INVDYN:
-        return _invdyn_pd_solve(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt, prev_target=prev_target, params=params)
-    if params is not None and (load_invdyn_params is not None or linuxcnc_deg_to_rad is not None):
-        return _invdyn_model_solve_deg(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
-    return _invdyn_solve_fallback(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
+    return _invdyn_solve_raw(q, target_angles, params, q_vel=q_vel, prev_q=prev_q, dt=dt, prev_target=prev_target)
 
 
-# ---------------------------------------------------------------------------
-# Control law: PD + velocity feedforward
-# ---------------------------------------------------------------------------
 @timed("solve")
 def pd_velff_solve(q, target_angles, prev_target, q_vel=None, prev_q=None, dt=None):
-    """PD on position + velocity feedforward: vel_ff = (target - prev_target)/dt; next_pos = q + (Kp*e - Kd*qd)*dt + vel_ff*dt."""
-    current = np.array(q, dtype=float)
-    target = np.array(target_angles, dtype=float)
-    error = target - current
-    if q_vel is not None:
-        velocity = np.array(q_vel, dtype=float)
-    elif prev_q is not None and dt and dt > 0:
-        velocity = (current - np.array(prev_q, dtype=float)) / dt
-    else:
-        velocity = np.zeros(MAX_JOINTS)
-    if dt is None or dt <= 0:
-        dt = PERIOD_SEC
-    vel_ff = np.zeros(MAX_JOINTS)
-    if prev_target is not None and dt > 0:
-        prev_t = np.array(prev_target, dtype=float)
-        vel_ff = (target - prev_t) / dt
-    acc_pd = KP_PD_VELFF * error - KD_PD_VELFF * velocity
-    next_pos = current + (acc_pd + vel_ff) * dt
-    vel_cmd = acc_pd + vel_ff
-    next_pos = np.clip(next_pos, current - U_MAX_PER_STEP, current + U_MAX_PER_STEP)
-    return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
+    return _pd_velff_solve_raw(q, target_angles, prev_target, q_vel=q_vel, prev_q=prev_q, dt=dt)
+
+
+@timed("solve")
+def mpc_solve(q, target_angles, dt=None):
+    return _mpc_solve_raw(q, target_angles, dt=dt)
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +279,7 @@ def enable_machine(h, timeout=60.0):
 # ---------------------------------------------------------------------------
 def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5, vel_tol=1.0, settle_steps=10,
                      log_dir=None, log_enabled=True, period_sec=None):
-    """One loop: poll -> solve (pid|invdyn|pd_velff) -> HAL write; done_reason = converged | duration."""
+    """One loop: poll -> solve (pid|invdyn|pd_velff|mpc) -> HAL write; done_reason = converged | duration."""
     if period_sec is None:
         period_sec = PERIOD_SEC
     h["enable"] = True
@@ -453,6 +308,8 @@ def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5,
         elif controller == "invdyn":
             res = invdyn_solve(q, target_angles, _params, q_vel=q_vel, prev_q=prev_current, dt=dt, prev_target=prev_target)
             next_pos, vel_cmd = res[0], res[1]
+        elif controller == "mpc":
+            next_pos, vel_cmd = mpc_solve(q, target_angles, dt=dt)
         else:  # pd_velff
             next_pos, vel_cmd = pd_velff_solve(q, target_angles, prev_target, q_vel=q_vel, prev_q=prev_current, dt=dt)
 
@@ -641,9 +498,9 @@ def _command_server_thread(port, log_dir):
 def main():
     global _params, _desktop_log_stamp
     import argparse
-    parser = argparse.ArgumentParser(description="Unified robot HAL: pid, invdyn, pd_velff")
-    parser.add_argument("--controller", choices=["pid", "invdyn", "pd_velff"], default="pid",
-                        help="Default control law (default: pid)")
+    parser = argparse.ArgumentParser(description="Unified robot HAL: pid, invdyn, pd_velff, mpc")
+    parser.add_argument("--controller", choices=["pid", "invdyn", "pd_velff", "mpc"], default="pid",
+                        help="Default control law: pid, invdyn, pd_velff, or mpc (TinyMPC, default: pid)")
     parser.add_argument("--params", default=None, help="Path to npz for invdyn (e.g. logs/invdyn_params.npz)")
     parser.add_argument("--urdf", default=None, help="URDF for Pinocchio when npz has pin_theta")
     parser.add_argument("--cmd-port", type=int, default=CMD_PORT)
@@ -707,8 +564,15 @@ def main():
 
     if USE_PD_STEPS_FOR_INVDYN:
         print("  invdyn: using PD position steps (robot will move)")
+    if args.controller == "mpc":
+        try:
+            import tinympc as _tm
+            _mpc_ok = True
+        except ImportError:
+            _mpc_ok = False
+        print(f"  mpc: TinyMPC={'ok' if _mpc_ok else 'not found, using OSQP fallback'}")
     print("\n" + "=" * 60)
-    print("Waiting for commands. Controller: pid | invdyn | pd_velff")
+    print("Waiting for commands. Controller: pid | invdyn | pd_velff | mpc")
     print("=" * 60 + "\n")
 
     default_controller = args.controller
@@ -723,7 +587,7 @@ def main():
                 continue
             duration = cmd.get("duration", 2.0)
             controller = cmd.get("controller", default_controller)
-            if controller not in ("pid", "invdyn", "pd_velff"):
+            if controller not in ("pid", "invdyn", "pd_velff", "mpc"):
                 controller = default_controller
             _desktop_log_stamp = cmd.get("log_stamp") if isinstance(cmd.get("log_stamp"), str) else None
             pos_tol = cmd.get("pos_tol", 0.5)

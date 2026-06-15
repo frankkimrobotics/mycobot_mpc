@@ -1,0 +1,77 @@
+# Controller parameters (Hydra-style). Used by controller_solvers, robot_hal, and mujoco_viewer.
+# Override per controller; missing keys fall back to defaults in controller_params.py.
+
+# Global
+max_joints: 6
+period_ms: 4
+
+# PID: u = Kp*e - Kd*qd + Ki*integral; next_pos = q + u, vel_cmd = u/dt
+# Optional per-joint (length 6): kp_per_joint, kd_per_joint; omit to use scalar kp/kd
+pid:
+  # kp: 500.
+  # kd: 10.
+  kp_per_joint: [5000., 8000., 8000., 5000., 5000., 5000.]  # e.g. more authority on joint 2
+  kd_per_joint: [10., 10., 10., 10., 10., 10.]
+  ki: 8000.
+  integral_clamp: 500000.0
+  u_max_per_step: 80000.0
+
+# InvDyn: PD position steps (use_pd_steps) or acceleration integration; optional G(q) from npz
+# Optional per-joint (length 6): kp_per_joint, kd_per_joint; kp_pd_per_joint, kd_pd_per_joint
+invdyn:
+  use_pd_steps: true
+  kp: 144.0
+  kd: 24.0
+  # kp_per_joint: [144., 200., 144., 144., 144., 144.]
+  # kd_per_joint: [24., 32., 24., 24., 24., 24.]
+  qdd_max_deg: 150.0
+  kp_pd: 0.5
+  kd_pd: 0.1
+  # kp_pd_per_joint: null
+  # kd_pd_per_joint: null
+  k_grav_comp: 0.02
+
+# PD + velocity feedforward; optional per-joint: kp_per_joint, kd_per_joint (length 6)
+pd_velff:
+  kp: 1.6      # ~ 144/90
+  kd: 0.2667  # ~ 24/90
+  # kp_per_joint: null
+  # kd_per_joint: null
+  u_max_per_step: 800.0
+
+# MPC (TinyMPC or OSQP): single-integrator, box bounds on u
+mpc:
+  horizon: 20
+  q: 100.0
+  r: .1
+  q_terminal: 50.0
+  rho: 1.0
+  u_max_per_step: 800.0
+
+# Viewer-only: inner loop (virtual driver). PID only: tau = Kp*e + Ki*integral(e) + Kd*(qdot_des - qdot).
+# All clipping limits are here; no hardcoded limits in code.
+# Gains tuned for dynamics model with DH-derived inertias (total ~8.7 kg), 100:1 harmonic drives,
+# and joint-side torque limits of ±186 Nm (J0-J2) / ±50 Nm (J3-J5).
+# Design: ω_n ≈ 15 rad/s, ζ ≈ 1.0 (critically damped) for J0-J2 (I_eff ≈ 0.5-1.0 kg·m²).
+virtual_driver:
+  kp_v: 200.0
+  kd_v: 25.0
+  ki_v: 40.0
+  # Per-joint gains override scalars: [J0, J1, J2, J3, J4, J5]
+  # J0-J2 (large links, I_eff ~0.3-1.0 kg·m²): Kp~200, Kd~25
+  # J3-J5 (small wrist links, I_eff ~0.01-0.05 kg·m²): Kp~10-30, Kd~2-4
+  kp_v_per_joint: [200., 750., 200., 30., 20., 10.]
+  kd_v_per_joint: [25., 250., 25., 4., 3., 2.]
+  ki_v_per_joint: [40., 150., 40., 8., 5., 3.]
+  integral_clamp_v: 5.0        # rad·s, anti-windup for integral of (q_des - q)
+  tau_smooth_alpha: 0.0        # low-pass on tau (0 = no smoothing)
+  gravity_comp: true             # feedforward G(q) from MuJoCo's qfrc_bias (highly recommended)
+  # Clipping limits — matched to physical actuator capabilities
+  torque_limit_nm: 186.0       # ±Nm; clamped to per-joint RATED_TORQUE_OUTPUT in code
+  vel_cmd_limit_deg_s: 720.0   # ±deg/s on commanded velocity from outer loop
+  qacc_limit_rad_s2: 1500.0    # ±rad/s² on desired acceleration (invdyn path before ID)
+  # For --controller inner_only: desired velocity (deg/s). Omit or [0,0,0,0,0,0] to hold position.
+  inner_only_vel_cmd_deg_s: [0., 0., 0., 0., 0., 0.]
+
+# Rest pose (viewer)
+rest_pose_deg: [0.0, 0.0, -90.0, 90.0, 0.0, 0.0]

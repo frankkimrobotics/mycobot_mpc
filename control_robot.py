@@ -6,7 +6,7 @@ Pipeline:
   Target (R, t) → IK (pyroki) → joint angles (deg) → TCP → robot (robot_hal.py)
 
 The robot runs a single HAL component (robot_hal.py) via LinuxCNC config elerob.ini.
-The desktop sends the control law per move; use --controller pid, invdyn, or pd_velff.
+The desktop sends the control law per move; use --controller pid, invdyn, pd_velff, or mpc.
 
 Usage:
     # Move to a Cartesian position (uses home orientation):
@@ -236,14 +236,14 @@ class RobotConnection:
         Args:
             target_deg: 6 joint angles in LinuxCNC degrees
             duration: Max duration for the move (seconds)
-            controller: "pid", "invdyn", or "pd_velff"
+            controller: "pid", "invdyn", "pd_velff", or "mpc"
             pos_tol: Position tolerance for early stop (degrees)
             settle_steps: Consecutive converged loops before early stop
 
         Returns:
             Ack dict from robot, or empty dict on failure
         """
-        # Robot HAL (robot_hal.py) accepts pid, invdyn, pd_velff as-is
+        # Robot HAL (robot_hal.py) accepts pid, invdyn, pd_velff, mpc as-is
         robot_controller = controller
         # Send desktop timestamp so Raspi uses it for CSV filename (Raspi clock may be wrong)
         log_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -385,7 +385,7 @@ def move_to_joints(
         conn: Robot connection
         target_deg: 6 joint angles in LinuxCNC degrees
         duration: Max duration for the move
-        controller: "pid", "invdyn", or "pd_velff"
+        controller: "pid", "invdyn", "pd_velff", or "mpc"
         pos_tol: Position tolerance for early stop (degrees)
         settle_steps: Consecutive converged loops before early stop
         timer: Optional PipelineTimer (will be created if None)
@@ -451,7 +451,7 @@ def move_to_pose(
         R: (3,3) rotation matrix for eef
         t: (3,) translation vector for eef (meters)
         duration: Max duration for the move
-        controller: "pid", "invdyn", or "pd_velff"
+        controller: "pid", "invdyn", "pd_velff", or "mpc"
         pos_tol: Position tolerance for early stop (degrees)
         settle_steps: Consecutive converged loops before early stop
         logger: Optional MoveLogger to record the move
@@ -631,8 +631,8 @@ Examples:
         help="Robot command port (default: 9998)")
     parser.add_argument("--stream-port", type=int, default=9999,
         help="Robot streaming port for rviz2 (default: 9999)")
-    parser.add_argument("--controller", choices=["pid", "invdyn", "pd_velff"], default="pid",
-        help="Controller type: pid, invdyn, or pd_velff (default: pid)")
+    parser.add_argument("--controller", choices=["pid", "invdyn", "pd_velff", "mpc"], default="pid",
+        help="Controller type: pid, invdyn, pd_velff, or mpc (default: pid)")
     parser.add_argument("--duration", type=float, default=2.0,
         help="Move duration in seconds (default: 2.0)")
     parser.add_argument("--pos-tol", type=float, default=0.5,
