@@ -3,14 +3,10 @@
 Desktop-side robot controller: solve IK for target eef pose, send to robot.
 
 Pipeline:
-  Target (R, t) → IK (pyroki) → joint angles (deg) → TCP → robot (mpc_hal or invdyn_hal)
+  Target (R, t) → IK (pyroki) → joint angles (deg) → TCP → robot (robot_hal.py)
 
-The robot runs one of two HAL components depending on the LinuxCNC config:
-  - elerob_mpc.ini  → mpc_hal.py  → honors --controller pid or mpc  (sends "pd" or "mpc")
-  - elerob_invdyn.ini → invdyn_hal.py → honors --controller pid or invdyn (sends "pd" or "invdyn")
-
-The robot uses the received controller value to choose the control law; the desktop
-choice is reflected. Use the INI that matches the controller you want (mpc vs invdyn).
+The robot runs a single HAL component (robot_hal.py) via LinuxCNC config elerob.ini.
+The desktop sends the control law per move; use --controller pid, invdyn, pd_velff, or mpc.
 
 Usage:
     # Move to a Cartesian position (uses home orientation):
@@ -204,7 +200,7 @@ def launch_rviz_streamer(host: str, stream_port: int = 9999) -> subprocess.Popen
 
 
 class RobotConnection:
-    """TCP connection to the robot's command server (mpc_hal.py port 9998).
+    """TCP connection to the robot's command server (robot_hal.py port 9998).
 
     Sends target joint angles and monitors execution status.
     """
@@ -240,21 +236,24 @@ class RobotConnection:
         Args:
             target_deg: 6 joint angles in LinuxCNC degrees
             duration: Max duration for the move (seconds)
-            controller: "pid", "mpc", or "invdyn"
+            controller: "pid", "invdyn", "pd_velff", or "mpc"
             pos_tol: Position tolerance for early stop (degrees)
             settle_steps: Consecutive converged loops before early stop
 
         Returns:
             Ack dict from robot, or empty dict on failure
         """
-        # Robot HAL expects "pd" for PID/PD; user-facing option is "pid"
-        robot_controller = "pd" if controller == "pid" else controller
+        # Robot HAL (robot_hal.py) accepts pid, invdyn, pd_velff, mpc as-is
+        robot_controller = controller
+        # Send desktop timestamp so Raspi uses it for CSV filename (Raspi clock may be wrong)
+        log_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         cmd = {
             "target_deg": [round(float(v), 4) for v in target_deg],
             "duration": duration,
             "controller": robot_controller,
             "pos_tol": pos_tol,
             "settle_steps": settle_steps,
+            "log_stamp": log_stamp,
         }
         msg = json.dumps(cmd) + "\n"
         self.sock.sendall(msg.encode("utf-8"))
@@ -386,7 +385,7 @@ def move_to_joints(
         conn: Robot connection
         target_deg: 6 joint angles in LinuxCNC degrees
         duration: Max duration for the move
-        controller: "pid", "mpc", or "invdyn"
+        controller: "pid", "invdyn", "pd_velff", or "mpc"
         pos_tol: Position tolerance for early stop (degrees)
         settle_steps: Consecutive converged loops before early stop
         timer: Optional PipelineTimer (will be created if None)
@@ -417,6 +416,8 @@ def move_to_joints(
             timer._timings[key] = 0.0
 
     print(f"[timer] {timer.summary()}")
+    if status.get("done_reason"):
+        print(f"  exit_reason={status['done_reason']}")
 
     if logger:
         logger.log_move(
@@ -450,7 +451,7 @@ def move_to_pose(
         R: (3,3) rotation matrix for eef
         t: (3,) translation vector for eef (meters)
         duration: Max duration for the move
-        controller: "pid", "mpc", or "invdyn"
+        controller: "pid", "invdyn", "pd_velff", or "mpc"
         pos_tol: Position tolerance for early stop (degrees)
         settle_steps: Consecutive converged loops before early stop
         logger: Optional MoveLogger to record the move
@@ -630,8 +631,8 @@ Examples:
         help="Robot command port (default: 9998)")
     parser.add_argument("--stream-port", type=int, default=9999,
         help="Robot streaming port for rviz2 (default: 9999)")
-    parser.add_argument("--controller", choices=["pid", "mpc", "invdyn"], default="pid",
-        help="Controller type: pid, mpc, or invdyn (default: pid)")
+    parser.add_argument("--controller", choices=["pid", "invdyn", "pd_velff", "mpc"], default="pid",
+        help="Controller type: pid, invdyn, pd_velff, or mpc (default: pid)")
     parser.add_argument("--duration", type=float, default=2.0,
         help="Move duration in seconds (default: 2.0)")
     parser.add_argument("--pos-tol", type=float, default=0.5,
@@ -706,7 +707,7 @@ Examples:
         conn.connect()
     except (ConnectionRefusedError, socket.timeout, OSError) as e:
         print(f"ERROR: Cannot connect to robot at {args.host}:{args.cmd_port}: {e}")
-        print("Make sure mpc_hal.py or invdyn_hal.py is running on the robot (via linuxcnc elerob_mpc.ini or elerob_invdyn.ini).")
+        print("Make sure robot_hal.py is running on the robot (via linuxcnc elerob.ini).")
         cleanup()
         sys.exit(1)
 

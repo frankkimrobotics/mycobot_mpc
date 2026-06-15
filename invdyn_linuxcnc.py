@@ -9,6 +9,8 @@ Flow: Get state -> InvDyn solve -> Send waypoint via G-code -> Loop
 
 import time
 import sys
+import os
+import glob
 from datetime import datetime
 from functools import wraps
 import numpy as np
@@ -19,12 +21,20 @@ except ImportError:
     print("linuxcnc module not found. Run this on a system with LinuxCNC installed.")
     sys.exit(1)
 
+try:
+    from invdyn_model import load_params as load_invdyn_params, linuxcnc_deg_to_rad
+except ImportError:
+    load_invdyn_params = None
+    linuxcnc_deg_to_rad = None
+
 MAX_JOINTS = 6
 MAX_ANGULAR_SPEED = 6930  # deg/min
 INVDYN_PERIOD_MS = 10
 INVDYN_KP = 144.0
 INVDYN_KD = 24.0
 QDD_MAX_DEG = 150.0
+INVDYN_KP_NM = 5.0
+INVDYN_KD_NM = 1.0
 
 _timing = {"poll": [], "invdyn_solve": [], "send_cmd": [], "sleep": []}
 
@@ -72,6 +82,32 @@ def invdyn_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
     return [float(x) for x in next_pos]
 
 
+@timed("invdyn_solve")
+def invdyn_model_solve(q, target_angles, params, q_vel=None, prev_q=None, dt=None):
+    """Drake-aligned: vd_command = Kp*(q_d - q) - Kd*qd (rad/s²); qdd_d = vd_command; integrate to next_pos (deg)."""
+    if load_invdyn_params is None or linuxcnc_deg_to_rad is None:
+        return invdyn_solve(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
+    current = np.array(q, dtype=float)
+    target = np.array(target_angles, dtype=float)
+    if q_vel is not None:
+        velocity_deg = np.array(q_vel, dtype=float)
+    elif prev_q is not None and dt is not None and dt > 0:
+        velocity_deg = (current - np.array(prev_q, dtype=float)) / dt
+    else:
+        velocity_deg = np.zeros(MAX_JOINTS)
+    if dt is None or dt <= 0:
+        dt = INVDYN_PERIOD_MS / 1000.0
+    q_rad = linuxcnc_deg_to_rad(current)
+    target_rad = linuxcnc_deg_to_rad(target)
+    qd_rad = np.deg2rad(velocity_deg)
+    vd_command_rad = INVDYN_KP * (target_rad - q_rad) - INVDYN_KD * qd_rad
+    qdd_d_rad = vd_command_rad
+    deg_per_rad = 180.0 / np.pi
+    qdd_d_deg = np.clip(qdd_d_rad * deg_per_rad, -QDD_MAX_DEG, QDD_MAX_DEG)
+    next_pos = current + velocity_deg * dt + 0.5 * qdd_d_deg * (dt ** 2)
+    return [float(x) for x in next_pos]
+
+
 @timed("poll")
 def _poll_feedback(s):
     s.poll()
@@ -101,11 +137,14 @@ def _print_timing_summary(loop_count):
     print(f"  [timing] poll={avg('poll'):.2f}ms invdyn_solve={avg('invdyn_solve'):.2f}ms send_cmd={avg('send_cmd'):.2f}ms sleep={avg('sleep'):.2f}ms")
 
 
-def run_invdyn_loop(target_angles, speed_pct=50.0, duration_sec=10.0):
-    """Run InvDyn control loop: poll -> invdyn_solve -> send MDI."""
+def run_invdyn_loop(target_angles, speed_pct=50.0, duration_sec=10.0, params=None):
+    """Run InvDyn control loop: poll -> (invdyn_model_solve or invdyn_solve) -> send MDI."""
     c = linuxcnc.command()
     s = linuxcnc.stat()
+    use_model = params is not None
     print("InvDyn loop starting. Target:", target_angles)
+    if use_model:
+        print("  Using model-based invdyn (M,C,G from npz).")
     print("Press Ctrl+C to stop.\n")
     s.poll()
     if s.task_mode != linuxcnc.MODE_MDI:
@@ -123,7 +162,10 @@ def run_invdyn_loop(target_angles, speed_pct=50.0, duration_sec=10.0):
         dt = (t_loop_start - t_prev) if t_prev is not None else None
         t_prev = t_loop_start
         q, q_vel, t_status = _poll_feedback(s)
-        next_cmd = invdyn_solve(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
+        if use_model:
+            next_cmd = invdyn_model_solve(q, target_angles, params, q_vel=q_vel, prev_q=prev_current, dt=dt)
+        else:
+            next_cmd = invdyn_solve(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
         prev_current = q.copy()
         _send_mdi_command(c, next_cmd, speed_pct)
         elapsed = time.time() - t_loop_start
@@ -145,6 +187,27 @@ def run_invdyn_loop(target_angles, speed_pct=50.0, duration_sec=10.0):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="InvDyn control via LinuxCNC MDI")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(script_dir, "logs")
+    default_params = os.path.join(log_dir, "invdyn_params.npz")
+    parser.add_argument("--params", default=default_params,
+                        help="Path to npz from identify_invdyn_from_log.py")
+    parser.add_argument("--urdf", default=None, help="URDF path for Pinocchio (when npz has pin_theta)")
+    args = parser.parse_args()
+
+    params_path = args.params
+    if not os.path.isfile(params_path):
+        npz_files = sorted(glob.glob(os.path.join(log_dir, "*.npz")))
+        if npz_files:
+            params_path = npz_files[0]
+    invdyn_params = None
+    if load_invdyn_params is not None and os.path.isfile(params_path):
+        invdyn_params = load_invdyn_params(params_path, urdf_path=args.urdf)
+        if invdyn_params is not None:
+            print(f"Loaded invdyn params from {params_path}")
+
     s = linuxcnc.stat()
     s.poll()
     initial = [-90, -90, 0, -90, 0, 0]
@@ -152,8 +215,8 @@ def main():
     target = [a + 5.0 for a in current]
     print("Current angles:", current)
     print("Target (current + 5° each):", target)
-    run_invdyn_loop(target, speed_pct=15.0, duration_sec=10.0)
-    run_invdyn_loop(initial, speed_pct=5.0, duration_sec=10.0)
+    run_invdyn_loop(target, speed_pct=15.0, duration_sec=10.0, params=invdyn_params)
+    run_invdyn_loop(initial, speed_pct=5.0, duration_sec=10.0, params=invdyn_params)
     print("Done.")
     sys.exit(0)
 

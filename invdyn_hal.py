@@ -25,10 +25,22 @@ import json
 import os
 import socket
 import threading
+import glob
 from datetime import datetime
 from functools import wraps
 import numpy as np
 import hal
+
+try:
+    from invdyn_model import (
+        load_params as load_invdyn_params,
+        linuxcnc_deg_to_rad,
+        NUM_JOINTS as MODEL_NUM_JOINTS,
+    )
+except ImportError:
+    load_invdyn_params = None
+    linuxcnc_deg_to_rad = None
+    MODEL_NUM_JOINTS = 6
 
 try:
     import linuxcnc
@@ -47,6 +59,10 @@ INVDYN_KP = 144.0      # 1/s² → ωn=12 rad/s in rad; in deg: 144 (deg/s² per
 INVDYN_KD = 24.0      # 1/s
 QDD_MAX_DEG = 150.0   # max |q̈_d| deg/s²
 
+# Model-based invdyn: PD gains in Nm/rad, Nm/(rad/s) when params loaded
+INVDYN_KP_NM = 5.0
+INVDYN_KD_NM = 1.0
+
 # PD fallback (same as mpc_hal)
 U_MAX_PER_STEP = 8.0
 KP_PD = 0.5
@@ -55,6 +71,9 @@ KD_PD = 0.1
 SUCTION_PIN = "pro600.digital_out00"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 _timing = {"poll": [], "invdyn_solve": [], "pd_solve": [], "hal_write": [], "sleep": []}
+
+# Loaded by main() when --params points to a valid npz; used by invdyn_control_loop for model-based solve
+_invdyn_params = None
 
 
 def timed(step_name):
@@ -92,6 +111,37 @@ def invdyn_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
 
 
+@timed("invdyn_solve")
+def invdyn_model_solve(q, target_angles, params, q_vel=None, prev_q=None, dt=None):
+    """Drake-aligned: vd_command = Kp*(q_d - q) - Kd*qd (rad/s²); qdd_d = vd_command; integrate to next_pos, vel_cmd. No M/C/G solve."""
+    if load_invdyn_params is None or linuxcnc_deg_to_rad is None:
+        return invdyn_solve(q, target_angles, q_vel=q_vel, prev_q=prev_q, dt=dt)
+    current = np.array(q, dtype=float)
+    target = np.array(target_angles, dtype=float)
+    if q_vel is not None:
+        velocity_deg = np.array(q_vel, dtype=float)
+    elif prev_q is not None and dt is not None and dt > 0:
+        velocity_deg = (current - np.array(prev_q, dtype=float)) / dt
+    else:
+        velocity_deg = np.zeros(MAX_JOINTS)
+    if dt is None or dt <= 0:
+        dt = INVDYN_PERIOD_MS / 1000.0
+    # LinuxCNC deg -> URDF rad
+    q_rad = linuxcnc_deg_to_rad(current)
+    target_rad = linuxcnc_deg_to_rad(target)
+    qd_rad = np.deg2rad(velocity_deg)
+    # Drake: PID outputs desired acceleration (rad/s²). Kp=1/s², Kd=1/s.
+    vd_command_rad = INVDYN_KP * (target_rad - q_rad) - INVDYN_KD * qd_rad
+    qdd_d_rad = vd_command_rad
+    # rad/s² -> deg/s², clip, integrate
+    deg_per_rad = 180.0 / np.pi
+    qdd_d_deg = qdd_d_rad * deg_per_rad
+    qdd_d_deg = np.clip(qdd_d_deg, -QDD_MAX_DEG, QDD_MAX_DEG)
+    next_pos = current + velocity_deg * dt + 0.5 * qdd_d_deg * (dt ** 2)
+    vel_cmd = velocity_deg + qdd_d_deg * dt
+    return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
+
+
 @timed("pd_solve")
 def pd_solve(q, target_angles, q_vel=None, prev_q=None, dt=None):
     """PD controller (fallback): same as mpc_hal."""
@@ -119,10 +169,13 @@ INVDYN_USE_PD_SOLVE = True
 
 def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
                         pos_tol=0.5, vel_tol=1.0, settle_steps=10, controller="invdyn"):
-    """Run control loop: poll -> (pd_solve or invdyn_solve) -> HAL write."""
-    use_pd = INVDYN_USE_PD_SOLVE
+    """Run control loop: poll -> (invdyn_model_solve, pd_solve, or invdyn_solve) -> HAL write."""
+    use_model = _invdyn_params is not None
+    use_pd = INVDYN_USE_PD_SOLVE and not use_model
     print("InvDyn control loop starting. Target:", target_angles)
-    if use_pd:
+    if use_model:
+        print("  Using model-based invdyn (M,C,G from npz).")
+    elif use_pd:
         print("  Using pd_solve (direct position steps) so robot moves.")
     else:
         print(f"  Kp={INVDYN_KP} Kd={INVDYN_KD} qdd_max={QDD_MAX_DEG} deg/s²")
@@ -134,6 +187,7 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
     converged_count = 0
     prev_current = None
     t_prev = None
+    done_reason = "duration"
     for k in _timing:
         _timing[k] = []
     log_rows = []
@@ -145,7 +199,9 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
         t_prev = t_loop_start
 
         q, q_vel, hal_vel, hal_torq, t_status = _poll_feedback(s)
-        if use_pd:
+        if use_model:
+            next_pos, vel_cmd = invdyn_model_solve(q, target_angles, _invdyn_params, q_vel=q_vel, prev_q=prev_current, dt=dt)
+        elif use_pd:
             next_pos, vel_cmd = pd_solve(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
         else:
             next_pos, vel_cmd = invdyn_solve(q, target_angles, q_vel=q_vel, prev_q=prev_current, dt=dt)
@@ -173,12 +229,13 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
         if err < pos_tol and vel_norm < vel_tol:
             converged_count += 1
             if converged_count >= settle_steps:
+                done_reason = "converged"
                 print(f"  Converged at loop {loop_count}: err={err:.3f}° vel_norm={vel_norm:.3f}°/s")
                 break
         else:
             converged_count = 0
 
-        solve_key = "pd_solve" if use_pd else "invdyn_solve"
+        solve_key = "invdyn_solve" if (use_model or not use_pd) else "pd_solve"
         log_rows.append([
             controller, t_status, loop_count,
             *q, *est_vel, *target_angles, *next_pos, *vel_cmd,
@@ -190,9 +247,10 @@ def invdyn_control_loop(h, s, target_angles, duration_sec=10.0,
         if loop_count % 10 == 0 or loop_count <= 3:
             print(f"Loop {loop_count}: q={q[:3]}... err={err:.3f} vcmd={[round(v, 1) for v in vel_cmd[:3]]}")
 
-    h["enable"] = False
-    print(f"\nDone. Ran {loop_count} InvDyn iterations.")
+    # Keep PIDs on between moves; disable only on exit (main finally).
+    print(f"\nDone. Ran {loop_count} InvDyn iterations. exit_reason={done_reason}")
     _save_log(log_rows, target_angles, controller)
+    return done_reason
 
 
 def pd_control_loop(h, s, target_angles, duration_sec=10.0,
@@ -205,6 +263,7 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
     converged_count = 0
     prev_current = None
     t_prev = None
+    done_reason = "duration"
     for k in _timing:
         _timing[k] = []
     log_rows = []
@@ -237,6 +296,7 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
         if err < pos_tol and vel_norm < vel_tol:
             converged_count += 1
             if converged_count >= settle_steps:
+                done_reason = "converged"
                 break
         else:
             converged_count = 0
@@ -246,9 +306,10 @@ def pd_control_loop(h, s, target_angles, duration_sec=10.0,
             err, _timing["poll"][-1], _timing["pd_solve"][-1],
             _timing["hal_write"][-1], _timing["sleep"][-1],
         ])
-    h["enable"] = False
-    print(f"Done. Ran {loop_count} PD iterations.")
+    # Keep PIDs on between moves; disable only on exit (main finally).
+    print(f"Done. Ran {loop_count} PD iterations. exit_reason={done_reason}")
     _save_log(log_rows, target_angles, controller)
+    return done_reason
 
 
 def _read_hal_feedback():
@@ -290,14 +351,16 @@ def _write_hal_cmd(h, next_pos, vel_cmd):
 
 
 _last_log_filename = None  # basename of last saved CSV (for desktop fetch)
+_desktop_log_stamp = None  # optional YYYYMMDD_HHMMSS from desktop (Raspi clock may be wrong)
 
 
 def _save_log(log_rows, target_angles, controller="invdyn"):
-    global _last_log_filename
+    global _last_log_filename, _desktop_log_stamp
     if not log_rows:
         return
     os.makedirs(LOG_DIR, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = _desktop_log_stamp if _desktop_log_stamp else datetime.now().strftime("%Y%m%d_%H%M%S")
+    _desktop_log_stamp = None  # use once per save
     target_str = "_".join(str(int(a)) for a in target_angles)
     filename = os.path.join(LOG_DIR, f"invdyn_{stamp}_t{target_str}.csv")
     header = (
@@ -590,13 +653,38 @@ def _update_cmd_status(state, current_deg, target_deg, error_norm, **extra):
 
 
 def main():
+    global _invdyn_params
     import argparse
     parser = argparse.ArgumentParser(description="InvDyn control for myCobot Pro 630")
     parser.add_argument("--suction", action="store_true", default=False)
     parser.add_argument("--stream-port", type=int, default=STREAM_PORT)
     parser.add_argument("--stream-rate", type=float, default=STREAM_RATE_HZ)
     parser.add_argument("--cmd-port", type=int, default=CMD_PORT)
+    default_params = os.path.join(LOG_DIR, "invdyn_params.npz")
+    parser.add_argument("--params", default=default_params,
+                        help="Path to npz from identify_invdyn_from_log.py (default: logs/invdyn_params.npz)")
+    parser.add_argument("--urdf", default=None,
+                        help="URDF path for Pinocchio model (when npz has pin_theta)")
     args = parser.parse_args()
+
+    # Load inverse-dynamics params (optional)
+    params_path = args.params
+    if not os.path.isfile(params_path):
+        npz_files = sorted(glob.glob(os.path.join(LOG_DIR, "*.npz")))
+        if npz_files:
+            params_path = npz_files[0]
+    if load_invdyn_params is not None and os.path.isfile(params_path):
+        _invdyn_params = load_invdyn_params(params_path, urdf_path=args.urdf)
+        if _invdyn_params is not None:
+            print(f"  Loaded invdyn params from {params_path} (use_pinocchio={_invdyn_params.get('use_pinocchio', False)})")
+        else:
+            _invdyn_params = None
+    else:
+        _invdyn_params = None
+        if args.params != default_params or (load_invdyn_params is None):
+            pass  # user passed --params or no invdyn_model
+        elif not os.path.isfile(default_params):
+            pass  # no npz in logs, keep PD
 
     try:
         h = hal.component("invdyn")
@@ -655,6 +743,10 @@ def main():
                 controller = "pd"
             pos_tol = cmd.get("pos_tol", 0.5)
             settle = cmd.get("settle_steps", 10)
+            # Use desktop timestamp for CSV filename (Raspi system date may be wrong)
+            global _desktop_log_stamp
+            _desktop_log_stamp = cmd.get("log_stamp") if isinstance(cmd.get("log_stamp"), str) else None
+
             t_cmd_start = time.perf_counter()
             s.poll()
             current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
@@ -662,9 +754,9 @@ def main():
             print(f"\n[cmd] Moving → {[round(v, 1) for v in target]} controller={controller}")
             _update_cmd_status("moving", current, target, err)
             if controller == "invdyn":
-                invdyn_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
+                done_reason = invdyn_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
             else:
-                pd_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
+                done_reason = pd_control_loop(h, s, target, duration_sec=duration, pos_tol=pos_tol, settle_steps=settle, controller=controller)
             robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
             s.poll()
             final = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
@@ -674,10 +766,11 @@ def main():
             avg_solve = sum(_timing[solve_key][-n_loops:]) / n_loops if _timing[solve_key] else 0
             _update_cmd_status(
                 "done", final, target, final_err,
-                robot_exec_ms=round(robot_exec_ms, 2), n_loops=n_loops, avg_solve_ms=round(avg_solve, 3),
+                robot_exec_ms=round(robot_exec_ms, 2), n_loops=n_loops, done_reason=done_reason,
+                avg_solve_ms=round(avg_solve, 3),
                 last_log_name=_last_log_filename,
             )
-            print(f"[cmd] Done. exec={robot_exec_ms:.0f}ms err={final_err:.3f}°")
+            print(f"[cmd] Done. exit_reason={done_reason} exec={robot_exec_ms:.0f}ms err={final_err:.3f}°")
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:

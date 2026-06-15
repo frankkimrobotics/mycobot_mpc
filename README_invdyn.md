@@ -10,8 +10,9 @@ Inverse-dynamics control using the same Raspi/LinuxCNC + HAL architecture as MPC
 
 ## Files
 
-- **invdyn_hal.py** — HAL component `invdyn`: runs on the robot (Raspi). **It is a PD controller**: desired acceleration `q̈_d = Kp*e - Kd*q̇`, then integrated to `next_pos` and `vel_cmd`. No mass/inertia matrix. The only difference from the `pd_solve` path is that this one integrates acceleration (smaller steps per cycle); both output pos/vel setpoints to the PIDs. Same command server (port 9998) and streaming server (port 9999) as `mpc_hal.py`.
-- **invdyn_linuxcnc.py** — Optional: InvDyn loop via MDI (G-code waypoints), like `mpc_linuxcnc.py`. Use when not using HAL direct write.
+- **invdyn_hal.py** — HAL component `invdyn`: runs on the robot (Raspi). By default it uses a PD law (or `pd_solve`); if **logs/invdyn_params.npz** exists (from `identify_invdyn_from_log.py -o logs/invdyn_params.npz`), it uses **model-based inverse dynamics** (M, C, G from the npz) to compute desired acceleration. Same command server (port 9998) and streaming server (port 9999) as `mpc_hal.py`.
+- **invdyn_model.py** — Shared module: loads npz, evaluates M(q), C(q,q̇), G(q), and computes q̈_d for control. Used by invdyn_hal and invdyn_linuxcnc.
+- **invdyn_linuxcnc.py** — Optional: InvDyn loop via MDI (G-code waypoints). Supports `--params` for model-based control (same npz as invdyn_hal).
 - **elerob_invdyn.hal** — HAL config that loads `invdyn_hal.py` and wires `invdyn.*` pins to the mux/PID.
 - **elerob_invdyn.ini** — LinuxCNC config that uses `elerob_invdyn.hal` (same as `elerob_mpc.ini` but with InvDyn HAL).
 
@@ -51,6 +52,7 @@ Same idea as MPC: start LinuxCNC on the **Raspi** with the InvDyn config; then f
   linuxcnc /home/pi/Desktop/mpc/config/elerob_invdyn.ini
   ```
   (ensure `elerob_invdyn.ini` and `elerob_invdyn.hal` are in that config dir or adjust paths in the INI).
+- **Model-based invdyn (optional):** After running `identify_invdyn_from_log.py` on robot logs, save params with `-o logs/invdyn_params.npz`. Copy that npz to the Raspi's repo `logs/` (or run identification on the Raspi). On the next start, invdyn_hal will load it and use M, C, G for the invdyn controller. If the file is missing, the robot falls back to PD.
 - LinuxCNC will start the GUI and load the HAL file; **invdyn_hal.py** is started by `loadusr` and will enable the machine, then listen on **port 9998** (commands) and **port 9999** (streaming). You should see “Waiting for commands from desktop (control_robot.py)...”.
 
 ### 2. On the desktop (your laptop/PC)
