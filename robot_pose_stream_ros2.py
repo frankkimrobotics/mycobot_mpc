@@ -4,7 +4,7 @@ Desktop-side script: launch rviz2 + stream robot joint poses from the robot cont
 
 Runs everything in a single command:
   1. Launches robot_state_publisher + rviz2 (via display.launch.py with use_gui:=false)
-  2. Connects to the robot's TCP streaming server (integrated in mpc_hal.py)
+  2. Connects to the robot's TCP streaming server (integrated in robot_hal.py)
   3. Publishes received joint angles to /joint_states for rviz2 visualization
 
 Usage:
@@ -28,20 +28,13 @@ import subprocess
 import sys
 import time
 
-MAX_JOINTS = 6
-JOINT_NAMES = [f"joint{i+1}" for i in range(MAX_JOINTS)]
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Joint calibration: LinuxCNC → URDF mapping
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  urdf_angle = JOINT_SIGNS[i] * (linuxcnc_angle + JOINT_OFFSETS_DEG[i])
-#
-#  Robot upright pose:  LinuxCNC = [-90, -90, 0, -90, 0, 0]
-#  URDF upright pose:             [-90,   0, 0,   0, 0, 0]
-
-JOINT_SIGNS       = [+1, +1, +1, +1, +1, +1]  # per-joint sign: +1 or -1
-JOINT_OFFSETS_DEG = [0.0, 90.0, 0.0, 90.0, 0.0, 0.0]  # per-joint offset (degrees)
+# Joint conventions (counts, names, LinuxCNC↔URDF calibration) are shared.
+from joint_conventions import (
+    MAX_JOINTS,
+    JOINT_NAMES,
+    JOINT_SIGNS,
+    JOINT_OFFSETS_DEG,
+)
 
 
 def launch_rviz2():

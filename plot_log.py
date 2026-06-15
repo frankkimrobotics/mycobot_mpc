@@ -24,38 +24,11 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-FIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
-NUM_JOINTS = 6
-
-
-def _save_fig(fig, name):
-    """Save figure to figures/ directory as PNG."""
-    os.makedirs(FIG_DIR, exist_ok=True)
-    from datetime import datetime
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(FIG_DIR, f"{name}_{stamp}.png")
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    print(f"  Saved: {path}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Robot-side logs (mpc_*.csv)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def load_robot_csv(filepath):
-    """Load a robot log CSV and add an elapsed-time column (seconds from start)."""
-    df = pd.read_csv(filepath)
-    t0_parts = df["timestamp"].iloc[0].split(":")
-    t0_sec = int(t0_parts[0]) * 3600 + int(t0_parts[1]) * 60 + float(t0_parts[2])
-
-    def to_elapsed(ts):
-        p = ts.split(":")
-        sec = int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2])
-        return sec - t0_sec
-
-    df["elapsed_s"] = df["timestamp"].apply(to_elapsed)
-    return df
+# Shared dirs, palette, CSV loader, and figure-saver.
+from plot_common import (
+    LOG_DIR, FIG_DIR, NUM_JOINTS, JOINT_COLORS, load_robot_csv,
+    save_fig as _save_fig,
+)
 
 
 def plot_merged_trajectories(dfs, axes):
