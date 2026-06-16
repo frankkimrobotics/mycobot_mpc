@@ -229,15 +229,21 @@ class RobotConnection:
         controller: str = "pid",
         pos_tol: float = 0.5,
         settle_steps: int = 10,
+        trajectory: list[list[float]] | None = None,
+        traj_dt: float | None = None,
     ) -> dict:
         """Send a move command and return the ack response.
 
         Args:
-            target_deg: 6 joint angles in LinuxCNC degrees
+            target_deg: 6 joint angles in LinuxCNC degrees (final pose)
             duration: Max duration for the move (seconds)
             controller: "pid", "invdyn", "pd_velff", or "mpc"
             pos_tol: Position tolerance for early stop (degrees)
             settle_steps: Consecutive converged loops before early stop
+            trajectory: optional list of N x 6 per-sample joint poses; the robot
+                        tracks this time-varying setpoint (smooth B-spline/quintic
+                        motion) in a single control loop and a single log.
+            traj_dt: seconds between trajectory samples (required with trajectory)
 
         Returns:
             Ack dict from robot, or empty dict on failure
@@ -254,6 +260,9 @@ class RobotConnection:
             "settle_steps": settle_steps,
             "log_stamp": log_stamp,
         }
+        if trajectory is not None and traj_dt is not None:
+            cmd["trajectory"] = [[round(float(v), 4) for v in row] for row in trajectory]
+            cmd["traj_dt"] = float(traj_dt)
         msg = json.dumps(cmd) + "\n"
         self.sock.sendall(msg.encode("utf-8"))
         print(f"[conn] Sent target: {[round(float(v), 1) for v in target_deg]} "
@@ -428,6 +437,67 @@ def move_to_joints(
             final_status=status,
         )
 
+    return status
+
+
+def move_smooth(
+    conn: RobotConnection,
+    current_deg: np.ndarray,
+    target_deg: np.ndarray,
+    via: list | None = None,
+    kind: str = "quintic",
+    controller: str = "pid",
+    rate_hz: float = 50.0,
+    vel_frac: float = 0.6,
+    acc_frac: float = 0.6,
+    pos_tol: float = 0.5,
+    settle_steps: int = 10,
+    timer: PipelineTimer | None = None,
+    logger: MoveLogger | None = None,
+) -> dict:
+    """Move from current_deg to target_deg along a smooth, time-scaled trajectory.
+
+    Builds a min-jerk quintic (kind="quintic") or quintic B-spline through
+    via-points (kind="bspline") with trajectory.plan(), samples it at rate_hz,
+    and sends it as one trajectory command. The robot tracks the moving setpoint
+    in a single control loop / single log. Returns the final status dict.
+    """
+    import trajectory as traj
+
+    tr = traj.plan(np.asarray(current_deg, float), np.asarray(target_deg, float),
+                   via=via, kind=kind, rate_hz=rate_hz, vel_frac=vel_frac, acc_frac=acc_frac)
+    samples = tr["q"]              # (N, 6) per-sample joint poses
+    T = tr["T"]
+    traj_dt = 1.0 / rate_hz
+    duration = T + 2.0             # play the trajectory, then a settle margin
+
+    if timer is None:
+        timer = PipelineTimer()
+    timer.start("total"); timer.start("cmd_send"); timer.start("ack_rtt")
+    ack = conn.send_target(
+        list(samples[-1]), duration=duration, controller=controller,
+        pos_tol=pos_tol, settle_steps=settle_steps,
+        trajectory=[list(row) for row in samples], traj_dt=traj_dt,
+    )
+    timer.stop("ack_rtt"); timer.stop("cmd_send")
+    print(f"[smooth] {kind} traj: {len(samples)} samples, T={T:.2f}s "
+          f"({vel_frac*100:.0f}% vel / {acc_frac*100:.0f}% acc limits)")
+
+    timer.start("wait_done")
+    status = conn.wait_for_done(timeout=duration + 5.0)
+    timer.stop("wait_done"); timer.stop("total")
+    for key in ("ik_solve", "fk_verify"):
+        if key not in timer.as_dict():
+            timer._timings[key] = 0.0
+    print(f"[timer] {timer.summary()}")
+    if status.get("done_reason"):
+        print(f"  exit_reason={status['done_reason']}")
+
+    if logger:
+        logger.log_move(
+            timer=timer, target_type=f"smooth_{kind}", controller=controller,
+            target_deg=list(target_deg), solved_deg=None, final_status=status,
+        )
     return status
 
 
