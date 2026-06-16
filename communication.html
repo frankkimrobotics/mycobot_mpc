@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Robot Arm Real-Time Control — Communication Architecture</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a212b;
+    --panel2: #222c38;
+    --ink: #e6edf3;
+    --muted: #9aa7b4;
+    --accent: #4ea1ff;
+    --accent2: #58d68d;
+    --accent3: #f5b041;
+    --accent4: #ec7063;
+    --border: #2d3947;
+    --code-bg: #11161d;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.6;
+  }
+  header {
+    padding: 48px 24px 32px;
+    text-align: center;
+    background: linear-gradient(160deg, #16202c 0%, #0f1419 100%);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: -0.5px; }
+  header p { margin: 0; color: var(--muted); font-size: 15px; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 80px; }
+  h2 {
+    font-size: 22px;
+    margin: 48px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--border);
+  }
+  h2 .num {
+    display: inline-block;
+    width: 30px; height: 30px;
+    line-height: 30px;
+    text-align: center;
+    background: var(--accent);
+    color: #06121f;
+    border-radius: 7px;
+    font-size: 15px;
+    margin-right: 10px;
+    font-weight: 700;
+  }
+  h3 { font-size: 17px; margin: 28px 0 10px; color: var(--accent2); }
+  p { color: #cdd6df; }
+  code {
+    font-family: var(--mono);
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: #ffd9a8;
+    border: 1px solid var(--border);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+    color: #d6e2ee;
+  }
+  pre code { background: none; border: none; padding: 0; color: inherit; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin: 16px 0;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px){ .grid { grid-template-columns: 1fr; } }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--accent); font-weight: 600; background: var(--panel2); }
+  td code { font-size: 12px; }
+  .tag {
+    display: inline-block;
+    font-size: 11px;
+    padding: 2px 9px;
+    border-radius: 20px;
+    font-weight: 600;
+    letter-spacing: .3px;
+  }
+  .tag.tcp { background: #173a52; color: #7fc6ff; }
+  .tag.hal { background: #1c3d2a; color: #7fe0a3; }
+  .tag.can { background: #4a3413; color: #f5c884; }
+  .tag.rt  { background: #4a1f1c; color: #f3a39b; }
+
+  /* Pipeline diagram */
+  .pipe { display: flex; flex-direction: column; gap: 0; margin: 24px 0; }
+  .layer {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    background: var(--panel);
+    position: relative;
+  }
+  .layer .lhead { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .layer .ltitle { font-weight: 700; font-size: 15px; }
+  .layer .lsub { color: var(--muted); font-size: 13px; }
+  .layer.desktop { border-left: 4px solid var(--accent); }
+  .layer.rthost  { border-left: 4px solid var(--accent2); }
+  .layer.servo   { border-left: 4px solid var(--accent3); }
+  .layer.motor   { border-left: 4px solid var(--accent4); }
+  .layer.arm     { border-left: 4px solid #b07cff; }
+  .arrow {
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+    padding: 8px 0;
+    font-family: var(--mono);
+  }
+  .arrow .lbl {
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 3px 12px;
+    color: var(--ink);
+  }
+  ul.tight { margin: 8px 0; padding-left: 22px; }
+  ul.tight li { margin: 4px 0; color: #cdd6df; }
+  .pin { color: #ffd9a8; font-family: var(--mono); font-size: 12.5px; }
+  .note {
+    background: #14222e;
+    border: 1px solid #2a4a5e;
+    border-left: 4px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 16px 0;
+    font-size: 14px;
+    color: #c6dcea;
+  }
+  .file { color: var(--accent2); font-family: var(--mono); font-size: 12.5px; }
+  footer { text-align: center; color: var(--muted); font-size: 13px; padding: 24px; border-top: 1px solid var(--border); }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; margin-top: 16px; }
+  .legend span { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Real-Time Control Communication</h1>
+  <p>How the desktop control scripts talk to the MyCobot&nbsp;Pro&nbsp;630 robot arm &mdash; <code>mycobot_mpc</code></p>
+</header>
+
+<div class="wrap">
+
+  <div class="note">
+    <strong>One-line summary:</strong> A desktop client streams target joint angles as JSON over TCP to a
+    Python HAL component running inside LinuxCNC on a Raspberry Pi. That component computes per-loop position
+    &amp; velocity commands, writes them onto LinuxCNC <em>HAL pins</em>, which a real-time servo thread relays
+    over a <em>CAN bus</em> to the joint motor drivers. Encoder feedback flows back the same path.
+  </div>
+
+  <!-- ===================== OVERVIEW ===================== -->
+  <h2><span class="num">1</span>System Overview</h2>
+  <p>
+    This is a <strong>two-machine distributed control system</strong>. High-level planning happens on a desktop;
+    hard real-time motor control happens on a Raspberry&nbsp;Pi running an RT-patched Linux kernel with
+    <strong>LinuxCNC</strong>. The two halves are connected by a plain TCP/JSON link; everything below the HAL
+    boundary on the Pi is real-time.
+  </p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>🖥️ Desktop side</h3>
+      <ul class="tight">
+        <li><span class="file">control_robot.py</span> — sends target joint angles, reads status, pulls logs</li>
+        <li><span class="file">ik_pyroki.py</span> — JAX inverse kinematics (Cartesian → joint angles)</li>
+        <li>ROS2 / rviz2 streamer for live visualization</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>🤖 Robot side (Raspberry Pi + LinuxCNC)</h3>
+      <ul class="tight">
+        <li><span class="file">robot_hal.py</span> — userspace HAL component <code>ctrl</code>; control law + TCP servers</li>
+        <li><span class="file">elerob.ini</span> / <span class="file">elerob.hal</span> — LinuxCNC config &amp; HAL wiring</li>
+        <li><span class="file">invdyn_model.py</span> — M(q), C(q,q̇), G(q) dynamics model</li>
+        <li><code>pro600</code> (hal_ele_master600) — CAN motor-driver HAL module</li>
+      </ul>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>Link</th><th>Transport</th><th>Port / Channel</th><th>Payload</th></tr>
+    <tr><td>Desktop → Robot (commands)</td><td><span class="tag tcp">TCP</span></td><td><code>9998</code></td><td>JSON: target_deg, controller, duration…</td></tr>
+    <tr><td>Robot → Desktop (status)</td><td><span class="tag tcp">TCP</span></td><td><code>9998</code></td><td>JSON: state, current_deg, error_norm…</td></tr>
+    <tr><td>Robot → rviz2 (stream)</td><td><span class="tag tcp">TCP</span></td><td><code>9999</code> @ 50&nbsp;Hz</td><td>JSON: joints_deg, timestamp</td></tr>
+    <tr><td>ctrl ↔ servo loop</td><td><span class="tag hal">HAL pins</span></td><td>shared memory</td><td>pos_cmd, vel_cmd, feedback (float)</td></tr>
+    <tr><td>servo loop ↔ motors</td><td><span class="tag can">SocketCAN</span></td><td>CAN bus</td><td>position/velocity cmd, encoder fb</td></tr>
+  </table>
+
+  <!-- ===================== DATA FLOW ===================== -->
+  <h2><span class="num">2</span>End-to-End Data Path</h2>
+  <p>A single command travels through five layers. Each layer runs at its own rate; the boundaries are where
+     the transport changes (TCP → HAL pins → CAN).</p>
+
+  <div class="pipe">
+
+    <div class="layer desktop">
+      <div class="lhead"><span class="ltitle">① Desktop client</span><span class="tag tcp">TCP</span><span class="lsub">control_robot.py · event-driven</span></div>
+      <ul class="tight">
+        <li>Optionally solves IK (<span class="file">ik_pyroki.py</span>) to turn a Cartesian goal into 6 joint angles.</li>
+        <li>Opens a TCP socket to the robot at <code>$ROBOT_IP:9998</code> (<code>TCP_NODELAY</code> set), then
+            <code>sendall()</code> of one newline-terminated JSON line per move (<span class="file">control_robot.py:251–259</span>).</li>
+      </ul>
+<pre><code>{ "target_deg": [j0,j1,j2,j3,j4,j5],
+  "duration": 2.0,
+  "controller": "invdyn",        // pid | invdyn | pd_velff
+  "pos_tol": 0.5, "settle_steps": 10,
+  "log_stamp": "20260616_101500" }</code></pre>
+    </div>
+
+    <div class="arrow">▼ <span class="lbl">JSON over TCP&nbsp;:9998</span> &nbsp; network RTT ≈ 5–10&nbsp;ms</div>
+
+    <div class="layer rthost">
+      <div class="lhead"><span class="ltitle">② ctrl component — command server &amp; control loop</span><span class="tag hal">HAL userspace</span><span class="lsub">robot_hal.py · ~50&nbsp;Hz (20&nbsp;ms)</span></div>
+      <ul class="tight">
+        <li>A server thread receives the JSON, validates <code>target_deg</code>, and pushes it onto an internal
+            queue, replying <code>{"state":"ack"}</code> (<span class="file">robot_hal.py:595–598</span>).</li>
+        <li>The main loop dequeues the target and runs <code>run_control_loop()</code> until converged or the
+            duration expires (<span class="file">robot_hal.py:425–502</span>). Each iteration:</li>
+      </ul>
+<pre><code>poll  →  s.poll(); read joint_actual_position + pro600.joint*_velfb/torqfb
+solve →  pid_solve | invdyn_solve | pd_velff_solve   (numpy, per-joint)
+write →  h["joint{i}_pos_cmd"], h["joint{i}_vel_cmd"]   ← HAL OUT pins
+sleep →  pad to the 20 ms period; check convergence (err < pos_tol)</code></pre>
+      <p style="margin:8px 0 0; font-size:13px; color:var(--muted)">
+        Three selectable control laws: <strong>PID</strong> (pos-error + integral),
+        <strong>InvDyn</strong> (PD position steps + optional gravity comp from <code>invdyn_params.npz</code>),
+        <strong>PD + velocity feed-forward</strong>. Output is clamped to ±8°/step.</p>
+    </div>
+
+    <div class="arrow">▼ <span class="lbl">HAL pins (shared memory)</span> &nbsp; <span class="pin">ctrl.joint{i}_pos_cmd · ctrl.joint{i}_vel_cmd · ctrl.enable</span></div>
+
+    <div class="layer servo">
+      <div class="lhead"><span class="ltitle">③ LinuxCNC real-time servo thread</span><span class="tag rt">RT</span><span class="lsub">elerob.hal · servo-thread @ 100&nbsp;Hz (SERVO_PERIOD 10&nbsp;ms)</span></div>
+      <ul class="tight">
+        <li><strong>Multiplexers</strong> <code>mux-gen.00–11</code> select the command source per joint, gated by
+            <code>ctrl.enable</code> (<span class="file">elerob.hal:186–251</span>):
+            <br>&nbsp;&nbsp;• <code>enable=FALSE</code> → LinuxCNC motion planner drives the joints (G-code / jog).
+            <br>&nbsp;&nbsp;• <code>enable=TRUE</code> → the Python <code>ctrl</code> commands take over.</li>
+        <li>Position command → <code>pid.N.command</code> + <code>pro600.jointN_motor_poscmd</code>;
+            velocity command → <code>pro600.jointN_poscmd</code>.</li>
+        <li>The six <code>pid.N</code> blocks (run on the 50&nbsp;Hz slow-thread) close an inner loop and are gated
+            on <code>ctrl.enable</code> to avoid startup spikes (<span class="file">elerob.hal:590–596</span>).</li>
+        <li><code>collidet_panda</code> runs a parallel collision/residual estimator from torque feedback.</li>
+      </ul>
+    </div>
+
+    <div class="arrow">▼ <span class="lbl">SocketCAN</span> &nbsp; <code>pro_socketcan.update</code> @ 50&nbsp;Hz (motor_time_interval 20&nbsp;ms)</div>
+
+    <div class="layer motor">
+      <div class="lhead"><span class="ltitle">④ pro600 motor-driver module (CAN bus)</span><span class="tag can">CAN</span><span class="lsub">hal_ele_master600</span></div>
+      <ul class="tight">
+        <li>Encodes the per-joint position/velocity setpoints into CAN frames for the joint driver boards.</li>
+        <li>Applies scaling: encoder <code>360/(524288·100)</code> deg/count, velocity <code>524288·0.001/60</code>,
+            torque scale per joint (<span class="file">elerob.ini:150–301</span>).</li>
+        <li>Each driver runs its own high-rate inner loop (current commutation, trapezoidal profile, torque limit).</li>
+      </ul>
+    </div>
+
+    <div class="arrow">▼ <span class="lbl">motor windings</span></div>
+
+    <div class="layer arm">
+      <div class="lhead"><span class="ltitle">⑤ Robot arm — 6 BLDC joints</span><span class="lsub">MyCobot Pro 630</span></div>
+      <ul class="tight">
+        <li>Joints move; absolute encoders + current sensors measure position, velocity, torque.</li>
+        <li>Feedback returns up the chain via CAN → <code>pro600.joint{i}_posfb / velfb / torqfb</code> →
+            <code>joint.N.motor-pos-fb</code> &amp; <code>pid.N.feedback</code>, and is read back by
+            <code>robot_hal.py</code> on the next loop, closing the loop.</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <div class="legend">
+    <span><span class="dot" style="background:var(--accent)"></span>TCP / JSON</span>
+    <span><span class="dot" style="background:var(--accent2)"></span>HAL component</span>
+    <span><span class="dot" style="background:var(--accent3)"></span>RT servo / HAL pins</span>
+    <span><span class="dot" style="background:var(--accent4)"></span>CAN bus</span>
+    <span><span class="dot" style="background:#b07cff"></span>Physical arm</span>
+  </div>
+
+  <!-- ===================== KEY MECHANISM ===================== -->
+  <h2><span class="num">3</span>The Key Mechanism: HAL Pins &amp; the <code>ctrl.enable</code> Multiplexer</h2>
+  <p>
+    The bridge between "soft" Python and "hard" real-time control is the <strong>HAL (Hardware Abstraction
+    Layer)</strong>. <span class="file">robot_hal.py</span> registers a userspace component named <code>ctrl</code>
+    and exports pins (<span class="file">robot_hal.py:674–679</span>):
+  </p>
+<pre><code>h = hal.component("ctrl")
+for i in range(6):
+    h.newpin(f"joint{i}_pos_cmd", hal.HAL_FLOAT, hal.HAL_OUT)
+    h.newpin(f"joint{i}_vel_cmd", hal.HAL_FLOAT, hal.HAL_OUT)
+h.newpin("enable", hal.HAL_BIT, hal.HAL_OUT)
+h.ready()</code></pre>
+  <p>
+    Writing <code>h["joint0_pos_cmd"] = …</code> in Python instantly updates a value in LinuxCNC's shared-memory
+    space. The RT servo thread reads it the same cycle. The <code>elerob.hal</code> wiring routes it through a
+    per-joint 2-input mux selected by <code>ctrl.enable</code>:
+  </p>
+<pre><code># elerob.hal — joint 0 position command path
+net sig0-mot-pos-cmd joint.0.motor-pos-cmd => mux-gen.00.in-float-00   # source 0: LinuxCNC planner
+net ctrl-j0-cmd      ctrl.joint0_pos_cmd   => mux-gen.00.in-float-01   # source 1: Python ctrl
+net ctrl-enable      ctrl.enable           => mux-gen.00.sel-bit-00    # selector
+net pid0-cmd         mux-gen.00.out-float  => pid.0.command pro600.joint0_motor_poscmd</code></pre>
+  <div class="note">
+    This design lets the same machine be driven either by LinuxCNC's G-code trajectory planner <em>or</em> by the
+    custom Python control law, switched live with a single bit. The Python side never touches CAN directly — it
+    only sets HAL pins, and LinuxCNC's RT layer guarantees the timing down to the motors.
+  </div>
+
+  <!-- ===================== TIMING ===================== -->
+  <h2><span class="num">4</span>Real-Time Timing Budget</h2>
+  <table>
+    <tr><th>Stage</th><th>Rate / Period</th><th>Where</th></tr>
+    <tr><td>Desktop command send</td><td>per-move (event)</td><td>control_robot.py</td></tr>
+    <tr><td>Python control loop (poll→solve→write)</td><td><strong>50&nbsp;Hz</strong> (20&nbsp;ms, <code>--period-ms</code>)</td><td>robot_hal.py:425</td></tr>
+    <tr><td>State streaming to rviz2</td><td>50&nbsp;Hz</td><td>robot_hal.py:508</td></tr>
+    <tr><td>LinuxCNC servo-thread (mux, ddt, motion)</td><td><strong>100&nbsp;Hz</strong> (SERVO_PERIOD 10&nbsp;ms)</td><td>elerob.ini:26</td></tr>
+    <tr><td>slow-thread (pid calcs, CAN update)</td><td>50&nbsp;Hz (20&nbsp;ms)</td><td>elerob.hal:7,35–58</td></tr>
+    <tr><td>Trajectory planner</td><td>10&nbsp;Hz (TRAJ_PERIOD 100&nbsp;ms)</td><td>elerob.ini:27</td></tr>
+    <tr><td>Motor driver inner loop</td><td>kHz (firmware)</td><td>pro600 board</td></tr>
+  </table>
+  <div class="note">
+    The Python control law runs in <em>userspace</em> at ~50&nbsp;Hz, not in the hard-RT servo thread. That is
+    acceptable because the downstream PID + CAN servo loop (10&nbsp;ms) and the driver firmware (kHz) provide the
+    tight, low-latency control. Per-loop timing (<code>poll_ms</code>, <code>solve_ms</code>, <code>hal_write_ms</code>,
+    <code>sleep_ms</code>) is logged to CSV for every run.
+  </div>
+
+  <!-- ===================== STARTUP ===================== -->
+  <h2><span class="num">5</span>Startup &amp; Enable Handshake</h2>
+  <ol>
+    <li><code>linuxcnc elerob.ini</code> loads <code>elerob.hal</code>, which <code>loadusr</code>-launches
+        <span class="file">robot_hal.py --controller invdyn --params logs/invdyn_params.npz</span> as the
+        <code>ctrl</code> component (<span class="file">elerob.hal:17</span>).</li>
+    <li><code>robot_hal.py</code> exports its HAL pins, starts the TCP command (9998) &amp; stream (9999) servers,
+        then runs <code>enable_machine()</code>: ESTOP-reset → <code>pro600.poweron</code> → wait for
+        <code>svr_poweroned</code> / <code>svr_enabled</code> → home joints.</li>
+    <li>It reads stable encoder feedback, pre-loads <code>joint{i}_pos_cmd</code> with the <em>current</em> position
+        (so there is no jump), then asserts <code>ctrl.enable = TRUE</code> — which simultaneously flips the muxes
+        and enables the PIDs (<span class="file">robot_hal.py:370–377</span>, <span class="file">elerob.hal:596</span>).</li>
+    <li>The desktop connects to <code>:9998</code> and begins sending target poses.</li>
+  </ol>
+
+  <!-- ===================== FILE MAP ===================== -->
+  <h2><span class="num">6</span>File Map</h2>
+  <table>
+    <tr><th>File</th><th>Role</th><th>Runs on</th></tr>
+    <tr><td><span class="file">control_robot.py</span></td><td>Desktop client: IK, JSON command sender, status reader, log fetch</td><td>Desktop</td></tr>
+    <tr><td><span class="file">ik_pyroki.py</span></td><td>JAX/pyroki inverse kinematics</td><td>Desktop</td></tr>
+    <tr><td><span class="file">robot_hal.py</span></td><td><code>ctrl</code> HAL component: PID / InvDyn / PD+VelFF control law + TCP servers</td><td>Raspi (LinuxCNC)</td></tr>
+    <tr><td><span class="file">elerob.ini</span></td><td>LinuxCNC config: servo/traj periods, kinematics, joint limits</td><td>Raspi</td></tr>
+    <tr><td><span class="file">elerob.hal</span></td><td>RT HAL wiring: muxes, PIDs, pro600 CAN, collision detect</td><td>Raspi</td></tr>
+    <tr><td><span class="file">invdyn_model.py</span></td><td>Dynamics model M(q), C(q,q̇), G(q) for gravity comp</td><td>Raspi</td></tr>
+    <tr><td><span class="file">robot_pose_stream_ros2.py</span></td><td>Subscribes to :9999 stream → publishes to rviz2</td><td>Desktop</td></tr>
+  </table>
+
+</div>
+
+<footer>
+  Generated for the <code>mycobot_mpc</code> repository · MyCobot Pro 630 + LinuxCNC + TinyMPC<br>
+  Diagram reflects <code>elerob.ini</code>, <code>elerob.hal</code> and <code>robot_hal.py</code> on branch <code>fixcalib</code>.
+</footer>
+
+</body>
+</html>
