@@ -75,6 +75,14 @@ def main():
                     help="Controller for the moves (default: pid)")
     ap.add_argument("--pos-tol", type=float, default=0.5, help="Early-stop position tolerance (deg)")
     ap.add_argument("--settle-steps", type=int, default=10, help="Settle steps for early stop")
+    ap.add_argument("--smooth", action="store_true",
+                    help="Move along a smooth, time-scaled B-spline/quintic trajectory between "
+                         "poses (uses the robot trajectory mode). Recommended.")
+    ap.add_argument("--traj-kind", choices=["quintic", "bspline"], default="quintic",
+                    help="Trajectory type when --smooth (default: quintic, ideal for 2 endpoints)")
+    ap.add_argument("--rate-hz", type=float, default=50.0, help="Trajectory sample rate when --smooth (default: 50)")
+    ap.add_argument("--vel-frac", type=float, default=0.6, help="Fraction of joint vel limit when --smooth (default: 0.6)")
+    ap.add_argument("--acc-frac", type=float, default=0.6, help="Fraction of joint accel limit when --smooth (default: 0.6)")
     ap.add_argument("--no-fetch-logs", action="store_true", help="Do not auto-fetch robot logs after each move")
     ap.add_argument("--dry-run", action="store_true", help="Print the planned moves only; do not connect or move")
     args = ap.parse_args()
@@ -105,29 +113,40 @@ def main():
         sys.exit(1)
 
     logger = cr.MoveLogger()
+    current_deg = base_deg.copy()
 
-    # 1) Move to base pose first (its own duration; robot may start slightly off base).
+    def do_move(target, duration, smooth):
+        """Execute one move (smooth trajectory or point-to-point) and track current pose."""
+        nonlocal current_deg
+        if smooth:
+            status = cr.move_smooth(
+                conn, current_deg, np.asarray(target, float), kind=args.traj_kind,
+                controller=args.controller, rate_hz=args.rate_hz,
+                vel_frac=args.vel_frac, acc_frac=args.acc_frac,
+                pos_tol=args.pos_tol, settle_steps=args.settle_steps, logger=logger,
+            )
+        else:
+            status = cr.move_to_joints(
+                conn, np.asarray(target, float), duration=duration, controller=args.controller,
+                pos_tol=args.pos_tol, settle_steps=args.settle_steps, logger=logger,
+            )
+        cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
+        cur = status.get("current_deg")
+        current_deg = np.array(cur, float) if cur else np.asarray(target, float)
+        return status
+
+    # 1) Move to base pose first. Point-to-point: the start pose is unknown to the
+    #    desktop, and base ≈ current so this opening move is small either way.
     base_dur = args.base_duration if args.base_duration is not None else args.duration
     print("\n--- Moving to base pose ---")
-    status = cr.move_to_joints(
-        conn, base_deg,
-        duration=base_dur, controller=args.controller,
-        pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-        logger=logger,
-    )
-    cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
+    do_move(base_deg, base_dur, smooth=False)
 
     # 2) Perturbation sequence (skip the leading "base" entry already done above).
-    print("\n--- Perturbation sequence ---")
+    mode = f"smooth {args.traj_kind}" if args.smooth else "point-to-point"
+    print(f"\n--- Perturbation sequence ({mode}) ---")
     for i, (label, target) in enumerate(plan[1:], start=1):
         print(f"  [{i}/{len(plan)-1}] {label:<12} J-targets = {np.round(target, 1).tolist()}")
-        status = cr.move_to_joints(
-            conn, target,
-            duration=args.duration, controller=args.controller,
-            pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-            logger=logger,
-        )
-        cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
+        do_move(target, args.duration, smooth=args.smooth)
 
     conn.close()
     logger.save(tag="perturb")

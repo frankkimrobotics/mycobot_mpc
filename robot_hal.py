@@ -423,10 +423,20 @@ def enable_machine(h, timeout=60.0):
 # Single control loop (dispatches to pid / invdyn / pd_velff)
 # ---------------------------------------------------------------------------
 def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5, vel_tol=1.0, settle_steps=10,
-                     log_dir=None, log_enabled=True, period_sec=None):
-    """One loop: poll -> solve (pid|invdyn|pd_velff) -> HAL write; done_reason = converged | duration."""
+                     log_dir=None, log_enabled=True, period_sec=None, trajectory=None, traj_dt=None):
+    """One loop: poll -> solve (pid|invdyn|pd_velff) -> HAL write; done_reason = converged | duration.
+
+    If ``trajectory`` (list of N x MAX_JOINTS poses) and ``traj_dt`` (s/sample) are
+    given, the setpoint follows trajectory[idx], idx = int(elapsed / traj_dt),
+    clamped to the last sample (which equals ``target_angles``). Convergence is
+    only tested once the trajectory has been fully played, so the smooth motion
+    isn't cut short by an early-stop. Logged target is the live (moving) setpoint.
+    """
     if period_sec is None:
         period_sec = PERIOD_SEC
+    use_traj = bool(trajectory) and bool(traj_dt)
+    final_target = list(target_angles)
+    n_traj = len(trajectory) if use_traj else 0
     h["enable"] = True
     t_start = time.time()
     loop_count = 0
@@ -441,10 +451,20 @@ def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5,
     log_rows = []
     period = period_sec
 
+    traj_done = not use_traj
     while (time.time() - t_start) < duration_sec:
         t_loop_start = time.time()
         dt = (t_loop_start - t_prev) if t_prev is not None else period
         t_prev = t_loop_start
+
+        # Advance the setpoint along the trajectory by elapsed time (time-accurate
+        # regardless of loop jitter); hold the final sample once exhausted.
+        if use_traj:
+            idx = int((t_loop_start - t_start) / traj_dt)
+            if idx >= n_traj - 1:
+                idx = n_traj - 1
+                traj_done = True
+            target_angles = trajectory[idx]
 
         q, q_vel, hal_vel, hal_torq, t_status = _poll_feedback(s)
 
@@ -475,9 +495,11 @@ def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5,
             _timing["sleep"].append(0.0)
 
         loop_count += 1
-        err = sum((t - a) ** 2 for t, a in zip(target_angles, q)) ** 0.5
+        # Convergence is judged against the FINAL target, and only once the
+        # trajectory has been fully played (so a smooth move isn't cut short).
+        err = sum((t - a) ** 2 for t, a in zip(final_target, q)) ** 0.5
         vel_norm = sum(v ** 2 for v in vel_cmd) ** 0.5
-        if err < pos_tol and vel_norm < vel_tol:
+        if traj_done and err < pos_tol and vel_norm < vel_tol:
             converged_count += 1
             if converged_count >= settle_steps:
                 done_reason = "converged"
@@ -728,17 +750,27 @@ def main():
             _desktop_log_stamp = cmd.get("log_stamp") if isinstance(cmd.get("log_stamp"), str) else None
             pos_tol = cmd.get("pos_tol", 0.5)
             settle = cmd.get("settle_steps", 10)
+            # Optional B-spline/quintic trajectory: a list of per-sample joint poses
+            # (N x 6) plus the seconds between samples. When present, the controller
+            # tracks this time-varying setpoint instead of a constant target, in a
+            # single control loop with a single log. Final target = last sample.
+            trajectory = cmd.get("trajectory")
+            traj_dt = cmd.get("traj_dt")
+            if trajectory and traj_dt:
+                # Run long enough to play the whole trajectory plus a settle margin.
+                duration = max(duration, len(trajectory) * traj_dt + 1.0)
 
             t_cmd_start = time.perf_counter()
             s.poll()
             current = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
             err = sum((t - c) ** 2 for t, c in zip(target, current)) ** 0.5
-            print(f"\n[cmd] Moving -> {[round(v, 1) for v in target]} controller={controller}")
+            kind = "trajectory" if (trajectory and traj_dt) else "target"
+            print(f"\n[cmd] Moving ({kind}) -> {[round(v, 1) for v in target]} controller={controller}")
             _update_cmd_status("moving", current, target, err)
 
             done_reason = run_control_loop(h, s, target, duration_sec=duration, controller=controller,
                                           pos_tol=pos_tol, settle_steps=settle, log_dir=log_dir, log_enabled=log_enabled,
-                                          period_sec=period_sec)
+                                          period_sec=period_sec, trajectory=trajectory, traj_dt=traj_dt)
 
             robot_exec_ms = (time.perf_counter() - t_cmd_start) * 1000
             s.poll()

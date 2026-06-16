@@ -94,6 +94,14 @@ def main():
                     help="Max joint offset in degrees per joint (symmetric ±) for sweep phase (default: 80, stay within limits)")
     ap.add_argument("--pos-tol", type=float, default=0.5, help="Position tolerance for early stop (deg)")
     ap.add_argument("--settle-steps", type=int, default=10, help="Settle steps for early stop")
+    ap.add_argument("--smooth", action="store_true",
+                    help="Move along a smooth, time-scaled B-spline/quintic trajectory between "
+                         "poses (uses the robot trajectory mode). Recommended.")
+    ap.add_argument("--traj-kind", choices=["quintic", "bspline"], default="quintic",
+                    help="Trajectory type when --smooth (default: quintic)")
+    ap.add_argument("--rate-hz", type=float, default=50.0, help="Trajectory sample rate when --smooth (default: 50)")
+    ap.add_argument("--vel-frac", type=float, default=0.6, help="Fraction of joint vel limit when --smooth (default: 0.6)")
+    ap.add_argument("--acc-frac", type=float, default=0.6, help="Fraction of joint accel limit when --smooth (default: 0.6)")
     ap.add_argument("--no-fetch-logs", action="store_true",
                     help="Do not fetch robot CSV logs after each move")
     start_group = ap.add_mutually_exclusive_group()
@@ -154,49 +162,47 @@ def main():
     logger = cr.MoveLogger()
     current_deg = start_deg.copy()
 
-    # Single move to rest pose (duration 3 s): robot goes there and holds for the move duration.
-    # Do not fetch log after this move so the next command is sent immediately; otherwise the
-    # robot sits with PIDs off (mpc.enable=False after each move) and can appear powered off.
+    def do_move(target, smooth, fetch=True):
+        """One move (smooth trajectory or point-to-point); tracks current pose."""
+        nonlocal current_deg
+        if smooth:
+            status = cr.move_smooth(
+                conn, current_deg, np.asarray(target, float), kind=args.traj_kind,
+                controller=args.controller, rate_hz=args.rate_hz,
+                vel_frac=args.vel_frac, acc_frac=args.acc_frac,
+                pos_tol=args.pos_tol, settle_steps=args.settle_steps, logger=logger,
+            )
+        else:
+            status = cr.move_to_joints(
+                conn, np.asarray(target, float), duration=args.duration, controller=args.controller,
+                pos_tol=args.pos_tol, settle_steps=args.settle_steps, logger=logger,
+            )
+        if fetch:
+            cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
+        cur = status.get("current_deg")
+        if cur:
+            current_deg = np.array(cur, float)
+        return status
+
+    mode = f"smooth {args.traj_kind}" if args.smooth else "point-to-point"
+
+    # Single move to rest pose. Point-to-point (start pose unknown to the desktop);
+    # skip the log fetch so the next command is sent immediately.
     print("\n--- Moving to rest pose ---")
-    status = cr.move_to_joints(
-        conn, start_deg,
-        duration=args.duration, controller=args.controller,
-        pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-        logger=logger,
-    )
-    # Skip fetch after rest move to avoid long gap with robot PIDs off
-    if status.get("current_deg"):
-        current_deg = np.array(status["current_deg"])
+    do_move(start_deg, smooth=False, fetch=False)
 
     # Per-joint sweeps: each joint sweeps, then move back to start pose before next joint
     for j in range(MAX_JOINTS):
-        print(f"\n--- Joint {j} sweep ({n_waypoints} waypoints) ---")
+        print(f"\n--- Joint {j} sweep ({n_waypoints} waypoints, {mode}) ---")
         for i, offset_deg in enumerate(offsets):
             target = current_deg.copy()
             target[j] = start_deg[j] + offset_deg
             print(f"  [{i+1}/{n_waypoints}] J{j} = {target[j]:.1f}° (offset {offset_deg:+.1f}°)")
-            status = cr.move_to_joints(
-                conn, target,
-                duration=args.duration, controller=args.controller,
-                pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                logger=logger,
-            )
-            cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
-            if status.get("current_deg"):
-                current_deg = np.array(status["current_deg"])
+            do_move(target, smooth=args.smooth)
 
         # Move back to start pose so the next joint starts from the same initial pose
         print(f"  Return to start pose before joint {j+1}...")
-        status = cr.move_to_joints(
-            conn, start_deg,
-            duration=args.duration, controller=args.controller,
-            pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-            logger=logger,
-        )
-        cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
-        current_deg = start_deg.copy()
-        if status.get("current_deg"):
-            current_deg = np.array(status["current_deg"])
+        do_move(start_deg, smooth=args.smooth)
 
     # Phase 2: random poses — joint0 ±10°, joints 1–5 ±30° from rest (start_deg)
     if not args.no_random_poses and args.random_poses > 0:
@@ -205,15 +211,7 @@ def main():
         print(f"\n--- Random poses ({len(random_poses)} poses, J0 ±{JOINT0_RANGE_DEG}°, J1–J5 ±{OTHER_JOINTS_RANGE_DEG}°) ---")
         for i, target in enumerate(random_poses):
             print(f"  [{i+1}/{len(random_poses)}] {target.tolist()}")
-            status = cr.move_to_joints(
-                conn, target,
-                duration=args.duration, controller=args.controller,
-                pos_tol=args.pos_tol, settle_steps=args.settle_steps,
-                logger=logger,
-            )
-            cr._maybe_fetch_robot_log(conn, status, fetch_logs=not args.no_fetch_logs)
-            if status.get("current_deg"):
-                current_deg = np.array(status["current_deg"])
+            do_move(target, smooth=args.smooth)
 
     conn.close()
 
