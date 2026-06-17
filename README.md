@@ -81,6 +81,34 @@ ros2 topic pub --once /mycobot/cmd/move std_msgs/String \
 ros2 service call /mycobot/home std_srvs/srv/Trigger
 ```
 
+### Calibration over ROS 2 (synced-timestamp logging)
+
+`calibrate_ros2.py` runs the `calibrate_perturb.py` sequence **through the
+bridge** and logs command input + robot response on one synchronized clock. For
+each joint it perturbs +/-`step` deg about a measured base pose, returning to
+base between moves: `base -> base[j]+step -> base -> base[j]-step -> base`.
+
+```bash
+python3 calibrate_ros2.py --dry-run                 # print the plan, no motion
+python3 calibrate_ros2.py --quick                   # smoke test: joint 0, +/-5 deg
+python3 calibrate_ros2.py --step-deg 10 --duration 6   # full perturbation set
+```
+
+Output: `logs/calibrate_ros2_<stamp>.jsonl`, one JSON object per line. Commands
+are stamped with the desktop clock; responses (`/joint_states`,
+`/mycobot/status`) with the robot's source time — both on the **same NTP/chrony
+-synced timeline** (`t_sync`):
+
+```json
+{"t_sync": ..., "type": "command",  "label": "J0+5", "target_deg": [...]}
+{"t_sync": ..., "type": "response", "source": "joint_states", "joints_rad": [...]}
+{"t_sync": ..., "type": "response", "source": "status", "current_deg": [...], "error_norm": ...}
+```
+
+> Requires the Pi and desktop clocks to be synced (see `ros2node` chrony setup).
+> The robot must be running `linuxcnc /home/pi/Desktop/mpc/elerob.ini` (the only
+> ini whose HAL starts `robot_hal.py`'s 9998/9999 servers).
+
 **Test without hardware** — `tests/mock_robot_server.py` emulates the 9999/9998
 protocol so the bridge and move scripts can be exercised on any machine:
 
