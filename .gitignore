@@ -3,8 +3,12 @@ figures/
 __pycache__/
 *.pyc
 
-# Log folders (robot + desktop): do not push CSV or other logs to GitHub
-logs/
+# Log folders (robot + desktop): ignore bulk CSV logs, but DO keep the
+# ROS 2 calibration results (synced-timestamp JSONL) in the repo.
+logs/*
+!logs/.gitkeep
+!logs/calibrate_ros2_*.jsonl
+!logs/calibrate_ros2_*.png
 log/
 
 # macOS
