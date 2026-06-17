@@ -77,13 +77,17 @@ class CalibLogger(Node):
     def _write(self, record):
         self._log.write(json.dumps(record) + "\n")
 
-    # --- responses (robot -> ROS), stamped with the robot's source time ---
+    # --- responses (robot -> ROS) ---
+    # t_sync is ALWAYS the desktop clock (the bridge runs here, so every row -
+    # command and response - shares this single clock and is synchronized by
+    # construction). t_robot preserves the Pi's source sample time; once the
+    # Pi/desktop clocks are chrony-synced, t_robot matches t_sync within ~ms.
     def _on_js(self, msg: JointState):
         if not msg.position:
             return
         self._write({
-            "t_sync": round(self._stamp_to_epoch(msg.header.stamp), 6),
-            "t_recv": round(self._now(), 6),
+            "t_sync": round(self._now(), 6),
+            "t_robot": round(self._stamp_to_epoch(msg.header.stamp), 6),
             "type": "response", "source": "joint_states",
             "waypoint": self._wp, "label": self._label,
             "joints_rad": [round(v, 5) for v in msg.position],
