@@ -9,6 +9,8 @@ logs/*
 !logs/.gitkeep
 !logs/calibrate_ros2_*.jsonl
 !logs/calibrate_ros2_*.png
+!logs/servo_char_*.jsonl
+!logs/servo_char_*.png
 log/
 
 # macOS
