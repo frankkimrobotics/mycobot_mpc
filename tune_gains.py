@@ -148,7 +148,11 @@ def main():
     ap.add_argument("--step-deg", type=float, default=20.0)
     ap.add_argument("--duration", type=float, default=6.0)
     ap.add_argument("--base", nargs=MAX_JOINTS, type=float, default=DEFAULT_BASE_DEG)
+    ap.add_argument("--candidates", default=None,
+                    help='JSON list of gain dicts, e.g. \'[{"kp":0.5,"kd":1.0,"ki":0.1}]\'')
     args = ap.parse_args()
+
+    candidates = json.loads(args.candidates) if args.candidates else DEFAULT_CANDIDATES
 
     base = [float(v) for v in args.base]
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -159,8 +163,8 @@ def main():
     node = Tuner(args.joint, out)
     results = []
     try:
-        for i, g in enumerate(DEFAULT_CANDIDATES):
-            node.get_logger().info(f"[{i+1}/{len(DEFAULT_CANDIDATES)}] testing gains {g}")
+        for i, g in enumerate(candidates):
+            node.get_logger().info(f"[{i+1}/{len(candidates)}] testing gains {g}")
             m = node.run_candidate(base, args.step_deg, args.duration, g)
             if m:
                 results.append((g, m, cost_of(m)))

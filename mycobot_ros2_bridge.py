@@ -218,6 +218,9 @@ class MyCobotBridge(Node):
         self._pub_status = self.create_publisher(String, "/mycobot/status", 10)
         # live clock-sync quality: receive_time - robot_sample_time (ms)
         self._pub_offset = self.create_publisher(Float64MultiArray, "/mycobot/clock_offset_ms", 10)
+        # low-level drive feedback (one JointState: position=posfb deg,
+        # velocity=velfb deg/s, effort=torqfb) -> all HAL feedback pins, timestamped
+        self._pub_drive = self.create_publisher(JointState, "/mycobot/drive_feedback", 50)
 
         # subscribers
         self.create_subscription(Float64MultiArray, "/mycobot/cmd/joint_deg", self._on_cmd_deg, 10)
@@ -278,6 +281,18 @@ class MyCobotBridge(Node):
         js_deg.position = [float(d) for d in joints_deg]  # degrees on this topic
         self._pub_js_deg.publish(js_deg)
 
+        # low-level drive feedback pins (posfb/velfb/torqfb) in one timestamped msg
+        posfb = obj.get("posfb")
+        if posfb and len(posfb) == MAX_JOINTS:
+            df = JointState()
+            df.header.stamp = stamp
+            df.name = list(JOINT_NAMES)
+            df.position = [float(v) for v in posfb]                      # deg
+            velfb = obj.get("velfb"); torqfb = obj.get("torqfb")
+            df.velocity = [float(v) for v in velfb] if velfb else []     # deg/s
+            df.effort = [float(v) for v in torqfb] if torqfb else []     # torque
+            self._pub_drive.publish(df)
+
     def _on_status(self, obj):
         msg = String()
         msg.data = json.dumps(obj)
@@ -314,6 +329,10 @@ class MyCobotBridge(Node):
             obj = json.loads(msg.data)
         except json.JSONDecodeError as e:
             self.get_logger().warn(f"cmd/move: bad JSON: {e}")
+            return
+        if "raw_step" in obj:  # low-level servo characterization (PID-bypass step)
+            if self._cmd.send({"raw_step": obj["raw_step"]}):
+                self.get_logger().info(f"cmd/move: raw_step {obj['raw_step']}")
             return
         target = obj.get("target_deg")
         if target is None:
