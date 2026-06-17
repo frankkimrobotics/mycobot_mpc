@@ -109,6 +109,15 @@ are stamped with the desktop clock; responses (`/joint_states`,
 > The robot must be running `linuxcnc /home/pi/Desktop/mpc/elerob.ini` (the only
 > ini whose HAL starts `robot_hal.py`'s 9998/9999 servers).
 
+Plot command vs response from a log:
+
+```bash
+python3 plot_calibrate_ros2.py            # newest log -> logs/<stamp>.png
+```
+
+It overlays each joint's commanded target (step) on the measured response
+(`/joint_states`, converted back to LinuxCNC degrees) against `t_sync`.
+
 **Test without hardware** — `tests/mock_robot_server.py` emulates the 9999/9998
 protocol so the bridge and move scripts can be exercised on any machine:
 
