@@ -284,7 +284,7 @@ class MyCobotBridge(Node):
         self._pub_status.publish(msg)
 
     # ---- outbound commands (ROS topics -> TCP) ----
-    def _send_target(self, target_deg, duration=None, controller=None, source=""):
+    def _send_target(self, target_deg, duration=None, controller=None, gains=None, source=""):
         if len(target_deg) != MAX_JOINTS:
             self.get_logger().warn(f"{source}: expected {MAX_JOINTS} joints, got {len(target_deg)}")
             return
@@ -296,8 +296,11 @@ class MyCobotBridge(Node):
             "duration": float(duration) if duration is not None else self._default_duration,
             "controller": controller or self._default_controller,
         }
+        if gains:  # optional runtime PID gain override for tuning
+            cmd["gains"] = gains
         if self._cmd.send(cmd):
-            self.get_logger().info(f"{source}: -> {[round(v, 1) for v in clamped]} ({cmd['controller']})")
+            extra = f" gains={gains}" if gains else ""
+            self.get_logger().info(f"{source}: -> {[round(v, 1) for v in clamped]} ({cmd['controller']}){extra}")
 
     def _on_cmd_deg(self, msg: Float64MultiArray):
         self._send_target(list(msg.data), source="cmd/joint_deg")
@@ -316,7 +319,8 @@ class MyCobotBridge(Node):
         if target is None:
             self.get_logger().warn("cmd/move: missing target_deg")
             return
-        self._send_target(target, obj.get("duration"), obj.get("controller"), source="cmd/move")
+        self._send_target(target, obj.get("duration"), obj.get("controller"),
+                          gains=obj.get("gains"), source="cmd/move")
 
     def _on_home(self, request, response):
         self._send_target(list(HOME_LINUXCNC_DEG), source="home")
