@@ -37,6 +37,18 @@ wraps those into a ROS 2 node so the arm is a first-class fleet peer — it does
 | `/joint_states` | `sensor_msgs/JointState` | joint angles in URDF **radians** (rviz-ready) |
 | `/mycobot/joint_states_deg` | `sensor_msgs/JointState` | raw LinuxCNC **degrees** |
 | `/mycobot/status` | `std_msgs/String` | controller status JSON (state, error_norm, …) |
+| `/mycobot/clock_offset_ms` | `std_msgs/Float64MultiArray` | live `recv - robot_stamp` (sync quality) |
+
+### Timestamp synchronization
+
+`robot_hal.py` stamps every stream packet with `time.time()` on the Pi. The
+bridge uses **that source time** as the ROS header stamp (`--stamp robot`,
+default) instead of the desktop's receive time, so `/joint_states` reflects when
+the joints were actually sampled — consistent across the whole fleet **as long
+as the Pi and desktop clocks are NTP/chrony-synced**. The bridge publishes and
+logs `recv - robot_stamp` on `/mycobot/clock_offset_ms` so you can watch sync
+quality live (≈ network latency when synced; large/drifting ⇒ clocks not
+synced). Use `--stamp local` to fall back to desktop receive time.
 
 **Subscribed topics / service**
 

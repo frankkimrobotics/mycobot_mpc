@@ -48,6 +48,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
+from builtin_interfaces.msg import Time as TimeMsg
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String, Float64MultiArray
 from std_srvs.srv import Trigger
@@ -64,6 +65,23 @@ from joint_conventions import (
 
 DEFAULT_STREAM_PORT = 9999
 DEFAULT_CMD_PORT = 9998
+
+
+def _epoch_to_stamp(ts):
+    """Unix epoch seconds (float) -> builtin_interfaces/Time.
+
+    robot_hal.py stamps each stream packet with time.time() on the Pi. Using
+    that source time as the ROS header stamp (instead of the desktop's receive
+    time) keeps the timestamp tied to when the joints were actually sampled, so
+    it is consistent across the fleet -- PROVIDED the Pi and desktop clocks are
+    NTP/chrony-synced (see /mycobot/clock_offset_ms logged below).
+    """
+    sec = int(ts)
+    nanosec = int(round((ts - sec) * 1e9))
+    if nanosec >= 1_000_000_000:
+        sec += 1
+        nanosec -= 1_000_000_000
+    return TimeMsg(sec=sec, nanosec=nanosec)
 
 
 def _deg_to_urdf_rad(joints_deg):
@@ -186,15 +204,20 @@ class _LineSocketClient(threading.Thread):
 
 
 class MyCobotBridge(Node):
-    def __init__(self, host, stream_port, cmd_port, default_duration, default_controller):
+    def __init__(self, host, stream_port, cmd_port, default_duration, default_controller,
+                 stamp_source="robot"):
         super().__init__("mycobot_bridge")
         self._default_duration = default_duration
         self._default_controller = default_controller
+        self._stamp_source = stamp_source  # "robot" (synced source time) or "local"
+        self._stream_count = 0
 
         # publishers
         self._pub_js = self.create_publisher(JointState, "/joint_states", 10)
         self._pub_js_deg = self.create_publisher(JointState, "/mycobot/joint_states_deg", 10)
         self._pub_status = self.create_publisher(String, "/mycobot/status", 10)
+        # live clock-sync quality: receive_time - robot_sample_time (ms)
+        self._pub_offset = self.create_publisher(Float64MultiArray, "/mycobot/clock_offset_ms", 10)
 
         # subscribers
         self.create_subscription(Float64MultiArray, "/mycobot/cmd/joint_deg", self._on_cmd_deg, 10)
@@ -220,7 +243,28 @@ class MyCobotBridge(Node):
         joints_deg = obj.get("joints_deg")
         if not joints_deg or len(joints_deg) != MAX_JOINTS:
             return
-        stamp = self.get_clock().now().to_msg()
+
+        now = self.get_clock().now()
+        robot_ts = obj.get("timestamp")
+        # Stamp with the robot's sample time (synced) unless asked for local time
+        # or the packet lacks a timestamp.
+        if self._stamp_source == "robot" and robot_ts is not None:
+            stamp = _epoch_to_stamp(float(robot_ts))
+        else:
+            stamp = now.to_msg()
+
+        # Publish/track the offset between robot stamp and local receive time.
+        # When clocks are synced this is ~network latency; a large/growing value
+        # means the Pi and desktop clocks are NOT in sync.
+        if robot_ts is not None:
+            offset_ms = (now.nanoseconds * 1e-9 - float(robot_ts)) * 1e3
+            self._pub_offset.publish(Float64MultiArray(data=[offset_ms]))
+            self._stream_count += 1
+            if self._stream_count % 250 == 0:  # steady-state, ~every 5 s at 50 Hz
+                self.get_logger().info(
+                    f"clock offset (recv - robot_stamp) = {offset_ms:.2f} ms "
+                    f"[stamp_source={self._stamp_source}]"
+                )
 
         js = JointState()
         js.header.stamp = stamp
@@ -294,11 +338,14 @@ def main():
     p.add_argument("--cmd-port", type=int, default=DEFAULT_CMD_PORT)
     p.add_argument("--duration", type=float, default=2.0, help="Default move duration (s)")
     p.add_argument("--controller", default="pid", choices=["pid", "invdyn", "pd_velff", "mpc"])
+    p.add_argument("--stamp", default="robot", choices=["robot", "local"],
+                   help="Header stamp source: 'robot' = synced sample time from the "
+                        "controller (default), 'local' = desktop receive time")
     args, _ = p.parse_known_args()
 
     rclpy.init()
     node = MyCobotBridge(args.robot_host, args.stream_port, args.cmd_port,
-                         args.duration, args.controller)
+                         args.duration, args.controller, stamp_source=args.stamp)
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
