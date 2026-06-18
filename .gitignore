@@ -24,3 +24,5 @@ log/
 .DS_Store
 !logs/sin_velsweep_*.jsonl
 !logs/sin_velsweep_*.png
+!logs/sin_velsweep_raw_*.jsonl
+!logs/sin_velsweep_traces_*.png

@@ -36,10 +36,12 @@ class SinSweep(Node):
         self._j = joint
         self._pub = self.create_publisher(String, "/mycobot/cmd/move", 10)
         self.create_subscription(JointState, "/mycobot/joint_states_deg", self._on_js, 50)
+        self.create_subscription(JointState, "/mycobot/drive_feedback", self._on_fb, 50)
         self.create_subscription(String, "/mycobot/status", self._on_status, 10)
         self._status = None
         self._collect = False
         self._buf = []
+        self._fb = []   # raw drive feedback: (t, pos[6], vel[6], torq[6])
 
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -53,6 +55,10 @@ class SinSweep(Node):
     def _on_js(self, m):
         if m.position and self._collect:
             self._buf.append((self._now(), m.position[self._j]))
+
+    def _on_fb(self, m):
+        if self._collect and len(m.position) >= MAX_JOINTS:
+            self._fb.append((self._now(), list(m.position), list(m.velocity), list(m.effort)))
 
     def _spin(self, s):
         t0 = time.time()
@@ -90,7 +96,7 @@ class SinSweep(Node):
             if self._pub.get_subscription_count() > 0:
                 break
             rclpy.spin_once(self, timeout_sec=0.1)
-        self._buf = []; self._collect = True
+        self._buf = []; self._fb = []; self._collect = True
         t_send = self._now()
         self._pub.publish(String(data=json.dumps(
             {"target_deg": traj[-1], "trajectory": traj, "traj_dt": traj_dt,
@@ -118,10 +124,15 @@ class SinSweep(Node):
         amp_fit = float(np.hypot(a, b)); phase = float(np.degrees(np.arctan2(-b, a)))
         # use the peak-to-peak amplitude (robust); fall back to fit if pp looks degenerate
         amp_act = amp_pp if amp_pp > 0.1 else amp_fit
+        # raw drive-feedback time-series for this run (all 6 joints), t rel to send
+        fb = [[round(s[0] - t_send, 4),
+               [round(v, 4) for v in s[1]],
+               [round(v, 4) for v in s[2]],
+               [round(v, 5) for v in s[3]]] for s in self._fb]
         return dict(amp_act=amp_act, amp_pct=100 * amp_act / amp,
                     amp_fit=amp_fit, amp_pp=amp_pp,
                     rng_lo=rng_lo, rng_hi=rng_hi, nfit=int(m.sum()),
-                    phase_lag=-phase)
+                    phase_lag=-phase, samples=fb)
 
 
 def main():
@@ -140,6 +151,7 @@ def main():
     lim = JOINT_LIMIT[args.joint]
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out = os.path.join(HERE, "logs", f"sin_velsweep_j{args.joint}_{stamp}.jsonl")
+    raw_out = os.path.join(HERE, "logs", f"sin_velsweep_raw_j{args.joint}_{stamp}.jsonl")
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
     rclpy.init()
@@ -155,12 +167,18 @@ def main():
             if r is None:
                 node.get_logger().warn(f"{pct:.0f}%: no data (fault?) - ABORTING"); break
             r["pct"] = pct; r["vpk"] = vpk
+            r["freq"] = freq; r["amp_cmd"] = args.amplitude; r["joint"] = args.joint
+            samples = r.pop("samples", [])
             rows.append(r)
             node.get_logger().info(f"  amplitude {r['amp_act']:.1f} deg ({r['amp_pct']:.0f}%), "
                                    f"raw range [{r['rng_lo']:+.1f},{r['rng_hi']:+.1f}] deg, "
                                    f"fit {r['amp_fit']:.1f} deg, phase lag {r['phase_lag']:.0f} deg "
-                                   f"(n={r['nfit']})")
+                                   f"(n={r['nfit']}, fb={len(samples)})")
             open(out, "a").write(json.dumps(r) + "\n")
+            # raw time-series for this run: meta + all-joint pos/vel/torq samples
+            open(raw_out, "a").write(json.dumps(
+                {"joint": args.joint, "pct": pct, "vpk": vpk, "freq": freq,
+                 "amp_cmd": args.amplitude, "base": base, "samples": samples}) + "\n")
     finally:
         node.destroy_node()
         if rclpy.ok():
@@ -185,7 +203,7 @@ def main():
     print(f"\n{'%limit':>7}{'peak v':>8}{'amp%':>8}{'phase':>8}")
     for r in rows:
         print(f"{r['pct']:>6.0f}%{r['vpk']:>8.0f}{r['amp_pct']:>8.0f}{r['phase_lag']:>8.0f}")
-    print(f"saved {png}\nlog: {out}")
+    print(f"saved {png}\nlog: {out}\nraw: {raw_out}")
 
 
 if __name__ == "__main__":
