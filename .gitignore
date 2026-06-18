@@ -22,3 +22,5 @@ log/
 
 # macOS
 .DS_Store
+!logs/sin_velsweep_*.jsonl
+!logs/sin_velsweep_*.png
