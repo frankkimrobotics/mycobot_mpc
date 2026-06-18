@@ -16,6 +16,8 @@ logs/*
 !logs/traj_speed_*.jsonl
 !logs/traj_speed_*.png
 !logs/traj_alljoints_*.png
+!logs/sin_controller_*.png
+!logs/sin_controller_*.jsonl
 log/
 
 # macOS
