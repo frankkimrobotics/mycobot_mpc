@@ -111,7 +111,7 @@ class TrajCompare(Node):
             {"target_deg": base, "duration": dur, "controller": "pid", "gains": {"u_max": 6}})))
         self._spin(dur + 2.0)
 
-    def run_profile(self, base, prof_pos, dt, label):
+    def run_profile(self, base, prof_pos, dt, label, vff=1.0, vel_clamp=1000.0):
         target = list(base); target[self._j] = base[self._j] + prof_pos[-1]
         traj = []
         for p in prof_pos:
@@ -122,7 +122,7 @@ class TrajCompare(Node):
         t_send = self._now()
         self._pub.publish(String(data=json.dumps(
             {"target_deg": target, "trajectory": traj, "traj_dt": dt,
-             "controller": "pid", "vff_scale": 1.0, "vel_clamp": 1000.0})))
+             "controller": "pid", "vff_scale": vff, "vel_clamp": vel_clamp})))
         self._spin(len(prof_pos) * dt + 3.5)        # collect through settle
         self._collect = False
         if len(self._fb) < 10:
@@ -155,6 +155,8 @@ def main():
     ap.add_argument("--vmax", type=float, default=25.0, help="peak velocity (deg/s, keep < ~32)")
     ap.add_argument("--dt", type=float, default=0.04)
     ap.add_argument("--base", nargs=MAX_JOINTS, type=float, default=DEFAULT_BASE_DEG)
+    ap.add_argument("--vff", type=float, default=1.0, help="velocity-feedforward gain (0=off)")
+    ap.add_argument("--vel-clamp", type=float, default=1000.0, help="vel_cmd clamp (0=position-only)")
     args = ap.parse_args()
     base = [float(v) for v in args.base]
 
@@ -168,7 +170,7 @@ def main():
     rows = []
     try:
         for pos, lbl in [(sine_pos, "sine"), (sc_pos, "scurve")]:
-            r = node.run_profile(base, pos, args.dt, lbl)
+            r = node.run_profile(base, pos, args.dt, lbl, vff=args.vff, vel_clamp=args.vel_clamp)
             if r is None:
                 node.get_logger().warn(f"{lbl}: no data"); continue
             rows.append(r)
