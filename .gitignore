@@ -15,6 +15,7 @@ logs/*
 !logs/umax_sweep_*.png
 !logs/traj_speed_*.jsonl
 !logs/traj_speed_*.png
+!logs/traj_alljoints_*.png
 log/
 
 # macOS
