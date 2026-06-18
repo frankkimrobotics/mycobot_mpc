@@ -57,10 +57,12 @@ class TrajTest(Node):
         if not msg.position or len(msg.position) <= self._j:
             return
         v = msg.velocity[self._j] if len(msg.velocity) > self._j else 0.0
+        e = msg.effort[self._j] if len(msg.effort) > self._j else 0.0
         p = msg.position[self._j]
         self._log.write(json.dumps({"t_sync": round(self._now(), 6), "type": "drive_feedback",
                                     "tag": self._tag, "joint": self._j,
-                                    "posfb": round(p, 5), "velfb": round(v, 5)}) + "\n")
+                                    "posfb": round(p, 5), "velfb": round(v, 5),
+                                    "torqfb": round(e, 7)}) + "\n")
         if self._collect:
             self._buf.append((self._now(), p, v))
 
@@ -91,6 +93,10 @@ class TrajTest(Node):
         self._send({"target_deg": base, "duration": 6, "controller": "pid", "gains": {"u_max": 8}})
         self._spin(0.4)
         self._buf = []; self._collect = True
+        # mark t=0 (command sent) so responses can be aligned per joint/velocity
+        self._log.write(json.dumps({"t_sync": round(self._now(), 6), "type": "command",
+                                    "tag": tag, "joint": joint, "cmd_V": V,
+                                    "distance_deg": dist, "accel": accel}) + "\n")
         self._send({"traj_move": {"joint": joint, "distance_deg": dist,
                                   "velocity_deg_s": V, "accel_deg_s2": accel}}, timeout=8)
         self._spin(0.3)
