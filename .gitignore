@@ -30,3 +30,5 @@ log/
 !logs/sin_velsweep_velocity_limit.png
 !logs/accel_limit_summary.json
 !logs/maxvel_probe_*.jsonl
+!logs/bspline_vs_sine_*.png
+!logs/bspline_vs_sine_*.json
