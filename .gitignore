@@ -32,3 +32,4 @@ log/
 !logs/maxvel_probe_*.jsonl
 !logs/bspline_vs_sine_*.png
 !logs/bspline_vs_sine_*.json
+!logs/bspline_vs_sine_alljoints.png
