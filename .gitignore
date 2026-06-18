@@ -29,3 +29,4 @@ log/
 !logs/sin_velsweep_accel_limit.png
 !logs/sin_velsweep_velocity_limit.png
 !logs/accel_limit_summary.json
+!logs/maxvel_probe_*.jsonl
