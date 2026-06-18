@@ -38,8 +38,9 @@ PERTURB_LIMIT_DEG = 20.0  # waypoints must stay within this of base, per joint
 
 
 class SinusoidalController(Node):
-    def __init__(self, base, amp, freq, periods, traj_dt, joints):
+    def __init__(self, base, amp, freq, periods, traj_dt, joints, vff_scale=1.0):
         super().__init__("sinusoidal_controller")
+        self.vff_scale = vff_scale
         self.base = [float(v) for v in base]
         # clamp every amplitude to <= 20 deg so |waypoint - base| <= 20
         self.amp = [min(PERTURB_LIMIT_DEG, abs(a)) for a in amp]
@@ -73,7 +74,7 @@ class SinusoidalController(Node):
                 break
             rclpy.spin_once(self, timeout_sec=0.1)
         cmd = {"target_deg": self.base, "trajectory": self.traj,
-               "traj_dt": self.traj_dt, "controller": "pid"}
+               "traj_dt": self.traj_dt, "controller": "pid", "vff_scale": self.vff_scale}
         self.pub_cmd.publish(String(data=json.dumps(cmd)))
         self.get_logger().info(f"sent trajectory ({len(self.traj)} pts) to /mycobot/cmd/move")
 
@@ -100,12 +101,15 @@ def main():
                     help="which joints oscillate (default all)")
     ap.add_argument("--base", nargs=MAX_JOINTS, type=float, default=DEFAULT_BASE_DEG)
     ap.add_argument("--no-send", action="store_true", help="publish waypoints only; do not move the robot")
+    ap.add_argument("--vff-scale", type=float, default=1.0,
+                    help="velocity-feedforward gain (inert: pro600 ctrl mode ignores velocity cmd)")
     args = ap.parse_args()
 
     amp = [args.amplitude if j in args.joints else 0.0 for j in range(MAX_JOINTS)]
 
     rclpy.init()
-    node = SinusoidalController(args.base, amp, args.freq, args.periods, args.traj_dt, args.joints)
+    node = SinusoidalController(args.base, amp, args.freq, args.periods, args.traj_dt, args.joints,
+                                vff_scale=args.vff_scale)
     try:
         if not args.no_send:
             node.send_to_robot()
