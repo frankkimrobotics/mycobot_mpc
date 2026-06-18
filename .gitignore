@@ -11,6 +11,8 @@ logs/*
 !logs/calibrate_ros2_*.png
 !logs/servo_char_*.jsonl
 !logs/servo_char_*.png
+!logs/umax_sweep_*.jsonl
+!logs/umax_sweep_*.png
 log/
 
 # macOS
