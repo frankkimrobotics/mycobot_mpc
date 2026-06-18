@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-traj_speed_test :: does trajectory-style commanding let robot_hal exceed the
-~14 deg/s ceiling while keeping the realtime (2.1 ms) loop?
+traj_speed_test :: per-joint realtime velocity sweep via robot_hal's
+trajectory-style command (advancing pos_cmd + tracking-error vel_cmd).
 
-Commands robot_hal's traj_move mode (smoothly advancing trapezoidal pos_cmd +
-velocity feedforward) on one joint at increasing commanded velocities, and
-measures the achieved peak velfb from /mycobot/drive_feedback. Returns to base
-between, aborts on under-track or fault.
+For each joint, commands traj_move at 20/40/60/80/100 % of the joint's
+configured velocity limit (180 deg/s for J0-J2, 200 for J3-J5) and measures the
+achieved peak velfb. The level where achieved stops tracking the command = that
+joint's realtime ceiling. Returns to base between moves; aborts a joint on
+under-track / suspected fault.
 
 Usage:
-    python3 traj_speed_test.py --joint 0 --distance 20 --vels 30 50 70
+    python3 traj_speed_test.py --joints 0 1 2 3 4 5 --distance 25 --accel 1000
 """
 import argparse
 import json
@@ -26,12 +27,14 @@ from joint_conventions import MAX_JOINTS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BASE_DEG = [0.0, -110.3, 111.4, -90.1, -90.3, 0.0]
+# configured joint velocity limits (deg/s) from elerob.ini
+JOINT_LIMIT = [180.0, 180.0, 180.0, 200.0, 200.0, 200.0]
 
 
 class TrajTest(Node):
-    def __init__(self, joint, log_path):
+    def __init__(self, log_path):
         super().__init__("mycobot_traj_test")
-        self._j = joint
+        self._j = 0
         self._log = open(log_path, "w", buffering=1)
         self._pub = self.create_publisher(String, "/mycobot/cmd/move", 10)
         self.create_subscription(JointState, "/mycobot/drive_feedback", self._on_fb, 200)
@@ -82,13 +85,14 @@ class TrajTest(Node):
             if self._status and self._status.get("state") == "done":
                 return
 
-    def probe(self, base, V, dist, tag):
+    def probe(self, base, joint, V, dist, accel, tag):
+        self._j = joint
         self._tag = tag
         self._send({"target_deg": base, "duration": 6, "controller": "pid", "gains": {"u_max": 8}})
         self._spin(0.4)
         self._buf = []; self._collect = True
-        self._send({"traj_move": {"joint": self._j, "distance_deg": dist,
-                                  "velocity_deg_s": V, "accel_deg_s2": 300}}, timeout=8)
+        self._send({"traj_move": {"joint": joint, "distance_deg": dist,
+                                  "velocity_deg_s": V, "accel_deg_s2": accel}}, timeout=8)
         self._spin(0.3)
         self._collect = False
         arr = np.array(self._buf) if len(self._buf) > 10 else None
@@ -103,43 +107,54 @@ class TrajTest(Node):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Trajectory-style realtime speed test.")
-    ap.add_argument("--joint", type=int, default=0)
-    ap.add_argument("--distance", type=float, default=20.0)
-    ap.add_argument("--vels", type=float, nargs="+", default=[30, 50, 70])
+    ap = argparse.ArgumentParser(description="Per-joint realtime trajectory velocity sweep.")
+    ap.add_argument("--joints", type=int, nargs="+", default=list(range(MAX_JOINTS)))
+    ap.add_argument("--fractions", type=float, nargs="+", default=[0.2, 0.4, 0.6, 0.8, 1.0])
+    ap.add_argument("--distance", type=float, default=25.0)
+    ap.add_argument("--accel", type=float, default=1000.0)
     ap.add_argument("--base", nargs=MAX_JOINTS, type=float, default=DEFAULT_BASE_DEG)
     args = ap.parse_args()
 
     base = [float(v) for v in args.base]
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    out = os.path.join(HERE, "logs", f"traj_speed_j{args.joint}_{stamp}.jsonl")
+    out = os.path.join(HERE, "logs", f"traj_speed_alljoints_{stamp}.jsonl")
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
     rclpy.init()
-    node = TrajTest(args.joint, out)
-    results = []
+    node = TrajTest(out)
+    results = {j: [] for j in args.joints}
     try:
-        for V in args.vels:
-            node.get_logger().info(f"traj_move V_cmd={V} deg/s, {args.distance} deg")
-            r = node.probe(base, V, args.distance, tag=f"v{int(V)}")
-            if r is None:
-                node.get_logger().warn(f"V={V}: no data (fault?) - ABORTING")
-                break
-            results.append(r)
-            node.get_logger().info(f"  commanded {V:.0f} -> achieved peak {r['peak_velfb']:.1f} deg/s "
-                                   f"(moved {r['moved']:.1f} deg)")
-            if abs(r["moved"]) < 0.5 * args.distance:
-                node.get_logger().warn("  under-tracked - ABORTING"); break
+        for j in args.joints:
+            lim = JOINT_LIMIT[j]
+            node.get_logger().info(f"=== joint {j}  (limit {lim:.0f} deg/s) ===")
+            for f in args.fractions:
+                V = round(f * lim, 1)
+                r = node.probe(base, j, V, args.distance, args.accel, tag=f"j{j}_{int(f*100)}pct")
+                if r is None:
+                    node.get_logger().warn(f"J{j} {int(f*100)}%: no data (fault?) - skipping joint")
+                    break
+                r["frac"] = f; r["limit"] = lim
+                results[j].append(r)
+                node.get_logger().info(f"  J{j} {int(f*100)}%: cmd {V:.0f} -> achieved {r['peak_velfb']:.1f} "
+                                       f"deg/s (moved {r['moved']:.1f})")
+                if abs(r["moved"]) < 0.4 * args.distance:
+                    node.get_logger().warn(f"  J{j}: under-tracked - stopping this joint"); break
     finally:
         node.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
-    print(f"\n=== trajectory-style realtime speed test: joint {args.joint}, {args.distance:.0f} deg ===")
-    print(f"{'cmd V':>8}{'peak velfb':>12}{'moved':>8}   (robot_hal ceiling was ~14 deg/s)")
-    for r in results:
-        print(f"{r['cmd_V']:>8.0f}{r['peak_velfb']:>12.1f}{r['moved']:>8.1f}")
+    print(f"\n=== per-joint realtime trajectory velocity (25 deg move, accel {args.accel:.0f}) ===")
+    print(f"{'joint':>6}{'limit':>7}{'20%':>8}{'40%':>8}{'60%':>8}{'80%':>8}{'100%':>8}   peak")
+    for j in sorted(results):
+        rs = results[j]
+        if not rs:
+            continue
+        ach = {round(r["frac"], 2): r["peak_velfb"] for r in rs}
+        row = "".join(f"{ach.get(f, float('nan')):>8.0f}" for f in [0.2, 0.4, 0.6, 0.8, 1.0])
+        peak = max(r["peak_velfb"] for r in rs)
+        print(f"{('J'+str(j)):>6}{JOINT_LIMIT[j]:>7.0f}{row}   {peak:.0f}")
     print(f"log: {out}")
 
 
