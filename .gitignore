@@ -13,6 +13,8 @@ logs/*
 !logs/servo_char_*.png
 !logs/umax_sweep_*.jsonl
 !logs/umax_sweep_*.png
+!logs/traj_speed_*.jsonl
+!logs/traj_speed_*.png
 log/
 
 # macOS
