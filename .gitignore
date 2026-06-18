@@ -26,3 +26,6 @@ log/
 !logs/sin_velsweep_*.png
 !logs/sin_velsweep_raw_*.jsonl
 !logs/sin_velsweep_traces_*.png
+!logs/sin_velsweep_accel_limit.png
+!logs/sin_velsweep_velocity_limit.png
+!logs/accel_limit_summary.json
