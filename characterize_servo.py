@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-characterize_servo :: low-level (drive) step-response characterization.
+characterize_servo :: low-level (drive) velocity-loop step characterization.
 
-Commands a direct position-command STEP on one joint with the Python PID
-*bypassed* (robot_hal.py raw_step mode), so what's measured is the servo
-drive's own closed-loop response. Records all HAL feedback pins from
-/mycobot/drive_feedback (position=posfb deg, velocity=velfb deg/s,
-effort=torqfb) under the synchronized clock, then fits step metrics:
+The myCobot drives are velocity-commanded (a direct pos_cmd with vel_cmd=0 does
+not move them). A normal PID move saturates the velocity command, so the rising
+edge of velfb is the drive's velocity-loop step response.
 
-  * rise time (10->90%)   * overshoot %   * settling time (2%)
-  * estimated bandwidth   omega_n ~= 1.8 / t_rise  (rad/s),  f ~= omega_n/2pi
+For each requested joint this script: moves the FULL arm to the default base
+pose (calibrate_perturb pose), perturbs ONE joint by +amp (clamped to +/-25 deg
+and the soft limits, all other joints held at base), captures all HAL feedback
+pins from /mycobot/drive_feedback (posfb/velfb/torqfb) at ~100 Hz on the synced
+clock, then RETURNS the joint to base. Fits per joint:
 
-Log -> logs/servo_char_<stamp>.jsonl. Use small amplitudes (1-3 deg).
+  * velocity-loop rise (10->90%) -> bandwidth  BW ~= 0.35 / t_rise
+  * peak/plateau velocity, peak torque, position move
+
+Log -> logs/servo_char_<stamp>.jsonl  (one run, all joints).
 
 Usage:
-    python3 characterize_servo.py --joint 0 --amplitude 2 --hold 2.5
+    python3 characterize_servo.py --joints 1 2 3 4 5 --amplitude 15
 """
 import argparse
 import json
@@ -27,22 +31,24 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
-from joint_conventions import MAX_JOINTS
+from joint_conventions import MAX_JOINTS, LINUXCNC_SOFT_LIMITS_DEG
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_BASE_DEG = [0.0, -110.3, 111.4, -90.1, -90.3, 0.0]
+PERTURB_LIMIT_DEG = 25.0
 
 
 class ServoChar(Node):
-    def __init__(self, joint, log_path):
+    def __init__(self, log_path):
         super().__init__("mycobot_servo_char")
-        self._j = joint
+        self._j = 0
         self._log = open(log_path, "w", buffering=1)
         self._pub = self.create_publisher(String, "/mycobot/cmd/move", 10)
         self.create_subscription(JointState, "/mycobot/drive_feedback", self._on_fb, 200)
         self.create_subscription(String, "/mycobot/status", self._on_status, 10)
         self._status = None
         self._collect = False
-        self._buf = []  # (t, posfb, velfb, torqfb) for the joint
+        self._buf = []
 
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -65,98 +71,120 @@ class ServoChar(Node):
         if self._collect:
             self._buf.append((rec["t_sync"], p, v, e))
 
-    def run_step(self, amp, hold, settle):
-        spec = {"joint": self._j, "amplitude_deg": amp, "hold_sec": hold,
-                "settle_sec": settle, "pre_sec": 0.5}
-        self._log.write(json.dumps({"t_sync": round(self._now(), 6), "type": "command",
-                                    "raw_step": spec}) + "\n")
-        m = String(); m.data = json.dumps({"raw_step": spec})
+    def _spin(self, secs):
+        t0 = time.time()
+        while rclpy.ok() and time.time() - t0 < secs:
+            rclpy.spin_once(self, timeout_sec=0.02)
+
+    def _move(self, target, duration):
+        """Publish a move and wait for status 'done' (or timeout)."""
+        cmd = {"target_deg": [float(v) for v in target], "duration": float(duration),
+               "controller": "pid"}
+        self._log.write(json.dumps({"t_sync": round(self._now(), 6), "type": "command", **cmd}) + "\n")
+        m = String(); m.data = json.dumps(cmd)
         for _ in range(30):
             if self._pub.get_subscription_count() > 0:
                 break
             rclpy.spin_once(self, timeout_sec=0.1)
-        self._buf = []
-        self._collect = True
+        self._status = None
         self._pub.publish(m)
-        # collect through the whole raw_step (pre + hold + settle + margin)
-        deadline = time.time() + 0.5 + hold + settle + 2.0
+        deadline = time.time() + duration + 3.0
         while rclpy.ok() and time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.02)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if self._status and self._status.get("state") == "done":
+                return
+
+    def characterize_joint(self, base, j, amp, step_dur, base_dur=6.0):
+        self._j = j
+        self._move(base, base_dur)      # ensure at base
+        self._spin(0.8)                 # settle
+        self._buf = []                  # clean capture window
+        self._collect = True
+        target = list(base); target[j] = base[j] + amp
+        self._move(target, step_dur)    # capture the step
+        self._spin(0.3)
         self._collect = False
-        return np.array(self._buf) if len(self._buf) > 10 else None
+        arr = np.array(self._buf) if len(self._buf) > 20 else None
+        self._move(base, base_dur)      # ALWAYS return to base
+        return arr
 
     def close(self):
         self._log.close()
 
 
-def step_metrics(t, y):
-    """t (s), y posfb; auto-detects the step from the baseline pre-hold."""
+def velocity_loop_metrics(t, vel, pos, torq):
     t = t - t[0]
-    y0 = float(np.median(y[t < 0.4]))            # baseline before step
-    yf = float(np.median(y[(t > t[-1] - 0.6) & (t < t[-1] - 0.1)]))  # before return... use plateau
-    # plateau = the held-step region: take median of the middle third
-    mid = y[(t > 0.6) & (t < 0.6 + (t[-1] - 0.6) * 0.5)]
-    plateau = float(np.median(mid)) if len(mid) else yf
-    step = plateau - y0
-    if abs(step) < 0.05:
+    av = np.abs(vel)
+    peak_v = float(np.max(av))
+    if peak_v < 1.0:
         return None
-    # restrict to the rising window: from step command (~0.5s) to plateau
-    win = (t >= 0.5)
-    tw, yw = t[win] - 0.5, y[win]
-    # normalize
-    yn = (yw - y0) / step
-    # rise 10->90%
-    def crossing(frac):
-        idx = np.where(yn >= frac)[0]
-        return float(tw[idx[0]]) if len(idx) else float("nan")
-    t10, t90 = crossing(0.1), crossing(0.9)
+    sign = 1.0 if np.max(vel) >= abs(np.min(vel)) else -1.0
+    sv = vel * sign
+    start_idx = int(np.argmax(av > 0.1 * peak_v))
+    t0 = t[start_idx]
+    cruise = sv[sv > 0.8 * peak_v]
+    plateau = float(np.median(cruise)) if len(cruise) else peak_v
+
+    def cross(frac):
+        thr = frac * plateau
+        idx = np.where((t >= t0) & (sv >= thr))[0]
+        return float(t[idx[0]]) if len(idx) else float("nan")
+    t10, t90 = cross(0.1), cross(0.9)
     rise = t90 - t10 if np.isfinite(t10) and np.isfinite(t90) else float("nan")
-    peak = float(np.max(yn[tw < (tw[-1] * 0.6)])) if len(yn) else 1.0
-    overshoot = max(0.0, (peak - 1.0)) * 100.0
-    band = 0.02
-    outside = np.abs(yn - 1.0) > band
-    settle = float(tw[np.where(outside & (tw < tw[-1] * 0.7))[0][-1]]) if outside.any() else 0.0
-    wn = (1.8 / rise) if rise and np.isfinite(rise) and rise > 0 else float("nan")
-    return dict(step_deg=step, rise_s=rise, overshoot_pct=overshoot, settling_s=settle,
-                omega_n_rad_s=wn, bw_hz=(wn / (2 * np.pi) if np.isfinite(wn) else float("nan")))
+    bw = (0.35 / rise) if rise and np.isfinite(rise) and rise > 0 else float("nan")
+    return dict(peak_vel_deg_s=peak_v, plateau_vel_deg_s=plateau, vel_rise_s=rise,
+                vel_bw_hz=bw, peak_torque=float(np.max(np.abs(torq))),
+                pos_move_deg=float(pos[-1] - pos[0]))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Low-level servo step/bandwidth characterization.")
-    ap.add_argument("--joint", type=int, default=0)
-    ap.add_argument("--amplitude", type=float, default=2.0, help="step size (deg), keep small")
-    ap.add_argument("--hold", type=float, default=2.5)
-    ap.add_argument("--settle", type=float, default=2.0)
+    ap = argparse.ArgumentParser(description="Low-level velocity-loop step characterization (per joint).")
+    ap.add_argument("--joints", type=int, nargs="+", default=[0])
+    ap.add_argument("--amplitude", type=float, default=15.0, help="step (deg), clamped to +/-25 + soft limits")
+    ap.add_argument("--duration", type=float, default=4.0)
+    ap.add_argument("--base", nargs=MAX_JOINTS, type=float, default=DEFAULT_BASE_DEG)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    base = [float(v) for v in args.base]
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    out = args.out or os.path.join(HERE, "logs", f"servo_char_j{args.joint}_{stamp}.jsonl")
+    out = args.out or os.path.join(HERE, "logs", f"servo_char_{stamp}.jsonl")
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
     rclpy.init()
-    node = ServoChar(args.joint, out)
+    node = ServoChar(out)
+    results = {}
     try:
-        node.get_logger().info(f"raw step: joint {args.joint}, {args.amplitude} deg")
-        arr = node.run_step(args.amplitude, args.hold, args.settle)
+        for j in args.joints:
+            amp = max(-PERTURB_LIMIT_DEG, min(PERTURB_LIMIT_DEG, args.amplitude))
+            lo, hi = LINUXCNC_SOFT_LIMITS_DEG[j]
+            amp = max(lo, min(hi, base[j] + amp)) - base[j]
+            node.get_logger().info(f"joint {j}: step {amp:+.1f} deg from base")
+            arr = node.characterize_joint(base, j, amp, args.duration)
+            if arr is None:
+                node.get_logger().warn(f"joint {j}: insufficient feedback")
+                continue
+            m = velocity_loop_metrics(arr[:, 0], arr[:, 2], arr[:, 1], arr[:, 3])
+            if m:
+                m["amp_deg"] = amp
+                results[j] = m
+                node.get_logger().info(
+                    f"  J{j}: plateau {m['plateau_vel_deg_s']:.1f} deg/s, rise "
+                    f"{m['vel_rise_s']*1e3:.0f} ms, BW~{m['vel_bw_hz']:.1f} Hz, "
+                    f"peak torq {m['peak_torque']:.3f}")
+                node._log.write(json.dumps({"type": "metrics", "joint": j, **m}) + "\n")
     finally:
         node.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
-    if arr is None:
-        print("no/insufficient feedback captured")
-        return
-    m = step_metrics(arr[:, 0], arr[:, 1])
-    print(f"\n=== servo step response: joint {args.joint}, {args.amplitude} deg ===")
-    if m:
-        print(f"  rise (10-90%) : {m['rise_s']*1e3:7.1f} ms")
-        print(f"  overshoot     : {m['overshoot_pct']:7.1f} %")
-        print(f"  settling (2%) : {m['settling_s']*1e3:7.1f} ms")
-        print(f"  bandwidth est : {m['bw_hz']:7.2f} Hz  (omega_n ~= {m['omega_n_rad_s']:.1f} rad/s)")
-        with open(out, "a") as f:
-            f.write(json.dumps({"type": "metrics", "joint": args.joint, **m}) + "\n")
+    print(f"\n=== velocity-loop step response per joint ({args.amplitude:.0f} deg) ===")
+    print(f"{'joint':>6}{'plateau v':>11}{'rise ms':>9}{'BW Hz':>8}{'pk torq':>9}{'move deg':>9}")
+    for j in sorted(results):
+        m = results[j]
+        print(f"{('J'+str(j)):>6}{m['plateau_vel_deg_s']:>11.1f}{m['vel_rise_s']*1e3:>9.0f}"
+              f"{m['vel_bw_hz']:>8.1f}{m['peak_torque']:>9.4f}{m['pos_move_deg']:>9.2f}")
     print(f"log: {out}")
 
 

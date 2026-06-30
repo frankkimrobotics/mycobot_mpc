@@ -9,7 +9,27 @@ logs/*
 !logs/.gitkeep
 !logs/calibrate_ros2_*.jsonl
 !logs/calibrate_ros2_*.png
+!logs/servo_char_*.jsonl
+!logs/servo_char_*.png
+!logs/umax_sweep_*.jsonl
+!logs/umax_sweep_*.png
+!logs/traj_speed_*.jsonl
+!logs/traj_speed_*.png
+!logs/traj_alljoints_*.png
+!logs/sin_controller_*.png
+!logs/sin_controller_*.jsonl
 log/
 
 # macOS
 .DS_Store
+!logs/sin_velsweep_*.jsonl
+!logs/sin_velsweep_*.png
+!logs/sin_velsweep_raw_*.jsonl
+!logs/sin_velsweep_traces_*.png
+!logs/sin_velsweep_accel_limit.png
+!logs/sin_velsweep_velocity_limit.png
+!logs/accel_limit_summary.json
+!logs/maxvel_probe_*.jsonl
+!logs/bspline_vs_sine_*.png
+!logs/bspline_vs_sine_*.json
+!logs/bspline_vs_sine_alljoints.png

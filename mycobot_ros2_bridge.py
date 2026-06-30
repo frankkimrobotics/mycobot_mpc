@@ -334,6 +334,23 @@ class MyCobotBridge(Node):
             if self._cmd.send({"raw_step": obj["raw_step"]}):
                 self.get_logger().info(f"cmd/move: raw_step {obj['raw_step']}")
             return
+        if "vel_probe" in obj:  # max-velocity probe (ramp pos_cmd at commanded V)
+            if self._cmd.send({"vel_probe": obj["vel_probe"]}):
+                self.get_logger().info(f"cmd/move: vel_probe {obj['vel_probe']}")
+            return
+        if "traj_move" in obj:  # trajectory-style realtime move (advancing pos + vel ff)
+            if self._cmd.send({"traj_move": obj["traj_move"]}):
+                self.get_logger().info(f"cmd/move: traj_move {obj['traj_move']}")
+            return
+        if "trajectory" in obj:  # time-sampled joint trajectory (robot_hal tracks it)
+            traj = obj["trajectory"]; tdt = obj.get("traj_dt")
+            tgt = obj.get("target_deg") or (traj[-1] if traj else None)
+            if traj and tdt and tgt:
+                cmd = {"target_deg": [float(v) for v in tgt], "trajectory": traj,
+                       "traj_dt": float(tdt), "controller": obj.get("controller", "pid")}
+                if self._cmd.send(cmd):
+                    self.get_logger().info(f"cmd/move: trajectory ({len(traj)} pts, dt={tdt}s)")
+            return
         target = obj.get("target_deg")
         if target is None:
             self.get_logger().warn("cmd/move: missing target_deg")
