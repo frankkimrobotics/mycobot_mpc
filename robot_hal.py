@@ -392,7 +392,12 @@ def _stream_server_thread(port, rate_hz):
         except (RuntimeError, OSError):
             time.sleep(1.0)
             continue
-        msg = json.dumps({"joints_deg": joints_deg, "timestamp": time.time()}) + "\n"
+        try:
+            _, torq = _read_hal_feedback()               # per-joint torque feedback (pro600.joint{i}_torqfb)
+        except Exception:
+            torq = [0.0] * MAX_JOINTS
+        msg = json.dumps({"joints_deg": joints_deg, "torque": [round(t, 4) for t in torq],
+                          "timestamp": time.time()}) + "\n"
         dead = []
         with clients_lock:
             for conn in clients:

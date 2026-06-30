@@ -1,0 +1,604 @@
+# core HAL config file for simulation - 6 axis
+
+# load RT modules
+loadrt pandakins
+
+loadrt [EMCMOT]EMCMOT servo_period_nsec=[EMCMOT]SERVO_PERIOD traj_period_nsec=[EMCMOT]TRAJ_PERIOD num_joints=[KINS]JOINTS num_dio=64 num_aio=64
+# "slow-thread" now runs at 4 ms (was 20 ms). The PID + pro_socketcan (CAN->STM32) are
+# addf'd here, so the drive command rate matches the 4 ms ctrl loop (period_ms=4) instead of
+# being downsampled to 50 Hz. The HAL link is ~2.1 ms/exchange (README) so 4 ms has margin.
+# STAGED ROLLOUT: currently 10000000 (10 ms, safe 2x from the old 20 ms). Verify NO CAN-overrun
+# / following-error faults, then drop to 4000000 (4 ms) for full speed. Keep
+# pro600.motor_time_interval (below) matched to this period in ms (10 here, 4 at full speed).
+loadrt threads name1=slow-thread period1=10000000
+loadrt ddt count=12
+loadrt or2 count=1
+loadrt pid num_chan=6
+loadrt mux_generic config="ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2"
+
+#motor update
+loadrt hal_ele_master600
+loadrt collidet_panda
+# Copy logs/invdyn_params.npz (from identify_invdyn_from_log.py) to Raspi logs/ for model-based invdyn
+loadusr -Wn ctrl python /home/pi/Desktop/mpc/online_servo.py
+
+# add motion controller functions to servo thread
+addf motion-command-handler servo-thread
+addf motion-controller servo-thread
+addf mux-gen.00 servo-thread
+addf mux-gen.01 servo-thread
+addf mux-gen.02 servo-thread
+addf mux-gen.03 servo-thread
+addf mux-gen.04 servo-thread
+addf mux-gen.05 servo-thread
+addf mux-gen.06 servo-thread
+addf mux-gen.07 servo-thread
+addf mux-gen.08 servo-thread
+addf mux-gen.09 servo-thread
+addf mux-gen.10 servo-thread
+addf mux-gen.11 servo-thread
+
+addf pid.0.do-pid-calcs slow-thread
+addf pid.1.do-pid-calcs slow-thread
+addf pid.2.do-pid-calcs slow-thread
+addf pid.3.do-pid-calcs slow-thread
+addf pid.4.do-pid-calcs slow-thread
+addf pid.5.do-pid-calcs slow-thread
+
+##addf siggen.0.update servo-thread
+addf ddt.0 servo-thread
+addf ddt.1 servo-thread
+addf ddt.2 servo-thread
+addf ddt.3 servo-thread
+addf ddt.4 servo-thread
+addf ddt.5 servo-thread
+addf ddt.6 servo-thread
+addf ddt.7 servo-thread
+addf ddt.8 servo-thread
+addf ddt.9 servo-thread
+addf ddt.10 servo-thread
+addf ddt.11 servo-thread
+
+addf or2.0 servo-thread
+
+addf pro_socketcan.update slow-thread
+#addf pro_serial.update serial-thread
+
+#Robot ID
+#Elephant5 ID: 101
+#Panda3 ID:    201
+#Panda5 ID:    202
+#Cat3 ID:      301
+# Pro600: 502
+# Pro630: 503
+setp motion.analog-in-55 503
+
+setp pro600.motor_time_interval 10  # match the thread period in ms (was 20; set 4 at full speed)
+
+setp pid.0.Pgain     60
+setp pid.0.Igain     0
+setp pid.0.Dgain     0.01
+setp pid.0.bias      0
+setp pid.0.FF0       0
+setp pid.0.FF1       0
+setp pid.0.FF2       0
+setp pid.0.deadband  0.0001
+setp pid.0.maxoutput 2800
+
+setp pid.1.Pgain     50
+setp pid.1.Igain     0
+setp pid.1.Dgain     0.01
+setp pid.1.bias      0
+setp pid.1.FF0       0
+setp pid.1.FF1       0
+setp pid.1.FF2       0
+setp pid.1.deadband  0.0001
+setp pid.1.maxoutput 2800
+
+setp pid.2.Pgain     60
+setp pid.2.Igain     0
+setp pid.2.Dgain     0.01
+setp pid.2.bias      0
+setp pid.2.FF0       0
+setp pid.2.FF1       0
+setp pid.2.FF2       0
+setp pid.2.deadband  0.0001
+setp pid.2.maxoutput 2800
+
+setp pid.3.Pgain     60
+setp pid.3.Igain     0
+setp pid.3.Dgain     0.01
+setp pid.3.bias      0
+setp pid.3.FF0       0
+setp pid.3.FF1       0
+setp pid.3.FF2       0
+setp pid.3.deadband  0.0001
+setp pid.3.maxoutput 2800
+
+setp pid.4.Pgain     60
+setp pid.4.Igain     0
+setp pid.4.Dgain     0.01
+setp pid.4.bias      0
+setp pid.4.FF0       0
+setp pid.4.FF1       0
+setp pid.4.FF2       0
+setp pid.4.deadband  0.0001
+setp pid.4.maxoutput 2800
+
+setp pid.5.Pgain     60
+setp pid.5.Igain     0
+setp pid.5.Dgain     0.01
+setp pid.5.bias      0
+setp pid.5.FF0       0
+setp pid.5.FF1       0
+setp pid.5.FF2       0
+setp pid.5.deadband  0.0001
+setp pid.5.maxoutput 2800
+
+# Pro630
+setp pandakins.D1 205
+setp pandakins.A2 269
+setp pandakins.A3 266
+setp pandakins.D4 88
+setp pandakins.D5 95
+setp pandakins.D6 53
+
+setp pandakins.singularthr 100000
+
+# joint_polarity
+setp pro600.joint0_pos_polarity 1
+setp pro600.joint1_pos_polarity 1
+setp pro600.joint2_pos_polarity 1
+setp pro600.joint3_pos_polarity 1
+setp pro600.joint4_pos_polarity 1
+setp pro600.joint5_pos_polarity 1
+
+# enc_scale = 360/(524288*100)
+setp pro600.joint0_enc_scale 0.0000068665
+setp pro600.joint1_enc_scale 0.0000068665
+setp pro600.joint2_enc_scale -0.0000068665
+setp pro600.joint3_enc_scale -0.0000068665
+setp pro600.joint4_enc_scale -0.0000068665
+setp pro600.joint5_enc_scale -0.0000068665
+
+# vel_scale = 524288*0.001/60
+setp pro600.joint0_vel_scale 8.7381333333
+setp pro600.joint1_vel_scale 8.7381333333
+setp pro600.joint2_vel_scale -8.7381333333
+setp pro600.joint3_vel_scale -8.7381333333
+setp pro600.joint4_vel_scale -8.7381333333
+setp pro600.joint5_vel_scale -8.7381333333
+
+# velocity feedback
+setp pro600.joint0_vel_enc_scale 0.0068849
+setp pro600.joint1_vel_enc_scale 0.0068849
+setp pro600.joint2_vel_enc_scale -0.0068849
+setp pro600.joint3_vel_enc_scale -0.0068849
+setp pro600.joint4_vel_enc_scale -0.0068849
+setp pro600.joint5_vel_enc_scale -0.0068849
+
+#2024/03/21-002#
+setp pro600.joint0_home_offset 7379.277053
+setp pro600.joint1_home_offset 7288.683530
+setp pro600.joint2_home_offset -7392.865902
+setp pro600.joint3_home_offset -7481.763784
+setp pro600.joint4_home_offset -7356.179346
+setp pro600.joint5_home_offset -7365.860644
+
+# 512*524288 = 512rpm
+#setp pro600.motor_accelaration 268435456
+setp pro600.motor_accelaration  2097152
+
+# MPC bypass: mux_generic switches between motion (in0) and mpc (in1) when ctrl.enable=1 (sel-bit-00=TRUE)
+net sig0-mot-pos-cmd joint.0.motor-pos-cmd => mux-gen.00.in-float-00
+net ctrl-j0-cmd ctrl.joint0_pos_cmd => mux-gen.00.in-float-01
+net ctrl-enable ctrl.enable => mux-gen.00.sel-bit-00
+net pid0-cmd mux-gen.00.out-float => pid.0.command pro600.joint0_motor_poscmd colli.qCmdVec.00
+
+net sig1-mot-pos-cmd joint.1.motor-pos-cmd => mux-gen.01.in-float-00
+net ctrl-j1-cmd ctrl.joint1_pos_cmd => mux-gen.01.in-float-01
+net ctrl-enable => mux-gen.01.sel-bit-00
+net pid1-cmd mux-gen.01.out-float => pid.1.command pro600.joint1_motor_poscmd colli.qCmdVec.01
+
+net sig2-mot-pos-cmd joint.2.motor-pos-cmd => mux-gen.02.in-float-00
+net ctrl-j2-cmd ctrl.joint2_pos_cmd => mux-gen.02.in-float-01
+net ctrl-enable => mux-gen.02.sel-bit-00
+net pid2-cmd mux-gen.02.out-float => pid.2.command pro600.joint2_motor_poscmd colli.qCmdVec.02
+
+net sig3-mot-pos-cmd joint.3.motor-pos-cmd => mux-gen.03.in-float-00
+net ctrl-j3-cmd ctrl.joint3_pos_cmd => mux-gen.03.in-float-01
+net ctrl-enable => mux-gen.03.sel-bit-00
+net pid3-cmd mux-gen.03.out-float => pid.3.command pro600.joint3_motor_poscmd colli.qCmdVec.03
+
+net sig4-mot-pos-cmd joint.4.motor-pos-cmd => mux-gen.04.in-float-00
+net ctrl-j4-cmd ctrl.joint4_pos_cmd => mux-gen.04.in-float-01
+net ctrl-enable => mux-gen.04.sel-bit-00
+net pid4-cmd mux-gen.04.out-float => pid.4.command pro600.joint4_motor_poscmd colli.qCmdVec.04
+
+net sig5-mot-pos-cmd joint.5.motor-pos-cmd => mux-gen.05.in-float-00
+net ctrl-j5-cmd ctrl.joint5_pos_cmd => mux-gen.05.in-float-01
+net ctrl-enable => mux-gen.05.sel-bit-00
+net pid5-cmd mux-gen.05.out-float => pid.5.command pro600.joint5_motor_poscmd colli.qCmdVec.05
+
+
+# Velocity mux: select between PID output (in0, normal) and ctrl velocity (in1, ctrl active)
+# When ctrl.enable=FALSE: pro600 gets PID velocity (normal servo loop)
+# When ctrl.enable=TRUE:  pro600 gets ctrl velocity directly (robot_hal has full control)
+# Note: pro600 exposes joint*_torqfb (torque feedback) only; no torque command pins are
+# wired. Commands are position (pid.command / joint*_motor_poscmd) and velocity (joint*_poscmd).
+net sig0-vel-cmd pid.0.output => mux-gen.06.in-float-00
+net ctrl-j0-vel ctrl.joint0_vel_cmd => mux-gen.06.in-float-01
+net ctrl-enable => mux-gen.06.sel-bit-00
+net vel0-out mux-gen.06.out-float => pro600.joint0_poscmd
+
+net sig1-vel-cmd pid.1.output => mux-gen.07.in-float-00
+net ctrl-j1-vel ctrl.joint1_vel_cmd => mux-gen.07.in-float-01
+net ctrl-enable => mux-gen.07.sel-bit-00
+net vel1-out mux-gen.07.out-float => pro600.joint1_poscmd
+
+net sig2-vel-cmd pid.2.output => mux-gen.08.in-float-00
+net ctrl-j2-vel ctrl.joint2_vel_cmd => mux-gen.08.in-float-01
+net ctrl-enable => mux-gen.08.sel-bit-00
+net vel2-out mux-gen.08.out-float => pro600.joint2_poscmd
+
+net sig3-vel-cmd pid.3.output => mux-gen.09.in-float-00
+net ctrl-j3-vel ctrl.joint3_vel_cmd => mux-gen.09.in-float-01
+net ctrl-enable => mux-gen.09.sel-bit-00
+net vel3-out mux-gen.09.out-float => pro600.joint3_poscmd
+
+net sig4-vel-cmd pid.4.output => mux-gen.10.in-float-00
+net ctrl-j4-vel ctrl.joint4_vel_cmd => mux-gen.10.in-float-01
+net ctrl-enable => mux-gen.10.sel-bit-00
+net vel4-out mux-gen.10.out-float => pro600.joint4_poscmd
+
+net sig5-vel-cmd pid.5.output => mux-gen.11.in-float-00
+net ctrl-j5-vel ctrl.joint5_vel_cmd => mux-gen.11.in-float-01
+net ctrl-enable => mux-gen.11.sel-bit-00
+net vel5-out mux-gen.11.out-float => pro600.joint5_poscmd
+
+
+# loop position commands back to motion module feedback
+net J0posfb pro600.joint0_posfb => joint.0.motor-pos-fb pid.0.feedback
+net J1posfb pro600.joint1_posfb => joint.1.motor-pos-fb pid.1.feedback
+net J2posfb pro600.joint2_posfb => joint.2.motor-pos-fb pid.2.feedback
+net J3posfb pro600.joint3_posfb => joint.3.motor-pos-fb pid.3.feedback
+net J4posfb pro600.joint4_posfb => joint.4.motor-pos-fb pid.4.feedback
+net J5posfb pro600.joint5_posfb => joint.5.motor-pos-fb pid.5.feedback
+
+###############################joint limit##########################
+net J1PosLim joint.0.pos-limit => pro600.joint0_pos_lim
+net J1NegLim joint.0.neg-limit => pro600.joint0_neg_lim
+net J2PosLim joint.1.pos-limit => pro600.joint1_pos_lim
+net J2NegLim joint.1.neg-limit => pro600.joint1_neg_lim
+net J3PosLim joint.2.pos-limit => pro600.joint2_pos_lim
+net J3NegLim joint.2.neg-limit => pro600.joint2_neg_lim
+net J4PosLim joint.3.pos-limit => pro600.joint3_pos_lim
+net J4NegLim joint.3.neg-limit => pro600.joint3_neg_lim
+net J5PosLim joint.4.pos-limit => pro600.joint4_pos_lim
+net J5NegLim joint.4.neg-limit => pro600.joint4_neg_lim
+net J6PosLim joint.5.pos-limit => pro600.joint5_pos_lim
+net J6NegLim joint.5.neg-limit => pro600.joint5_neg_lim
+
+
+##########################Torque##################################
+setp pro600.joint0_rated_torq 1.86
+setp pro600.joint1_rated_torq 1.86
+setp pro600.joint2_rated_torq 1.86
+setp pro600.joint3_rated_torq 0.5
+setp pro600.joint4_rated_torq 0.5
+setp pro600.joint5_rated_torq 0.5
+
+setp pro600.joint0_torque_scale -57676.0563381
+setp pro600.joint1_torque_scale -57676.0563381
+setp pro600.joint2_torque_scale 57676.0563381
+setp pro600.joint3_torque_scale -57982.300885
+setp pro600.joint4_torque_scale -57982.300885
+setp pro600.joint5_torque_scale -57982.300885
+
+
+#a torque：torque-constant * I
+#b torque: 9550 * (1.732 * 48 * I * 0.85 / 1000) / 3000
+#I: 2 * ipeak /65520 * cur_IU = 2 * 16 / 65520 * cur_IU
+setp pro600.joint0_torque_enc_scale -0.000017338217338
+setp pro600.joint1_torque_enc_scale -0.000017338217338
+setp pro600.joint2_torque_enc_scale  0.000017338217338
+setp pro600.joint3_torque_enc_scale -0.000017246642247
+setp pro600.joint4_torque_enc_scale 0.000017246642247
+setp pro600.joint5_torque_enc_scale -0.000017246642247
+
+###panda
+##########################Teahcing##################################
+#-------------------0Kg---------------------
+setp pro600.tchp0.00 0.007585253456737
+setp pro600.tchp0.01 0.000032081364742
+setp pro600.tchp0.02 0.000198158443630
+setp pro600.tchp0.03 0.000002177620485
+setp pro600.tchp0.04 -0.000007883875595
+setp pro600.tchp0.05 0.000032321948360
+setp pro600.tchp0.06 -0.000010261140910
+setp pro600.tchp0.07 -0.000012488574003
+setp pro600.tchp0.08 -0.000009520062897
+setp pro600.tchp0.09 -0.000010492549954
+setp pro600.tchp0.10 0.002614387577801
+setp pro600.tchp0.11 0.001815926322052
+setp pro600.tchp0.12 0.002272604743847
+setp pro600.tchp0.13 0.000126145588340
+setp pro600.tchp0.14 0.001036035548404
+setp pro600.tchp0.15 -0.000272482132287
+setp pro600.tchp0.16 0.009972205771019
+setp pro600.tchp0.17 0.016349309619750
+setp pro600.tchp0.18 0.009282881583360
+setp pro600.tchp0.19 0.002588048645383
+setp pro600.tchp0.20 0.002210957792047
+setp pro600.tchp0.21 -0.003442126383203
+
+setp pro600.tchp4.00 0.010315564924601
+setp pro600.tchp4.01 -0.000659962147654
+setp pro600.tchp4.02 0.000301371532937
+setp pro600.tchp4.03 0.000005161701850
+setp pro600.tchp4.04 -0.000025906053898
+setp pro600.tchp4.05 0.000076598980621
+setp pro600.tchp4.06 0.000016377278257
+setp pro600.tchp4.07 -0.000028123967677
+setp pro600.tchp4.08 -0.000010035290345
+setp pro600.tchp4.09 -0.000026198811145
+setp pro600.tchp4.10 0.003019613023601
+setp pro600.tchp4.11 0.003082016772205
+setp pro600.tchp4.12 0.002527059924063
+setp pro600.tchp4.13 0.000392751453253
+setp pro600.tchp4.14 0.000846462243027
+setp pro600.tchp4.15 0.000330395870041
+setp pro600.tchp4.16 0.006357010829786
+setp pro600.tchp4.17 0.013173503263472
+setp pro600.tchp4.18 0.008132739164763
+setp pro600.tchp4.19 0.001417979444078
+setp pro600.tchp4.20 0.002570722110409
+setp pro600.tchp4.21 -0.006932942313156
+
+#friction factors
+setp pro600.tchp0.22 0.99
+setp pro600.tchp0.23 0.75
+setp pro600.tchp0.24 0.9
+setp pro600.tchp0.25 0.65
+setp pro600.tchp0.26 0.6
+setp pro600.tchp0.27 0.7
+
+###velocity limit
+setp pro600.tchp0.30 30
+setp pro600.tchp0.31 30
+setp pro600.tchp0.32 30
+setp pro600.tchp0.33 30
+setp pro600.tchp0.34 30
+setp pro600.tchp0.35 30
+
+###Deadband
+setp pro600.tchp0.36 10
+setp pro600.tchp0.37 1
+##-----------------3Kg----------------------------
+
+
+#friction factors
+setp pro600.tchp4.22 0.99
+setp pro600.tchp4.23 0.75
+setp pro600.tchp4.24 0.9
+setp pro600.tchp4.25 0.65
+setp pro600.tchp4.26 0.6
+setp pro600.tchp4.27 0.7
+
+#loadmass diffCeFl
+setp pro600.tchp4.37 0.001
+#setp pro600.tchp.loadmass 0
+##########################Teahcing end##################################
+
+
+###################################collision params, by hanjiang######################################
+setp colli.baseInertialParamsBott.00 -0.000115663119907
+setp colli.baseInertialParamsBott.01 0.002614387577801
+setp colli.baseInertialParamsBott.02 0.009972205771019
+setp colli.baseInertialParamsBott.03 0.000189257351269
+setp colli.baseInertialParamsBott.04 0.000015149268874
+setp colli.baseInertialParamsBott.05 -0.000020179819104
+setp colli.baseInertialParamsBott.06 -0.000006885734505
+setp colli.baseInertialParamsBott.07 -0.000113445967035
+setp colli.baseInertialParamsBott.08 0.007585253456737
+setp colli.baseInertialParamsBott.09 0.000032081364742
+setp colli.baseInertialParamsBott.10 0.001815926322052
+setp colli.baseInertialParamsBott.11 0.016349309619750
+setp colli.baseInertialParamsBott.12 0.000009840844465
+setp colli.baseInertialParamsBott.13 -0.000000946699380
+setp colli.baseInertialParamsBott.14 0.000007179527073
+setp colli.baseInertialParamsBott.15 0.000001154859718
+setp colli.baseInertialParamsBott.16 0.000043220668357
+setp colli.baseInertialParamsBott.17 0.000198158443630
+setp colli.baseInertialParamsBott.18 0.000002177620485
+setp colli.baseInertialParamsBott.19 0.002272604743847
+setp colli.baseInertialParamsBott.20 0.009282881583360
+setp colli.baseInertialParamsBott.21 -0.000051498928084
+setp colli.baseInertialParamsBott.22 -0.000009071677795
+setp colli.baseInertialParamsBott.23 0.000008313465705
+setp colli.baseInertialParamsBott.24 -0.000006075127806
+setp colli.baseInertialParamsBott.25 0.000015723159000
+setp colli.baseInertialParamsBott.26 -0.000007883875595
+setp colli.baseInertialParamsBott.27 0.000032321948360
+setp colli.baseInertialParamsBott.28 0.000126145588340
+setp colli.baseInertialParamsBott.29 0.002588048645383
+setp colli.baseInertialParamsBott.30 -0.000008101758517
+setp colli.baseInertialParamsBott.31 -0.000014362333736
+setp colli.baseInertialParamsBott.32 0.000018540980801
+setp colli.baseInertialParamsBott.33 -0.000007678037782
+setp colli.baseInertialParamsBott.34 -0.000014413925004
+setp colli.baseInertialParamsBott.35 -0.000010261140910
+setp colli.baseInertialParamsBott.36 -0.000012488574003
+setp colli.baseInertialParamsBott.37 0.001036035548404
+setp colli.baseInertialParamsBott.38 0.002210957792047
+setp colli.baseInertialParamsBott.39 -0.000003075920895
+setp colli.baseInertialParamsBott.40 -0.000002009228632
+setp colli.baseInertialParamsBott.41 0.000004171885111
+setp colli.baseInertialParamsBott.42 0.000002325162240
+setp colli.baseInertialParamsBott.43 0.000000845654327
+setp colli.baseInertialParamsBott.44 -0.000009520062897
+setp colli.baseInertialParamsBott.45 -0.000010492549954
+setp colli.baseInertialParamsBott.46 -0.000272482132287
+setp colli.baseInertialParamsBott.47 -0.003442126383203
+
+setp colli.baseInertialParamsTop.00 -0.000104486747575
+setp colli.baseInertialParamsTop.01 0.003019613023601
+setp colli.baseInertialParamsTop.02 0.006357010829786
+setp colli.baseInertialParamsTop.03 0.000201589919599
+setp colli.baseInertialParamsTop.04 -0.000037141808029
+setp colli.baseInertialParamsTop.05 -0.000035831312621
+setp colli.baseInertialParamsTop.06 0.000001211962131
+setp colli.baseInertialParamsTop.07 -0.000194262474839
+setp colli.baseInertialParamsTop.08 0.010315564924601
+setp colli.baseInertialParamsTop.09 -0.000659962147654
+setp colli.baseInertialParamsTop.10 0.003082016772205
+setp colli.baseInertialParamsTop.11 0.013173503263472
+setp colli.baseInertialParamsTop.12 0.000015136798709
+setp colli.baseInertialParamsTop.13 0.000023427899579
+setp colli.baseInertialParamsTop.14 0.000002518376097
+setp colli.baseInertialParamsTop.15 -0.000007651825113
+setp colli.baseInertialParamsTop.16 0.000082811414913
+setp colli.baseInertialParamsTop.17 0.000301371532937
+setp colli.baseInertialParamsTop.18 0.000005161701850
+setp colli.baseInertialParamsTop.19 0.002527059924063
+setp colli.baseInertialParamsTop.20 0.008132739164763
+setp colli.baseInertialParamsTop.21 -0.000099834238302
+setp colli.baseInertialParamsTop.22 -0.000017050277560
+setp colli.baseInertialParamsTop.23 0.000005398601447
+setp colli.baseInertialParamsTop.24 -0.000001537959491
+setp colli.baseInertialParamsTop.25 0.000016322819399
+setp colli.baseInertialParamsTop.26 -0.000025906053898
+setp colli.baseInertialParamsTop.27 0.000076598980621
+setp colli.baseInertialParamsTop.28 0.000392751453253
+setp colli.baseInertialParamsTop.29 0.001417979444078
+setp colli.baseInertialParamsTop.30 -0.000012525134896
+setp colli.baseInertialParamsTop.31 -0.000021647774666
+setp colli.baseInertialParamsTop.32 0.000026374189890
+setp colli.baseInertialParamsTop.33 -0.000003663876660
+setp colli.baseInertialParamsTop.34 -0.000026644196874
+setp colli.baseInertialParamsTop.35 0.000016377278257
+setp colli.baseInertialParamsTop.36 -0.000028123967677
+setp colli.baseInertialParamsTop.37 0.000846462243027
+setp colli.baseInertialParamsTop.38 0.002570722110409
+setp colli.baseInertialParamsTop.39 -0.000002827379558
+setp colli.baseInertialParamsTop.40 -0.000003634797046
+setp colli.baseInertialParamsTop.41 0.000016286174339
+setp colli.baseInertialParamsTop.42 0.000005736383285
+setp colli.baseInertialParamsTop.43 -0.000004999352570
+setp colli.baseInertialParamsTop.44 -0.000010035290345
+setp colli.baseInertialParamsTop.45 -0.000026198811145
+setp colli.baseInertialParamsTop.46 0.000330395870041
+setp colli.baseInertialParamsTop.47 -0.006932942313156
+
+setp colli.payloadDiff	0
+
+
+setp colli.gravity 9.80665
+setp colli.linkVec.00 0.236
+setp colli.linkVec.01 0.236
+setp colli.linkVec.02 0.128
+setp colli.linkVec.03 0.126
+setp colli.linkVec.04 0
+setp colli.residualStaThreVec.00 0.2
+setp colli.residualStaThreVec.01 0.2
+setp colli.residualStaThreVec.02 0.28
+setp colli.residualStaThreVec.03 0.15
+setp colli.residualStaThreVec.04 0.1
+setp colli.residualStaThreVec.05 0.1
+setp colli.picount 4500
+setp colli.cutoffFreq 10
+setp colli.cutoffFreqDynThre 200
+setp colli.rmsFilterHorizon 4
+setp colli.rmsFilterHorizonDyn 20
+
+#setp colli.enable 1
+
+net colli-res0 colli.residualDeciVec.00 => pro600.joint0_colli_res
+net colli-res1 colli.residualDeciVec.01 => pro600.joint1_colli_res
+net colli-res2 colli.residualDeciVec.02 => pro600.joint2_colli_res
+net colli-res3 colli.residualDeciVec.03 => pro600.joint3_colli_res
+net colli-res4 colli.residualDeciVec.04 => pro600.joint4_colli_res
+net colli-res5 colli.residualDeciVec.05 => pro600.joint5_colli_res
+
+#####Act
+net J0posfb => colli.qVec.00
+net J1posfb => colli.qVec.01
+net J2posfb => colli.qVec.02
+net J3posfb => colli.qVec.03
+net J4posfb => colli.qVec.04
+net J5posfb => colli.qVec.05
+
+
+net j0-act-vel pro600.joint0_velfb => colli.qdotVec.00
+net j1-act-vel pro600.joint1_velfb => colli.qdotVec.01
+net j2-act-vel pro600.joint2_velfb => colli.qdotVec.02
+net j3-act-vel pro600.joint3_velfb => colli.qdotVec.03
+net j4-act-vel pro600.joint4_velfb => colli.qdotVec.04
+net j5-act-vel pro600.joint5_velfb => colli.qdotVec.05
+
+#####Cmd
+# (colli.qCmdVec wired via mux-gen.00.out-float etc above)
+
+net j0_cmd_vel => colli.qdotCmdVec.00
+net j1_cmd_vel => colli.qdotCmdVec.01
+net j2_cmd_vel => colli.qdotCmdVec.02
+net j3_cmd_vel => colli.qdotCmdVec.03
+net j4_cmd_vel => colli.qdotCmdVec.04
+net j5_cmd_vel => colli.qdotCmdVec.05
+
+net j0_cmd_vel joint.0.vel-cmd => ddt.0.in
+net j1_cmd_vel joint.1.vel-cmd => ddt.1.in
+net j2_cmd_vel joint.2.vel-cmd => ddt.2.in
+net j3_cmd_vel joint.3.vel-cmd => ddt.3.in
+net j4_cmd_vel joint.4.vel-cmd => ddt.4.in
+net j5_cmd_vel joint.5.vel-cmd => ddt.5.in
+
+net j0_acc ddt.0.out => colli.qdottCmdVec.00
+net j1_acc ddt.1.out => colli.qdottCmdVec.01
+net j2_acc ddt.2.out => colli.qdottCmdVec.02
+net j3_acc ddt.3.out => colli.qdottCmdVec.03
+net j4_acc ddt.4.out => colli.qdottCmdVec.04
+net j5_acc ddt.5.out => colli.qdottCmdVec.05
+
+# a, b, c axes correspond to rx, ry, rz
+# ddt.N.out is output value (can read)
+net axisx_cmd_vel axis.x.pos-cmd => ddt.6.in
+net axisy_cmd_vel axis.y.pos-cmd => ddt.7.in
+net axisz_cmd_vel axis.z.pos-cmd => ddt.8.in
+net axisa_cmd_vel axis.a.pos-cmd => ddt.9.in
+net axisb_cmd_vel axis.b.pos-cmd => ddt.10.in
+net axisc_cmd_vel axis.c.pos-cmd => ddt.11.in
+
+net sig0-jtorq0-fb pro600.joint0_torqfb => colli.torqVec.00
+net sig1-jtorq1-fb pro600.joint1_torqfb => colli.torqVec.01
+net sig2-jtorq2-fb pro600.joint2_torqfb => colli.torqVec.02
+net sig3-jtorq3-fb pro600.joint3_torqfb => colli.torqVec.03
+net sig4-jtorq4-fb pro600.joint4_torqfb => colli.torqVec.04
+net sig5-jtorq5-fb pro600.joint5_torqfb => colli.torqVec.05
+###################################collision params end ######################################
+
+# estop loopback
+net estop-loop iocontrol.0.user-enable-out iocontrol.0.emc-enable-in
+
+# create signals for tool loading loopback
+net tool-prep-loop iocontrol.0.tool-prepare iocontrol.0.tool-prepared
+net tool-change-loop iocontrol.0.tool-change iocontrol.0.tool-changed
+
+net estop-loop => pro600.svr_en
+# Collision abort: colli can false-trigger at startup (q=0, residual mismatch) and turn off robot.
+# BYPASS active for MPC testing - robot was turning off. Re-enable for production safety.
+# net colli-out colli.output => motion.ex-abort pro600.collidet_res
+loadrt and2 count=1
+addf and2.0 servo-thread
+setp and2.0.in1 0
+net colli-out colli.output => and2.0.in0
+net colli-bypass and2.0.out => motion.ex-abort pro600.collidet_res
+# PID enable: gated ONLY by ctrl.enable (NOT by motion.motion-enabled).
+# This prevents PID spike at startup: the motor encoders report stale positions
+# until CAN init completes, causing 90° errors that produce 2800°/s PID output.
+# By gating PIDs on ctrl.enable, we wait until Python has confirmed valid feedback
+# and pre-loaded matching MPC commands before PIDs start computing.
+net sig-mot-en motion.motion-enabled => pro600.motion_enabled
+net ctrl-enable => pid.0.enable pid.1.enable pid.2.enable pid.3.enable pid.4.enable pid.5.enable
+
+net sig-en pro600.svr_enabled => motion.enable colli.enable

@@ -127,3 +127,119 @@ python3 mycobot_ros2_bridge.py --robot-host 127.0.0.1 &
 ros2 topic echo /joint_states                  # watch state
 python3 move_arm_ros2.py --deg 45 -90 0 -90 0 0
 ```
+
+## cuRobo motion-planning controller (collision-free)
+
+`curobo_controller_node.py` turns a **goal** (Cartesian pose or joint target)
+into a **collision-free trajectory** with NVIDIA cuRobo, then streams it to the
+arm through the bridge's existing `trajectory` command path. cuRobo (Py3.10 +
+CUDA) and rclpy (system Humble, Py3.8) can't share a process, so the GPU
+planning runs in a sidecar — `curobo_planner_server.py`, in the `curobo` conda
+env — and the node talks to it over a newline-JSON socket (the same pattern
+`robot_hal.py` uses for 9998/9999).
+
+```
+goal ─▶ curobo_controller_node (rclpy) ─socket▶ curobo_planner_server (GPU)
+        │                                          │  MotionGen, collision spheres
+        │  rad → LinuxCNC deg                       ▼  → trajectory (URDF rad + dt)
+        └─▶ /mycobot/cmd/move ─▶ bridge ─▶ robot_hal (tracks the trajectory)
+```
+
+`curobo_planner_server.py` lives with the cuRobo config at
+`frankkimrobotics/ros2_mycobot/src/mycobot_description/curobo/`.
+
+**Topics**
+
+| Topic | Type | Direction | Meaning |
+|-------|------|-----------|---------|
+| `/joint_states` | `sensor_msgs/JointState` | sub | current q (URDF rad) → plan start |
+| `/mycobot/curobo/goal_pose` | `geometry_msgs/PoseStamped` | sub | EE goal in `base_link` |
+| `/mycobot/curobo/goal_joint` | `sensor_msgs/JointState` | sub | joint goal (URDF rad) |
+| `/mycobot/cmd/move` | `std_msgs/String` | pub | trajectory command for the bridge |
+| `/mycobot/curobo/status` | `std_msgs/String` | pub | plan result JSON (success, solve_time, …) |
+
+**Run** (planner + bridge must be up; the bridge can run against
+`tests/mock_robot_server.py` for a hardware-free dry run):
+
+```bash
+# 1) GPU planner (curobo env). --ground-z sets the table height in base_link.
+conda activate curobo
+python curobo_planner_server.py                      # 127.0.0.1:9997
+#   add obstacles with a cuRobo world yaml:  --world world.yml
+
+# 2) controller node (system ROS env). DRY RUN by default — add --execute to move.
+python3 curobo_controller_node.py                    # plan + log only
+python3 curobo_controller_node.py --execute --controller pid
+
+# 3) send a goal
+ros2 topic pub --once /mycobot/curobo/goal_pose geometry_msgs/PoseStamped \
+  '{header: {frame_id: base_link}, pose: {position: {x: 0.30, y: 0.20, z: 0.35},
+    orientation: {w: 0.0, x: 1.0, y: 0.0, z: 0.0}}}'
+ros2 topic echo /mycobot/curobo/status
+```
+
+> ⚠️ `--execute` moves the real arm. Without it the node plans, logs, and
+> publishes `/mycobot/curobo/status` but sends nothing. The planner enforces
+> self-collision + the ground/obstacle world; targets are still clamped to the
+> LinuxCNC soft limits by the bridge.
+
+### Planner backend: v1 vs V2 (dynamics-aware)
+
+The controller node is backend-agnostic (same socket protocol on port 9997).
+Pick the planner server:
+
+| Server | Env | Planner |
+|--------|-----|---------|
+| `curobo_planner_server.py` | `curobo` (0.7.7) | kinematic trajopt (vel/accel/jerk limits) |
+| `curobo_planner_server_v2.py` | `curobo2` (0.8.0) | **dynamics-aware** trajopt: B-spline + torque limits + inverse dynamics |
+
+cuRobo **V2** reads link mass/inertia/CoM from the URDF `<inertial>` tags and
+joint torque limits from `<limit effort=...>` — so the mesh-derived inertials
+(`compute_inertia.py`) actually feed its planning. The V2 server also returns
+the **B-spline control points** in the response (`control_points`), alongside
+the sampled trajectory. The V2 robot config is auto-ported from the v1 yaml at
+startup to `mycobot_pro_630_v2.yml`.
+
+```bash
+# V2 backend (dynamics-aware); curobo2 env
+conda activate curobo2
+python curobo_planner_server_v2.py            # 127.0.0.1:9997
+# then the SAME controller node, unchanged:
+python3 curobo_controller_node.py --execute
+```
+
+> Note: the URDF `<limit effort>` values are still the placeholder `1000` Nm, so
+> V2's torque limiting is effectively inactive until realistic joint torque
+> limits are set. The inertials are real (mesh-derived); the effort limits are
+> the remaining piece for meaningful torque-aware planning.
+
+## online_servo — 4 ms streaming controller (vs robot_hal)
+
+`robot_hal.py` converges to a target **per command** (~600 ms/cmd), so it can't track a
+high-rate stream. `online_servo.py` replaces it when driving the arm from an **online /
+streaming planner**: it **welds incoming trajectory chunks** into a continuous reference
+`q_ref(t)` and **servos it at the HAL command rate** (`controller_params period_ms=4` →
+**250 Hz**), so the desktop just streams chunks.
+
+```
+desktop planner ── weld chunks (TCP JSON, :9994) ──▶ online_servo  → q_ref(t)
+  servo @250 Hz:  target = q_ref(now + lead)  → PID → HAL pos/vel cmd   (pure-PD, no windup)
+  feedback on :9999  (joints_deg + per-joint torque pro600.joint{i}_torqfb)
+```
+
+- **Dead-time lead** — the actuator has a constant transport dead-time; sampling
+  `q_ref(now + lead)` cancels it for known trajectories (only reactive events pay the delay).
+- **Pure-PD** — the welded reference is the feed-forward, so the integral is dropped (a
+  wound-up integral through the dead-time was the source of terminal overshoot).
+- **Torque in the stream** — `:9999` now also carries `pro600.joint{i}_torqfb`, enabling
+  torque-based contact detection on the desktop side.
+
+Load it instead of `robot_hal.py` via LinuxCNC (the Pi runs `loadusr -Wn ctrl python
+online_servo.py` from **`elerob_online.hal`**, started with `linuxcnc elerob_online.ini`).
+**`elerob_online.hal`** also moves the PID + `pro_socketcan` off the 20 ms slow-thread onto a
+fast thread (staged at 10 ms; 4 ms target) with `motor_time_interval` matched — otherwise the
+4 ms loop is downsampled to 50 Hz at the drive (the HAL link itself is ~2.1 ms).
+
+The cuRobo planner can feed it as **0.4 s sliding-window chunks at 10 Hz**; the welder bridges
+the 10 Hz chunk rate to the 250 Hz control rate. (Desktop side: `../pick_and_place`
+`online_planner_node.py` + `chunk_to_pi.py`.)

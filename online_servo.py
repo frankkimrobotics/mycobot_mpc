@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
-"""online_servo :: streaming SERVO controller for the MyCobot Pro 630 -- run on the Pi
-INSTEAD of robot_hal when driving the arm from the ONLINE / streaming planner.
+"""online_servo :: low-level 4 ms stream-following controller for the MyCobot Pro 630.
 
-robot_hal converges-to-target per command (~600 ms / 29 loops) so it cannot track a
-high-rate stream. This instead WELDS incoming trajectory chunks into a continuous
-reference q_ref(t) and SERVOS it at the LinuxCNC servo rate (PID), so the planner can
-drive the arm smoothly. The welding happens HERE (on the Pi), so the desktop just
-streams chunks -- no 12 Hz window re-targeting through robot_hal's per-cmd loop.
+Run on the Pi (loaded by LinuxCNC as the `ctrl` component) INSTEAD of robot_hal when the
+arm is driven by a streaming planner node.
 
-  desktop planner --weld chunks (TCP, JSON lines)--> [:9994] --> q_ref(t)
-        servo loop @ servo rate:  pid(q, q_ref(now)) -> HAL joint pos/vel cmd
-  feedback streamed on :9999 (same as robot_hal).
+ARCHITECTURE -- a planner node emits a short trajectory CHUNK at a fixed rate; this
+controller WELDS the chunks into one continuous wall-clock reference q_ref(t) and SERVOS
+it at the HAL command rate (controller_params period_ms=4 -> 250 Hz):
 
-Chunk JSON (LinuxCNC deg, the same the desktop already builds):
+    planner node (10 Hz):  every 0.1 s -> 0.4 s chunk (40 pts @ dt=0.01), anchored at
+                           an absolute wall-time t_anchor
+          --TCP JSON lines--> [:9994] --weld--> q_ref(t)
+    servo @250 Hz:  target = q_ref(now + LEAD)  ->  pid -> HAL joint pos/vel cmd
+    feedback streamed on :9999 (same as robot_hal).
+
+DEAD-TIME COMPENSATION -- the actuator has a transport dead-time (the motion lags the
+command). Because q_ref(t) is known ahead of time (the welder holds the future chunk),
+we sample it with a feed-forward LEAD: target = q_ref(now + lead). The delayed motion then
+lands on q_ref(now). `lead` should be set to the MEASURED residual dead-time (0 = pure
+follower; tune up after a step-response measurement). The lead can never exceed the welder
+horizon (~0.4 s of chunk), which is why the planner streams 0.4 s chunks.
+
+NO INTEGRAL WINDUP -- the welded reference IS the feed-forward, so the loop runs as pure PD
+(integral zeroed each step). A wound-up integral through the dead-time is what caused the
+terminal overshoot; dropping it + the lead is the fix.
+
+Chunk JSON (LinuxCNC deg, exactly what the planner builds):
     {"trajectory": [[6 deg], ...], "traj_dt": float, "t_anchor": abs_wall_seconds}
-Safety: chunks implying > --max-chunk-vel are REJECTED; if no chunk arrives for
---watchdog seconds the reference HOLDS the last position; per-step target motion is
-clamped to --max-step deg. Clocks are NTP-synced (bridge logs ~1 ms offset).
+    {"hold": true}                 # freeze the reference at the current position
 
-Run on the Pi (LinuxCNC up, robot_hal NOT running):
-    python3 online_servo.py
+REQUIRES elerob_online.hal to run pid + pro_socketcan on a FAST (~4 ms) thread and
+pro600.motor_time_interval ~4 -- otherwise the HAL downsamples this 4 ms loop back to the
+20 ms slow-thread and the gain is lost. See mycobot-command-rate-throttle.
+
+Loaded by LinuxCNC (robot_hal NOT running):
+    loadusr -Wn ctrl python /home/pi/Desktop/mpc/online_servo.py --lead 0.0
 """
 import argparse
 import json
@@ -37,14 +52,14 @@ from traj_weld import TrajectoryWelder
 MAX_JOINTS = rh.MAX_JOINTS
 
 
-class OnlineServo:
+class StreamFollower:
     def __init__(self, a):
         self.a = a
-        self.welder = TrajectoryWelder(dof=MAX_JOINTS, fine_dt=0.01)
+        # welder fine grid = the chunk dt; sample() interpolates to the 4 ms servo instants
+        self.welder = TrajectoryWelder(dof=MAX_JOINTS, fine_dt=a.weld_fine_dt)
         self.lock = threading.Lock()
-        self.last_chunk_t = 0.0
         self.hold = True
-        self.h = hal.component("ctrl")        # same name -> wired to the joints in the HAL config
+        self.h = hal.component("ctrl")        # name wired to the joints in elerob_online.hal
         for i in range(MAX_JOINTS):
             self.h.newpin(f"joint{i}_pos_cmd", hal.HAL_FLOAT, hal.HAL_OUT)
             self.h.newpin(f"joint{i}_vel_cmd", hal.HAL_FLOAT, hal.HAL_OUT)
@@ -56,13 +71,13 @@ class OnlineServo:
         self.h["enable"] = False
         self.s = linuxcnc.stat()
 
-    # ---- chunk intake ----
+    # ---------- chunk intake ----------
     def _chunk_server(self):
         srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", self.a.chunk_port)); srv.listen(5)
         print(f"[chunks] listening on 0.0.0.0:{self.a.chunk_port}")
         while True:
-            conn, addr = srv.accept()
+            conn, _ = srv.accept()
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             threading.Thread(target=self._chunk_client, args=(conn,), daemon=True).start()
 
@@ -78,61 +93,69 @@ class OnlineServo:
                     break
                 buf += d.decode("utf-8", "replace")
                 while "\n" in buf:
-                    line, buf = buf.split("\n", 1); line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        c = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if c.get("hold"):
-                        with self.lock:
-                            self.hold = True
-                        continue
-                    traj = c.get("trajectory")
-                    if not traj or len(traj) < 1:
-                        continue
-                    arr = np.array(traj, float)
-                    dt = float(c.get("traj_dt", 0.01))
-                    if arr.shape[0] > 1:               # SAFETY: reject too-fast chunks
-                        vmax = float(np.abs(np.diff(arr, axis=0)).max()) / max(dt, 1e-4)
-                        if vmax > self.a.max_chunk_vel:
-                            print(f"[chunks] REJECT chunk vmax={vmax:.0f} deg/s > {self.a.max_chunk_vel}")
-                            continue
-                    ta = float(c.get("t_anchor", time.time() + 0.05))
-                    with self.lock:
-                        if self.welder.t is None:
-                            self.welder.seed(arr[0], time.time() - 0.2)
-                        self.welder.weld(arr, dt, ta, blend=0.06)
-                        self.last_chunk_t = time.time(); self.hold = False
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._ingest(line)
         finally:
             conn.close()
 
-    # ---- servo loop @ servo rate ----
+    def _ingest(self, line):
+        try:
+            c = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if c.get("hold"):
+            with self.lock:
+                self.hold = True
+            return
+        traj = c.get("trajectory")
+        if not traj:
+            return
+        arr = np.array(traj, float)
+        dt = float(c.get("traj_dt", 0.01))
+        if arr.shape[0] > 1:                                   # SAFETY: reject too-fast chunks
+            vmax = float(np.abs(np.diff(arr, axis=0)).max()) / max(dt, 1e-4)
+            if vmax > self.a.max_chunk_vel:
+                print(f"[chunks] REJECT vmax={vmax:.0f} > {self.a.max_chunk_vel} deg/s")
+                return
+        ta = float(c.get("t_anchor", time.time() + 0.02))
+        with self.lock:
+            if self.welder.t is None:
+                self.welder.seed(arr[0], time.time() - 0.05)
+            self.welder.weld(arr, dt, ta, blend=self.a.blend)
+            self.hold = False
+
+    # ---------- servo loop @ HAL command rate (period_ms=4) ----------
     def _servo_loop(self):
         self.h["enable"] = True
-        integral = [0.0] * MAX_JOINTS
-        prev_q = None; t_prev = None; hold_target = None
-        period = rh.PERIOD_SEC
-        print(f"[servo] running @ {1.0/period:.0f} Hz")
+        zero_integ = [0.0] * MAX_JOINTS                       # pure PD: never accumulate
+        prev_q = None
+        t_prev = None
+        hold_target = None
+        period = rh.PERIOD_SEC                                 # 0.004 s from controller_params
+        lead = self.a.lead
+        dv = max(period, 0.004)                               # finite-difference span for vel ff
+        print(f"[servo] running @ {1.0/period:.0f} Hz, lead={lead*1000:.0f} ms")
         while True:
             t0 = time.time()
             dt = (t0 - t_prev) if t_prev is not None else period
             t_prev = t0
             q, q_vel, _, _, _ = rh._poll_feedback(self.s)
             with self.lock:
-                stale = (time.time() - self.last_chunk_t) > self.a.watchdog
-                ref = self.welder.sample(time.time()) if (not self.hold and not stale) else None
-            if ref is None:                                   # hold last position
+                # feed-forward LEAD: command where the reference will be `lead` ahead, so the
+                # delayed motion lands on q_ref(now). Welder clamps past its horizon -> holds goal.
+                ref = self.welder.sample(t0 + lead) if not self.hold else None
+            if ref is None:
                 if hold_target is None:
                     hold_target = list(q)
                 target = hold_target
             else:
                 hold_target = None
                 target = [float(np.clip(ref[i], q[i] - self.a.max_step, q[i] + self.a.max_step))
-                          for i in range(MAX_JOINTS)]          # backstop clamp
-            next_pos, vel_cmd, integral = rh.pid_solve(q, target, integral, q_vel=q_vel,
-                                                       prev_q=prev_q, dt=dt)
+                          for i in range(MAX_JOINTS)]           # rate-limit backstop
+            next_pos, vel_cmd, _ = rh.pid_solve(q, target, zero_integ, q_vel=q_vel,
+                                                prev_q=prev_q, dt=dt)
             rh._write_hal_cmd(self.h, next_pos, vel_cmd)
             prev_q = q
             slp = period - (time.time() - t0)
@@ -149,8 +172,8 @@ class OnlineServo:
         self.s.poll()
         q0 = [round(self.s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
         with self.lock:
-            self.welder.seed(np.array(q0, float), time.time() - 0.2)
-        print(f"online_servo ready at {q0}; hold until chunks arrive on :{self.a.chunk_port}")
+            self.welder.seed(np.array(q0, float), time.time() - 0.05)
+        print(f"online_servo ready at {q0}; holding until chunks arrive on :{self.a.chunk_port}")
         self._servo_loop()
 
 
@@ -159,11 +182,17 @@ def main():
     ap.add_argument("--chunk-port", type=int, default=9994)
     ap.add_argument("--stream-port", type=int, default=9999)
     ap.add_argument("--stream-rate", type=float, default=50.0)
-    ap.add_argument("--watchdog", type=float, default=0.6, help="hold if no chunk for this long (s)")
-    ap.add_argument("--max-step", type=float, default=8.0, help="max target dev from current per servo step (deg)")
-    ap.add_argument("--max-chunk-vel", type=float, default=80.0, help="reject chunks faster than this (deg/s)")
+    ap.add_argument("--lead", type=float, default=0.0,
+                    help="feed-forward dead-time lead (s): sample q_ref(now+lead). Set to the "
+                         "MEASURED residual dead-time; 0 = pure follower. Must be < chunk horizon.")
+    ap.add_argument("--blend", type=float, default=0.04, help="weld cross-fade window (s)")
+    ap.add_argument("--weld-fine-dt", type=float, default=0.01, help="welder reference grid (s)")
+    ap.add_argument("--max-step", type=float, default=8.0,
+                    help="max target deviation from current per servo step (deg) -- jump backstop")
+    ap.add_argument("--max-chunk-vel", type=float, default=80.0,
+                    help="reject chunks implying more than this per-joint speed (deg/s)")
     a = ap.parse_args()
-    srv = OnlineServo(a)
+    srv = StreamFollower(a)
     try:
         srv.start()
     except KeyboardInterrupt:
