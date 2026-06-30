@@ -3,6 +3,9 @@ Load controller parameters from controller_params.yaml (Hydra-style).
 Falls back to built-in defaults if the file is missing or a key is absent.
 Requires PyYAML for YAML loading; if unavailable, only defaults are used.
 """
+# NOTE: __future__ annotations keeps PEP 585/604 hints (dict[...], str | None) as lazy
+# strings so this module imports on the Pi/LinuxCNC Python 3.7.3 (not just desktop 3.10+).
+from __future__ import annotations
 
 import os
 from copy import deepcopy

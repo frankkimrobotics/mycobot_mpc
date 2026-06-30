@@ -38,7 +38,7 @@ try:
         compute_MCG,
         NUM_JOINTS as MODEL_NUM_JOINTS,
     )
-except ImportError:
+except Exception:   # invdyn_model is optional (gravity comp); also skips its 3.7-incompat syntax / missing joint_conventions on the Pi
     load_invdyn_params = None
     linuxcnc_deg_to_rad = None
     compute_MCG = None

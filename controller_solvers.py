@@ -5,6 +5,7 @@ All angles and angular velocities are in degrees (LinuxCNC convention).
 Optional: invdyn_model for gravity comp; tinympc/osqp for MPC.
 Gains are loaded from controller_params.yaml via controller_params.get_controller_params().
 """
+from __future__ import annotations  # keep PEP 585/604 hints lazy for Pi/LinuxCNC Python 3.7.3
 
 import numpy as np
 
@@ -17,7 +18,7 @@ try:
         compute_MCG,
         NUM_JOINTS as MODEL_NUM_JOINTS,
     )
-except ImportError:
+except Exception:   # invdyn_model is optional (gravity comp); also skips its 3.7-incompat syntax on the Pi
     load_invdyn_params = None
     linuxcnc_deg_to_rad = None
     compute_MCG = None
