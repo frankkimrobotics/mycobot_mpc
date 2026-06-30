@@ -121,8 +121,9 @@ class OnlineServo:
             t_prev = t0
             q, q_vel, _, _, _ = rh._poll_feedback(self.s)
             with self.lock:
-                stale = (time.time() - self.last_chunk_t) > self.a.watchdog
-                ref = self.welder.sample(time.time()) if (not self.hold and not stale) else None
+                # the welder clamps to the last welded position past its horizon, so when the
+                # stream stops q_ref simply HOLDS the goal -- no watchdog cut-off needed.
+                ref = self.welder.sample(time.time()) if not self.hold else None
             if ref is None:                                   # hold last position
                 if hold_target is None:
                     hold_target = list(q)
