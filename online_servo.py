@@ -109,6 +109,11 @@ class StreamFollower:
             with self.lock:
                 self.hold = True
             return
+        if "set_max_step" in c:                                # live-tune the target rate-limit
+            with self.lock:
+                self.a.max_step = float(c["set_max_step"])
+            print(f"[cfg] max_step -> {self.a.max_step:.1f} deg")
+            return
         traj = c.get("trajectory")
         if not traj:
             return
