@@ -10,7 +10,7 @@ period_ms: 4
 pid:
   # kp: 500.
   # kd: 10.
-  kp_per_joint: [5000., 8000., 8000., 5000., 5000., 5000.]  # e.g. more authority on joint 2
+  kp_per_joint: [10000., 16000., 16000., 10000., 10000., 10000.]  # 2x tuning test (was 5000/8000...); shrink pos_cmd time-constant (tau~=1.7s). UNVERIFIED: pending step-response after LinuxCNC restart. Revert to prior 1x if it oscillates at base.
   kd_per_joint: [10., 10., 10., 10., 10., 10.]
   ki: 8000.
   integral_clamp: 500000.0
