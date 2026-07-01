@@ -114,6 +114,11 @@ class StreamFollower:
                 self.a.max_step = float(c["set_max_step"])
             print(f"[cfg] max_step -> {self.a.max_step:.1f} deg")
             return
+        if "set_lead" in c:                                    # live-tune the feed-forward lead
+            with self.lock:
+                self.a.lead = float(c["set_lead"])
+            print(f"[cfg] lead -> {self.a.lead*1000:.0f} ms")
+            return
         traj = c.get("trajectory")
         if not traj:
             return
@@ -139,9 +144,8 @@ class StreamFollower:
         t_prev = None
         hold_target = None
         period = rh.PERIOD_SEC                                 # 0.004 s from controller_params
-        lead = self.a.lead
         dv = max(period, 0.004)                               # finite-difference span for vel ff
-        print(f"[servo] running @ {1.0/period:.0f} Hz, lead={lead*1000:.0f} ms")
+        print(f"[servo] running @ {1.0/period:.0f} Hz, lead={self.a.lead*1000:.0f} ms")
         while True:
             t0 = time.time()
             dt = (t0 - t_prev) if t_prev is not None else period
@@ -150,7 +154,7 @@ class StreamFollower:
             with self.lock:
                 # feed-forward LEAD: command where the reference will be `lead` ahead, so the
                 # delayed motion lands on q_ref(now). Welder clamps past its horizon -> holds goal.
-                ref = self.welder.sample(t0 + lead) if not self.hold else None
+                ref = self.welder.sample(t0 + self.a.lead) if not self.hold else None
             if ref is None:
                 if hold_target is None:
                     hold_target = list(q)
