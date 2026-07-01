@@ -129,51 +129,35 @@ class StreamFollower:
     # ---------- servo loop @ HAL command rate (period_ms=4) ----------
     def _servo_loop(self):
         self.h["enable"] = True
+        zero_integ = [0.0] * MAX_JOINTS                       # pure PD: never accumulate
+        prev_q = None
+        t_prev = None
+        hold_target = None
         period = rh.PERIOD_SEC                                 # 0.004 s from controller_params
         lead = self.a.lead
-        max_vel = self.a.max_vel_deg                           # per-joint command slew cap (deg/s)
-        cmd = None                                             # command-anchored state (deg)
-        hold_target = None
-        t_prev = None
-        print(f"[servo] running @ {1.0/period:.0f} Hz, lead={lead*1000:.0f} ms, "
-              f"max_vel={max_vel:.0f} deg/s (command-anchored follower)")
+        dv = max(period, 0.004)                               # finite-difference span for vel ff
+        print(f"[servo] running @ {1.0/period:.0f} Hz, lead={lead*1000:.0f} ms")
         while True:
             t0 = time.time()
-            dt = period if t_prev is None else min(max(t0 - t_prev, period), 4 * period)
+            dt = (t0 - t_prev) if t_prev is not None else period
             t_prev = t0
-            q, _, _, _, _ = rh._poll_feedback(self.s)
+            q, q_vel, _, _, _ = rh._poll_feedback(self.s)
             with self.lock:
                 # feed-forward LEAD: command where the reference will be `lead` ahead, so the
                 # delayed motion lands on q_ref(now). Welder clamps past its horizon -> holds goal.
                 ref = self.welder.sample(t0 + lead) if not self.hold else None
-            if cmd is None:
-                cmd = list(q)                                  # seed to actual: no startup jump
-            if ref is None:                                    # stream idle -> hold last command
+            if ref is None:
                 if hold_target is None:
-                    hold_target = list(cmd)
+                    hold_target = list(q)
                 target = hold_target
             else:
                 hold_target = None
-                target = ref
-            # Command-anchored, velocity-limited slew toward the reference. Advancing the
-            # COMMAND from its own previous value -- NOT re-seeding from the lagging feedback q
-            # each tick -- decouples the command rate from the ~150 ms drive lag. The old
-            # `next_pos = q + u` made pos_cmd rise only as fast as posfb (a self-limiting
-            # follower => the ~3 s crawl); this lets pos_cmd track the welded reference at its
-            # own rate, capped at max_vel for drive safety. See mycobot-reactivity notes.
-            max_dstep = max_vel * dt
-            new_cmd = [0.0] * MAX_JOINTS
-            for i in range(MAX_JOINTS):
-                d = target[i] - cmd[i]
-                if d > max_dstep:
-                    d = max_dstep
-                elif d < -max_dstep:
-                    d = -max_dstep
-                new_cmd[i] = cmd[i] + d
-            # velocity feed-forward from actual command motion (legacy 0.5 drive-scale factor)
-            vel_cmd = [(new_cmd[i] - cmd[i]) / dt * 0.5 for i in range(MAX_JOINTS)]
-            cmd = new_cmd
-            rh._write_hal_cmd(self.h, cmd, vel_cmd)
+                target = [float(np.clip(ref[i], q[i] - self.a.max_step, q[i] + self.a.max_step))
+                          for i in range(MAX_JOINTS)]           # rate-limit backstop
+            next_pos, vel_cmd, _ = rh.pid_solve(q, target, zero_integ, q_vel=q_vel,
+                                                prev_q=prev_q, dt=dt)
+            rh._write_hal_cmd(self.h, next_pos, vel_cmd)
+            prev_q = q
             slp = period - (time.time() - t0)
             if slp > 0:
                 time.sleep(slp)
@@ -204,9 +188,7 @@ def main():
     ap.add_argument("--blend", type=float, default=0.04, help="weld cross-fade window (s)")
     ap.add_argument("--weld-fine-dt", type=float, default=0.01, help="welder reference grid (s)")
     ap.add_argument("--max-step", type=float, default=8.0,
-                    help="(legacy, unused by command-anchored loop) per-step jump backstop (deg)")
-    ap.add_argument("--max-vel-deg", type=float, default=55.0,
-                    help="per-joint command slew cap (deg/s); drive faults above ~60, keep <=55")
+                    help="max target deviation from current per servo step (deg) -- jump backstop")
     ap.add_argument("--max-chunk-vel", type=float, default=80.0,
                     help="reject chunks implying more than this per-joint speed (deg/s)")
     a = ap.parse_args()
