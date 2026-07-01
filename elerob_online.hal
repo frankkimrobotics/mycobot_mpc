@@ -187,7 +187,11 @@ setp pro600.joint5_home_offset -7365.860644
 
 # 512*524288 = 512rpm
 #setp pro600.motor_accelaration 268435456
-setp pro600.motor_accelaration  2097152
+# Reactivity experiment: drive accel cap was 2097152; step response showed a slow
+# ~2.2s rise that 2x kp did NOT change (accel-limited, not gain-limited). Bumped 2x
+# to test. Stage further toward the commented 268435456 (128x) if clean; watch for
+# following-error / CAN faults / jerk. Prior value backed up in .bak_pre_accel2x.
+setp pro600.motor_accelaration  4194304
 
 # MPC bypass: mux_generic switches between motion (in0) and mpc (in1) when ctrl.enable=1 (sel-bit-00=TRUE)
 net sig0-mot-pos-cmd joint.0.motor-pos-cmd => mux-gen.00.in-float-00
