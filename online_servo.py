@@ -192,8 +192,11 @@ def main():
                          "MEASURED residual dead-time; 0 = pure follower. Must be < chunk horizon.")
     ap.add_argument("--blend", type=float, default=0.04, help="weld cross-fade window (s)")
     ap.add_argument("--weld-fine-dt", type=float, default=0.01, help="welder reference grid (s)")
-    ap.add_argument("--max-step", type=float, default=8.0,
-                    help="max target deviation from current per servo step (deg) -- jump backstop")
+    ap.add_argument("--max-step", type=float, default=40.0,
+                    help="max target lead over feedback (deg); THIS caps slew: measured peak "
+                         "vel ~= 0.33*max_step deg/s (8->3.3, 40->13.6, 60->19.6, linear, no "
+                         "drive saturation). Keep <=150 to stay under the ~60 deg/s fault ceiling. "
+                         "Was 8 (=>~3 deg/s crawl). Live-tune via {\"set_max_step\":N}.")
     ap.add_argument("--max-chunk-vel", type=float, default=80.0,
                     help="reject chunks implying more than this per-joint speed (deg/s)")
     a = ap.parse_args()
