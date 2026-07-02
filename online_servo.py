@@ -119,6 +119,11 @@ class StreamFollower:
                 self.a.lead = float(c["set_lead"])
             print(f"[cfg] lead -> {self.a.lead*1000:.0f} ms")
             return
+        if "set_ff_scale" in c:                                # live-tune the velocity feed-forward
+            with self.lock:
+                self.a.ff_scale = float(c["set_ff_scale"])
+            print(f"[cfg] ff_scale -> {self.a.ff_scale:.3f}")
+            return
         traj = c.get("trajectory")
         if not traj:
             return
@@ -155,6 +160,8 @@ class StreamFollower:
                 # feed-forward LEAD: command where the reference will be `lead` ahead, so the
                 # delayed motion lands on q_ref(now). Welder clamps past its horizon -> holds goal.
                 ref = self.welder.sample(t0 + self.a.lead) if not self.hold else None
+                v_ref = (self.welder.velocity(t0 + self.a.lead)
+                         if (ref is not None and self.a.ff_scale) else None)
             if ref is None:
                 if hold_target is None:
                     hold_target = list(q)
@@ -165,6 +172,13 @@ class StreamFollower:
                           for i in range(MAX_JOINTS)]           # rate-limit backstop
             next_pos, vel_cmd, _ = rh.pid_solve(q, target, zero_integ, q_vel=q_vel,
                                                 prev_q=prev_q, dt=dt)
+            # Phase 1: reference-VELOCITY feed-forward. The reactive-only loop is too slow to
+            # build up the velocity to track a moving reference (measured: 10 deg/s ramp -> only
+            # 3.5 deg/s achieved, ~12 deg lag). Adding q_dot_ref directly drives the velocity so
+            # the arm tracks the reference from the start; pid stays only as a small trim.
+            # ff_scale maps deg/s -> ctrl.vel_cmd drive units (CALIBRATE live; 0 = old behavior).
+            if v_ref is not None:
+                vel_cmd = [vel_cmd[i] + self.a.ff_scale * float(v_ref[i]) for i in range(MAX_JOINTS)]
             rh._write_hal_cmd(self.h, next_pos, vel_cmd)
             prev_q = q
             slp = period - (time.time() - t0)
@@ -201,6 +215,9 @@ def main():
                          "vel ~= 0.33*max_step deg/s (8->3.3, 40->13.6, 60->19.6, linear, no "
                          "drive saturation). Keep <=150 to stay under the ~60 deg/s fault ceiling. "
                          "Was 8 (=>~3 deg/s crawl). Live-tune via {\"set_max_step\":N}.")
+    ap.add_argument("--ff-scale", dest="ff_scale", type=float, default=0.0,
+                    help="reference-velocity feed-forward scale (deg/s -> ctrl.vel_cmd units); "
+                         "0 = reactive-only (old). CALIBRATE live via {\"set_ff_scale\":X}.")
     ap.add_argument("--max-chunk-vel", type=float, default=80.0,
                     help="reject chunks implying more than this per-joint speed (deg/s)")
     a = ap.parse_args()
