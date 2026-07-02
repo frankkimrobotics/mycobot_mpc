@@ -217,7 +217,7 @@ def main():
     ap.add_argument("--chunk-port", type=int, default=9994)
     ap.add_argument("--stream-port", type=int, default=9999)
     ap.add_argument("--stream-rate", type=float, default=50.0)
-    ap.add_argument("--lead", type=float, default=0.0,
+    ap.add_argument("--lead", type=float, default=0.05,
                     help="feed-forward dead-time lead (s): sample q_ref(now+lead). Set to the "
                          "MEASURED residual dead-time; 0 = pure follower. Must be < chunk horizon.")
     ap.add_argument("--blend", type=float, default=0.04, help="weld cross-fade window (s)")
@@ -227,7 +227,7 @@ def main():
                          "vel ~= 0.33*max_step deg/s (8->3.3, 40->13.6, 60->19.6, linear, no "
                          "drive saturation). Keep <=150 to stay under the ~60 deg/s fault ceiling. "
                          "Was 8 (=>~3 deg/s crawl). Live-tune via {\"set_max_step\":N}.")
-    ap.add_argument("--ff-scale", dest="ff_scale", type=float, default=0.0,
+    ap.add_argument("--ff-scale", dest="ff_scale", type=float, default=18.0,
                     help="reference-velocity feed-forward scale (deg/s -> ctrl.vel_cmd units); "
                          "0 = reactive-only (old). CALIBRATE live via {\"set_ff_scale\":X}.")
     ap.add_argument("--vel-cmd-max", dest="vel_cmd_max", type=float, default=700.0,
