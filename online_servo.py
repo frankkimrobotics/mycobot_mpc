@@ -124,6 +124,11 @@ class StreamFollower:
                 self.a.ff_scale = float(c["set_ff_scale"])
             print(f"[cfg] ff_scale -> {self.a.ff_scale:.3f}")
             return
+        if "set_vel_cmd_max" in c:                             # live-tune the overspeed clamp
+            with self.lock:
+                self.a.vel_cmd_max = float(c["set_vel_cmd_max"])
+            print(f"[cfg] vel_cmd_max -> {self.a.vel_cmd_max:.0f}")
+            return
         traj = c.get("trajectory")
         if not traj:
             return
@@ -178,7 +183,14 @@ class StreamFollower:
             # the arm tracks the reference from the start; pid stays only as a small trim.
             # ff_scale maps deg/s -> ctrl.vel_cmd drive units (CALIBRATE live; 0 = old behavior).
             if v_ref is not None:
-                vel_cmd = [vel_cmd[i] + self.a.ff_scale * float(v_ref[i]) for i in range(MAX_JOINTS)]
+                # bound the FF input to the legit chunk-velocity range: weld-seam blend transients
+                # can spike q_dot_ref far past the trajectory speed and, x ff_scale, trip the drive
+                # overspeed fault (seen: poscmd=2771 -> "speed over max limit").
+                vr = np.clip(np.asarray(v_ref, float), -self.a.max_chunk_vel, self.a.max_chunk_vel)
+                vel_cmd = [vel_cmd[i] + self.a.ff_scale * float(vr[i]) for i in range(MAX_JOINTS)]
+            # hard drive-safety clamp on total commanded velocity (prevents ANY overspeed fault)
+            vc = self.a.vel_cmd_max
+            vel_cmd = [(-vc if v < -vc else vc if v > vc else v) for v in vel_cmd]
             rh._write_hal_cmd(self.h, next_pos, vel_cmd)
             prev_q = q
             slp = period - (time.time() - t0)
@@ -218,6 +230,9 @@ def main():
     ap.add_argument("--ff-scale", dest="ff_scale", type=float, default=0.0,
                     help="reference-velocity feed-forward scale (deg/s -> ctrl.vel_cmd units); "
                          "0 = reactive-only (old). CALIBRATE live via {\"set_ff_scale\":X}.")
+    ap.add_argument("--vel-cmd-max", dest="vel_cmd_max", type=float, default=700.0,
+                    help="hard clamp on |ctrl.vel_cmd| (drive units) -- overspeed backstop; the drive "
+                         "faulted at ~2771. Live-tune via {\"set_vel_cmd_max\":X}.")
     ap.add_argument("--max-chunk-vel", type=float, default=80.0,
                     help="reject chunks implying more than this per-joint speed (deg/s)")
     a = ap.parse_args()
