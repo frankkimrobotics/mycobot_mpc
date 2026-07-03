@@ -61,6 +61,7 @@ class StreamFollower:
             self.ff_arr = np.array([float(x) for x in a.ff_scale_arr.split(",")], float)
         else:
             self.ff_arr = np.full(MAX_JOINTS, float(a.ff_scale))
+        self.vprev = np.zeros(MAX_JOINTS)      # accel-limited FF velocity (jerk/detach smoothing)
         # welder fine grid = the chunk dt; sample() interpolates to the 4 ms servo instants
         self.welder = TrajectoryWelder(dof=MAX_JOINTS, fine_dt=a.weld_fine_dt)
         self.lock = threading.Lock()
@@ -146,6 +147,11 @@ class StreamFollower:
                 self.a.vel_cmd_max = float(c["set_vel_cmd_max"])
             print(f"[cfg] vel_cmd_max -> {self.a.vel_cmd_max:.0f}")
             return
+        if "set_accel_max" in c:                               # live-tune the accel/jerk smoothing
+            with self.lock:
+                self.a.accel_max = float(c["set_accel_max"])
+            print(f"[cfg] accel_max -> {self.a.accel_max:.0f} deg/s^2")
+            return
         traj = c.get("trajectory")
         if not traj:
             return
@@ -199,11 +205,18 @@ class StreamFollower:
             # 3.5 deg/s achieved, ~12 deg lag). Adding q_dot_ref directly drives the velocity so
             # the arm tracks the reference from the start; pid stays only as a small trim.
             # ff_scale maps deg/s -> ctrl.vel_cmd drive units (CALIBRATE live; 0 = old behavior).
-            if v_ref is not None:
-                # bound the FF input to the legit chunk-velocity range: weld-seam blend transients
-                # can spike q_dot_ref far past the trajectory speed and, x ff_scale, trip the drive
-                # overspeed fault (seen: poscmd=2771 -> "speed over max limit").
-                vr = np.clip(np.asarray(v_ref, float), -self.a.max_chunk_vel, self.a.max_chunk_vel)
+            if self.ff_arr.any():
+                dvmax = self.a.accel_max * dt                  # max FF-velocity change per tick (deg/s)
+                if v_ref is not None:
+                    # bound the FF input to the legit chunk-velocity range (weld-seam blend transients
+                    # can spike q_dot_ref past the trajectory speed and trip the drive overspeed), THEN
+                    # accel-limit it: cap |dv/dt| so velocity ramps smoothly -> minimizes jerk at each
+                    # move's start/end AND keeps inertial force below the suction hold on fast returns.
+                    vr = np.clip(np.asarray(v_ref, float), -self.a.max_chunk_vel, self.a.max_chunk_vel)
+                    vr = np.clip(vr, self.vprev - dvmax, self.vprev + dvmax)
+                else:                                          # holding: ramp FF velocity down to 0 (smooth decel)
+                    vr = np.sign(self.vprev) * np.maximum(0.0, np.abs(self.vprev) - dvmax)
+                self.vprev = vr
                 vel_cmd = [vel_cmd[i] + float(self.ff_arr[i]) * float(vr[i]) for i in range(MAX_JOINTS)]
             # hard drive-safety clamp on total commanded velocity (prevents ANY overspeed fault)
             vc = self.a.vel_cmd_max
@@ -250,6 +263,10 @@ def main():
     ap.add_argument("--ff-scale-arr", dest="ff_scale_arr", type=str, default="",
                     help="per-joint ff scales, comma-sep 6 values; overrides --ff-scale. "
                          "Live-tune via {\"set_ff_scale_arr\":[...]} or {\"set_ff_scale_j\":[i,v]}.")
+    ap.add_argument("--accel-max", dest="accel_max", type=float, default=60.0,
+                    help="max FF-velocity change (deg/s per s) -> accel-limits the command to smooth "
+                         "jerk at move start/end and keep the suction seal on fast returns. Lower = "
+                         "smoother/gentler. Live-tune via {\"set_accel_max\":X}.")
     ap.add_argument("--vel-cmd-max", dest="vel_cmd_max", type=float, default=700.0,
                     help="hard clamp on |ctrl.vel_cmd| (drive units) -- overspeed backstop; the drive "
                          "faulted at ~2771. Live-tune via {\"set_vel_cmd_max\":X}.")
