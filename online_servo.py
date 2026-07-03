@@ -55,6 +55,12 @@ MAX_JOINTS = rh.MAX_JOINTS
 class StreamFollower:
     def __init__(self, a):
         self.a = a
+        # per-joint velocity feed-forward scale (calibrated per joint: drive response differs,
+        # esp. the wrist). From --ff-scale-arr if given, else broadcast the scalar --ff-scale.
+        if getattr(a, "ff_scale_arr", ""):
+            self.ff_arr = np.array([float(x) for x in a.ff_scale_arr.split(",")], float)
+        else:
+            self.ff_arr = np.full(MAX_JOINTS, float(a.ff_scale))
         # welder fine grid = the chunk dt; sample() interpolates to the 4 ms servo instants
         self.welder = TrajectoryWelder(dof=MAX_JOINTS, fine_dt=a.weld_fine_dt)
         self.lock = threading.Lock()
@@ -119,10 +125,21 @@ class StreamFollower:
                 self.a.lead = float(c["set_lead"])
             print(f"[cfg] lead -> {self.a.lead*1000:.0f} ms")
             return
-        if "set_ff_scale" in c:                                # live-tune the velocity feed-forward
+        if "set_ff_scale" in c:                                # broadcast all joints
             with self.lock:
-                self.a.ff_scale = float(c["set_ff_scale"])
-            print(f"[cfg] ff_scale -> {self.a.ff_scale:.3f}")
+                self.ff_arr[:] = float(c["set_ff_scale"])
+            print(f"[cfg] ff_scale (all) -> {float(c['set_ff_scale']):.3f}")
+            return
+        if "set_ff_scale_arr" in c:                            # per-joint list of 6
+            with self.lock:
+                self.ff_arr[:] = np.asarray(c["set_ff_scale_arr"], float)
+            print(f"[cfg] ff_scale_arr -> {[round(float(x),1) for x in self.ff_arr]}")
+            return
+        if "set_ff_scale_j" in c:                              # single joint [idx, val]
+            jj, vv = c["set_ff_scale_j"]
+            with self.lock:
+                self.ff_arr[int(jj)] = float(vv)
+            print(f"[cfg] ff_scale[{int(jj)}] -> {float(vv):.3f}")
             return
         if "set_vel_cmd_max" in c:                             # live-tune the overspeed clamp
             with self.lock:
@@ -166,7 +183,7 @@ class StreamFollower:
                 # delayed motion lands on q_ref(now). Welder clamps past its horizon -> holds goal.
                 ref = self.welder.sample(t0 + self.a.lead) if not self.hold else None
                 v_ref = (self.welder.velocity(t0 + self.a.lead)
-                         if (ref is not None and self.a.ff_scale) else None)
+                         if (ref is not None and self.ff_arr.any()) else None)
             if ref is None:
                 if hold_target is None:
                     hold_target = list(q)
@@ -187,7 +204,7 @@ class StreamFollower:
                 # can spike q_dot_ref far past the trajectory speed and, x ff_scale, trip the drive
                 # overspeed fault (seen: poscmd=2771 -> "speed over max limit").
                 vr = np.clip(np.asarray(v_ref, float), -self.a.max_chunk_vel, self.a.max_chunk_vel)
-                vel_cmd = [vel_cmd[i] + self.a.ff_scale * float(vr[i]) for i in range(MAX_JOINTS)]
+                vel_cmd = [vel_cmd[i] + float(self.ff_arr[i]) * float(vr[i]) for i in range(MAX_JOINTS)]
             # hard drive-safety clamp on total commanded velocity (prevents ANY overspeed fault)
             vc = self.a.vel_cmd_max
             vel_cmd = [(-vc if v < -vc else vc if v > vc else v) for v in vel_cmd]
@@ -230,6 +247,9 @@ def main():
     ap.add_argument("--ff-scale", dest="ff_scale", type=float, default=18.0,
                     help="reference-velocity feed-forward scale (deg/s -> ctrl.vel_cmd units); "
                          "0 = reactive-only (old). CALIBRATE live via {\"set_ff_scale\":X}.")
+    ap.add_argument("--ff-scale-arr", dest="ff_scale_arr", type=str, default="",
+                    help="per-joint ff scales, comma-sep 6 values; overrides --ff-scale. "
+                         "Live-tune via {\"set_ff_scale_arr\":[...]} or {\"set_ff_scale_j\":[i,v]}.")
     ap.add_argument("--vel-cmd-max", dest="vel_cmd_max", type=float, default=700.0,
                     help="hard clamp on |ctrl.vel_cmd| (drive units) -- overspeed backstop; the drive "
                          "faulted at ~2771. Live-tune via {\"set_vel_cmd_max\":X}.")
