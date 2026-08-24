@@ -58,7 +58,7 @@ from controller_solvers import (
 SUCTION_PIN = "pro600.digital_out00"
 CMD_PORT = 9998
 STREAM_PORT = 9999
-STREAM_RATE_HZ = 50.0
+STREAM_RATE_HZ = 100.0
 
 _timing = {"poll": [], "solve": [], "hal_write": [], "sleep": []}
 _params = None  # invdyn params when --params npz loaded
@@ -97,8 +97,8 @@ def pd_velff_solve(q, target_angles, prev_target, q_vel=None, prev_q=None, dt=No
 
 
 @timed("solve")
-def mpc_solve(q, target_angles, dt=None):
-    return _mpc_solve_raw(q, target_angles, dt=dt)
+def mpc_solve(q, target_angles, dt=None, q_vel=None):
+    return _mpc_solve_raw(q, target_angles, dt=dt, q_vel=q_vel)
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +309,7 @@ def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5,
             res = invdyn_solve(q, target_angles, _params, q_vel=q_vel, prev_q=prev_current, dt=dt, prev_target=prev_target)
             next_pos, vel_cmd = res[0], res[1]
         elif controller == "mpc":
-            next_pos, vel_cmd = mpc_solve(q, target_angles, dt=dt)
+            next_pos, vel_cmd = mpc_solve(q, target_angles, dt=dt, q_vel=q_vel)
         else:  # pd_velff
             next_pos, vel_cmd = pd_velff_solve(q, target_angles, prev_target, q_vel=q_vel, prev_q=prev_current, dt=dt)
 
@@ -567,7 +567,7 @@ def main():
         _halcmd_set(SUCTION_PIN, 1)
     _update_cmd_status("idle", current, current, 0.0)
 
-    if USE_PD_STEPS_FOR_INVDYN:
+    if False:  # USE_PD_STEPS_FOR_INVDYN -- undefined global, print-only branch
         print("  invdyn: using PD position steps (robot will move)")
     if args.controller == "mpc":
         try:
@@ -581,11 +581,25 @@ def main():
     print("=" * 60 + "\n")
 
     default_controller = args.controller
+    # POSITION HOLD between commands: without this the 250 Hz loop only runs
+    # during a command window; at idle the HAL pins freeze and the arm sags
+    # under gravity (~0.4 deg/s) until the STM32 ferror-trips the drives.
+    s.poll()
+    hold_target = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
     try:
         while True:
             try:
-                cmd = _cmd_queue.get(timeout=1.0)
+                cmd = _cmd_queue.get(timeout=0.05)
             except queue.Empty:
+                # duty-cycled hold: continuous bursts starve the stream
+                # thread (GIL); 0.6 s hold + 0.4 s breather -> ripple < 0.2 deg
+                try:
+                    run_control_loop(h, s, hold_target, duration_sec=0.6,
+                                     controller='pid', log_dir=log_dir,
+                                     log_enabled=False)
+                except Exception:
+                    pass
+                time.sleep(0.4)
                 continue
             target = cmd.get("target_deg")
             if target is None or len(target) != MAX_JOINTS:
@@ -605,6 +619,7 @@ def main():
             print(f"\n[cmd] Moving -> {[round(v, 1) for v in target]} controller={controller}")
             _update_cmd_status("moving", current, target, err)
 
+            hold_target = list(target)
             done_reason = run_control_loop(h, s, target, duration_sec=duration, controller=controller,
                                           pos_tol=pos_tol, settle_steps=settle, log_dir=log_dir, log_enabled=log_enabled,
                                           period_sec=period_sec)

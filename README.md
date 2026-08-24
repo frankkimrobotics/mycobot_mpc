@@ -243,3 +243,44 @@ fast thread (staged at 10 ms; 4 ms target) with `motor_time_interval` matched �
 The cuRobo planner can feed it as **0.4 s sliding-window chunks at 10 Hz**; the welder bridges
 the 10 Hz chunk rate to the 250 Hz control rate. (Desktop side: `../pick_and_place`
 `online_planner_node.py` + `chunk_to_pi.py`.)
+
+## MPC on the real robot — validated process (2026-08-24)
+
+The `mpc` controller is now a **lag-aware LQR-clamp** (`controller_solvers.mpc_solve`):
+`u = -K @ [pos_err, vel]`, `K = [53.48, 4.71]`, clamped ±40 °/s — the closed form of a
+2-state drive-lag MPC, sim-tuned on the MuJoCo twin to **0.0% overshoot** at the
+drive-limited rise time (the old integrator MPC overshot ~5% = the drive braking
+distance; pure PID rings 17–21%). Solver-free, so it runs on the Pi (no osqp needed).
+Gains assume drive lag kv≈40/s @ 4 ms; recompute via the DARE if stage-1 identification
+disagrees.
+
+### Bring-up ritual (the only sequence that reliably works)
+
+1. Power the arm; press the base START button once (watch `pro600.svr_poweroned`).
+2. Kill any stale stack: all `linuxcnc` pids + `rm /tmp/linuxcnc.lock`.
+3. `linuxcnc ~/Desktop/mpc/elerob.ini` — robot_hal then self-initializes everything
+   (drive power-on, motor init, machine-on, ctrl preload) and serves :9998/:9999.
+4. Home if using the headless variant (`set home -1` via linuxcncrsh :5007).
+5. **Probe before any motion**: command +1° on J1, verify the :9999 stream moves.
+   Frozen drives + repeated commands wind the PID integral into a jump hazard.
+
+### robot_hal changes to keep (in this repo's copy)
+
+* **Idle hold mode**: between commands robot_hal now re-servos the last target in
+  0.6 s bursts (0.4 s breather for the stream thread). Without it the 250 Hz loop
+  stopped at command end → drives coasted → gravity sag ~0.4 °/s → STM32
+  ferror-tripped the enable (the recurring "drift"/dropout).
+* `mpc_solve` receives `q_vel` (the lag model is useless with v=0).
+
+### Validation protocol
+
+`pick_n_place/real_ctrl_validate.py --exec` (dry-run without `--exec`):
+stage 1 fits the real drive lag from a +5° step (gate: within 30% of kv=40);
+stage 2 replays the sim step-bench with `pid` vs `mpc` and prints metrics against
+the sim predictions (mpc: 0% overshoot, 0.5–0.7 s settle); stage 3 steps all six
+joints at once (coupling check). Probes before every case, homes between cases,
+logs everything, writes a comparison plot.
+
+Known hardware caveat: servo-enable hold-time degrades across soft restarts and
+resets only with a full power cycle — suspected 48 V path issue, physical
+inspection pending. Time-box on-robot sessions accordingly.
