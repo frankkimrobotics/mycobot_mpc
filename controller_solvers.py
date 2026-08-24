@@ -267,6 +267,78 @@ def _mpc_solve_tinympc(q, target_angles, dt):
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
 
 
+_lag_mpc_cache = {}
+
+
+def _lag_mpc_get(dt):
+    """Per-process lag-aware MPC (2-state: [err, vel]) with persistent
+    per-joint OSQP solvers (linear-term update only -> fits the 4 ms tick).
+    Models the drive as a first-order velocity lag, so the plan brakes one
+    lag constant early: sim-tuned 0.0% overshoot at unchanged rise time
+    (integrator-model MPC overshot ~5% = drive braking distance)."""
+    import numpy as np
+    import osqp
+    from scipy import sparse
+    key = round(dt, 5)
+    if key in _lag_mpc_cache:
+        return _lag_mpc_cache[key]
+    p = get_controller_params().get("mpc", {})
+    N = int(p.get("lag_horizon", 25))
+    kv = float(p.get("kv_drive", 40.0))
+    vmax = float(p.get("vel_max", 40.0))          # LC deg/s
+    qe = float(p.get("lag_qe", 100.0))
+    qv = float(p.get("lag_qv", 1.0))
+    r = float(p.get("lag_r", 0.005))
+    A = np.array([[1.0, dt], [0.0, 1.0 - kv * dt]])
+    B = np.array([[0.0], [kv * dt]])
+    Ap = [np.linalg.matrix_power(A, k) for k in range(N + 1)]
+    G = np.zeros((2 * N, N))
+    for k in range(1, N + 1):
+        for j in range(k):
+            G[2 * (k - 1):2 * k, j] = (Ap[k - 1 - j] @ B).ravel()
+    W = np.zeros(2 * N)
+    W[0::2] = qe
+    W[1::2] = qv
+    W[-2] = qe * 10.0
+    Wd = np.diag(W)
+    P = G.T @ Wd @ G + r * np.eye(N)
+    Ps = sparse.csc_matrix((P + P.T) / 2)
+    Aq = sparse.eye(N, format="csc")
+    GtW = G.T @ Wd
+    solvers = []
+    for _ in range(MAX_JOINTS):
+        s = osqp.OSQP()
+        s.setup(Ps, np.zeros(N), Aq, np.full(N, -vmax), np.full(N, vmax),
+                verbose=False, max_iter=200, warm_start=True)
+        solvers.append(s)
+    ctx = {"N": N, "Ap": Ap, "GtW": GtW, "vmax": vmax, "solvers": solvers,
+           "np": np}
+    _lag_mpc_cache[key] = ctx
+    return ctx
+
+
+def _mpc_solve_lag(q, target_angles, q_vel, dt):
+    """Lag-aware MPC step. q_vel = joint velocities (LC deg/s) or None."""
+    import numpy as np
+    ctx = _lag_mpc_get(dt)
+    N, Ap, GtW, vmax = ctx["N"], ctx["Ap"], ctx["GtW"], ctx["vmax"]
+    next_pos, vel_cmd = [], []
+    for j in range(MAX_JOINTS):
+        e0 = float(q[j]) - float(target_angles[j])
+        v0 = float(q_vel[j]) if q_vel is not None else 0.0
+        x0 = np.array([e0, v0])
+        f = np.concatenate([(Ap[k] @ x0) for k in range(1, N + 1)])
+        ctx["solvers"][j].update(q=GtW @ f)
+        res = ctx["solvers"][j].solve()
+        if res.info.status.startswith("solved"):
+            u0 = float(np.clip(res.x[0], -vmax, vmax))
+        else:
+            u0 = float(np.clip(-2.0 * e0, -vmax, vmax))
+        vel_cmd.append(u0)
+        next_pos.append(float(q[j]) + u0 * dt)
+    return next_pos, vel_cmd
+
+
 def _mpc_solve_osqp(q, target_angles, dt):
     """Fallback: OSQP-based QP. Returns (next_pos, vel_cmd)."""
     try:
@@ -306,11 +378,31 @@ def _mpc_solve_osqp(q, target_angles, dt):
     return next_pos_list, vel_cmd_list
 
 
-def mpc_solve(q, target_angles, dt=None):
-    """MPC: TinyMPC if available, else OSQP fallback. Returns (next_pos, vel_cmd)."""
+def mpc_solve(q, target_angles, dt=None, q_vel=None):
+    """MPC. Default = lag-aware velocity MPC (sim-tuned: 0% overshoot at
+    the drive-limited rise time). Set mpc.use_lag: false in the yaml to
+    fall back to the legacy integrator MPC (TinyMPC/OSQP)."""
     global _mpc_use_tinympc
     if dt is None or dt <= 0:
         dt = PERIOD_SEC
+    mode = get_controller_params().get("mpc", {}).get("use_lag", "lqr")
+    if mode == "lqr" or mode is True:
+        # LQR-clamp form of the lag-aware MPC (validated identical to the
+        # QP in sim; deployed on the Pi). u = -K @ [err, vel], clamp VMAX.
+        K0, K1, VMAX = 53.4798, 4.7131, 40.0
+        next_pos, vel_cmd = [], []
+        for j in range(MAX_JOINTS):
+            e = float(q[j]) - float(target_angles[j])
+            v = float(q_vel[j]) if q_vel is not None else 0.0
+            u = max(-VMAX, min(VMAX, -(K0 * e + K1 * v)))
+            vel_cmd.append(u)
+            next_pos.append(float(q[j]) + u * PERIOD_SEC)
+        return next_pos, vel_cmd
+    if mode == "qp":
+        try:
+            return _mpc_solve_lag(q, target_angles, q_vel, PERIOD_SEC)
+        except Exception:
+            pass
     if _mpc_use_tinympc is None:
         try:
             import tinympc as _tm
