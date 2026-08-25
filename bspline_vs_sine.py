@@ -3,7 +3,7 @@
 bspline_vs_sine :: head-to-head comparison of a SINUSOID move vs a jerk-limited
 B-spline / S-curve (smooth trapezoid) move, at the SAME peak velocity.
 
-Why: the per-joint limit is a drive following-error ceiling (~36 deg/s) - the
+Why: the per-joint limit is a --max-vel-deg cap (verified fault-free to 50+ deg/s; real cap unmeasured) - the
 drive faults when pos_cmd outruns posfb. The question is whether a different
 trajectory shape, run at a higher *useful* velocity, covers a move better.
 
