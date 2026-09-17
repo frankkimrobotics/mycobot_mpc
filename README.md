@@ -246,6 +246,10 @@ the 10 Hz chunk rate to the 250 Hz control rate. (Desktop side: `../pick_and_pla
 
 ## MPC on the real robot — validated process (2026-08-24)
 
+> **Superseded on 2026-09-17** — the gains below limit-cycle on the real drive and the
+> velocity feedback they assumed was never real. See *Hardware calibration, agile tuning and
+> latency (2026-09-17)* at the end of this file for what actually runs now.
+
 The `mpc` controller is now a **lag-aware LQR-clamp** (`controller_solvers.mpc_solve`):
 `u = -K @ [pos_err, vel]`, `K = [53.48, 4.71]`, clamped ±40 °/s — the closed form of a
 2-state drive-lag MPC, sim-tuned on the MuJoCo twin to **0.0% overshoot** at the
@@ -284,3 +288,114 @@ logs everything, writes a comparison plot.
 Known hardware caveat: servo-enable hold-time degrades across soft restarts and
 resets only with a full power cycle — suspected 48 V path issue, physical
 inspection pending. Time-box on-robot sessions accordingly.
+
+## Hardware calibration, agile tuning and latency (2026-09-17)
+
+Everything in this section was measured on the real Pro 630 (joint 0, arm folded, base
+rotation only) with the tools added the same day. The numbers replace the sim-tuned values
+above.
+
+### Network: use the cable, not WiFi
+
+`10.0.0.27` is the Pi's **wlan0**. Commands over it showed 50–125 ms latency spikes. The Pi's
+`eth0` is cabled straight to the desktop's `enp5s0` (NetworkManager profile `raspi-direct`,
+`192.168.50.1/24`); a systemd unit on the Pi (`eth0-direct-link.service`) adds
+**`192.168.50.2/24`** to `eth0` at boot. Use `pi@192.168.50.2` for `:9998/:9999`, ssh and scp:
+1–2 ms typical, 5 ms worst over 320 streamed chunks.
+
+### ctrl_tuner — step / stream tuner with live plots
+
+```bash
+python3 ctrl_tuner.py                      # http://127.0.0.1:8765 (defaults: 192.168.50.2)
+ssh -L 8765:localhost:8765 <desktop>       # from a laptop, then open http://localhost:8765
+```
+
+`ctrl_tuner.py` (stdlib only) talks to `robot_hal` directly on `:9998/:9999` — no ROS bridge.
+`ctrl_tuner.html` gives sliders for every gain, a step test, a streamed-sinusoid test, the
+real-vs-sim response plot, per-hop latency for each move, and overlays of saved runs
+(`logs/tuner_runs/*.json`). It works standalone in sim-only mode when opened as a file.
+The architecture diagram is in the collapsible panel at the top of the page.
+
+### robot_hal: what changed on the Pi (this repo's copy is the running one)
+
+* **Per-move overrides** in the command JSON: `"gains": {...}`, `"period_ms"`, `"vel_cmd_max"`.
+  Keys — mpc: `k0 k1 vmax vel_scale`; pid: `kp kd ki u_max integral_clamp`; pd_velff: `kp kd`.
+  Overrides clear after the move; hold mode uses the file defaults.
+* **Safety clamps on every HAL write**: `|pos_cmd − q| ≤ 3°` and `|vel_cmd| ≤ vel_cmd_max`
+  (default 100 units). The yaml PID (`kp` 5000–8000) is unusable with robot_hal: a 0.03° error
+  produced a 168° `motor_poscmd` gap and the firmware powered the arm off ("Position cmd and
+  fb are too far apart"). Hold mode now uses the bounded mpc law at 5 units, aborts the instant
+  a command is queued, and has no breather sleep.
+* **Feedback comes from `pro600.jointN_posfb` pins**, not `linuxcnc.stat`. `stat`'s joint
+  velocity is the trajectory planner's *commanded* velocity — **zero whenever ctrl drives the
+  joints** — so every earlier `K1` was acting on nothing (steps) or as `K1·v_ref` feedforward
+  (streaming). Velocity is now a finite difference of the pins. (`USE_STAT_FEEDBACK=False`.)
+* **Streaming mode** (welded chunks):
+  `{"chunk": [[6 deg], ...], "traj_dt": 0.01, "t_anchor": <epoch>, "seq": k, "gains": {...}}`.
+  Chunks weld into one `q_ref(t)`; the law is
+  `u = vff·v_ref − K0·(q − q_ref) − K1·(q̇ − v_ref)`, clamped to `vmax`, `vel_cmd = u·vel_scale`.
+  Reply `{"state":"ack_chunk", "seq", "t_recv", "n_ref"}`. Send chunks ≥ 100 ms ahead of their anchor.
+* **Latency stamps** in the status: `t_recv`, `t_dequeue`, `t_loop0`, `t_write0`, `t_done`;
+  CSV logs gained a `t_epoch` column; status cadence 20 Hz (was once per second).
+* Stream thread hardened (it died on an uncaught `linuxcnc.error` under load).
+* `elerob.hal`: `loadusr` pinned to `/usr/bin/python3 -u` (the login shell's `python3` is pyenv
+  3.10 without yaml); `mux-gen.*` moved onto the slow-thread just before `pro_socketcan.update`;
+  slow-thread and `motor_time_interval` 20 → **10 ms**; `motor_accelaration` **4×** (see below).
+* `launch_mpc_stack.sh`: clean relaunch as a user service (kills the vendor stack, clears the lock).
+
+### Calibration results
+
+| quantity | value |
+|---|---|
+| drive velocity unit (`pro600.jointN_poscmd`) | **≈ 17 units per °/s**, linear 5–510 units |
+| drive velocity saturation | ≈ 50 °/s |
+| drive acceleration cap, 1× (2097152) | 250 °/s² — only read at drive **init**, `setp` live does nothing |
+| drive acceleration cap, 4× (8388608, now default) | 720–870 °/s², 0.0–0.1 % overshoot, fault-free |
+| START button | needed after every robot_hal exit (its shutdown drops `pro600.poweron`) |
+
+### Gains that work (mpc law, `vel_scale 17`)
+
+| use | K0 | K1 | vff | vmax | result |
+|---|---|---|---|---|---|
+| waypoint steps (10°) | 6 | 0 | — | 50 | peak 45–50 °/s, 0.1 % overshoot, rise 0.27 s, settle ±0.5° 0.43 s |
+| streamed trajectory | 20 | 0.3 | **1.0** | 50 | 12° 0.5 Hz sine: rms 0.10°, max 0.23°, lag 0–5 ms |
+| deployed before (sim-tuned) | 53.48 | 4.71 | — | 40 | **relay limit cycle ±0.4° at 2.4 Hz** (dead-time × clamp) |
+
+With `vff = 0` a streamed reference lags by exactly `1/K0` (70 ms at K0 = 14). Lookahead
+(`lead`) does not help; K0 above ~8 rings on steps.
+
+![streamed sinusoid command vs response](docs/sine_cmd_vs_response.png)
+![waypoint steps command vs response](docs/step_cmd_vs_response.png)
+
+### Latency per hop, one waypoint (ms), cable, 10 ms threads, accel 4×
+
+| hop | before (morning) | now |
+|---|---|---|
+| desktop → Pi TCP command received | 2–4 | 1–2 |
+| Pi queue wait (hold loop) | 0–100 | 0.3 |
+| dequeue → first control loop | 0.5 | 0.5 |
+| poll + solve → HAL pin write | 2–3 | 2–3 |
+| HAL write → first encoder motion (0.02°) | 65–77 | 36–52 |
+| HAL write → motion past 0.2° | 95–108 | 56–69 |
+| stream sample Pi → desktop | 0.2–0.8 | 0.2–0.4 |
+| **total: send → motion seen on desktop** | **112** | **≈ 75** |
+
+What remains is CAN (2.8 ms per cycle) plus STM32/drive firmware. **5 ms threads** (set
+`period1`, `motor_time_interval` *and* `SERVO_PERIOD` in `elerob.ini` to 5 ms — the ini caps
+thread periods) take another ~10 ms off and halve the streaming error (rms 0.06°), but the CAN
+update then fills 3.5 ms of every cycle (12 ms worst) and CAN error-state events double
+(1.5/s vs 0.8/s idle) on a bus with a wiring history. Left as an opt-in; recipe at the bottom
+of `elerob.hal`.
+
+### Bring-up as of 2026-09-17
+
+```bash
+ssh pi@192.168.50.2 ~/Desktop/mpc/launch_mpc_stack.sh      # then press START on the base if
+                                                            # pro600.svr_poweroned stays FALSE
+halcmd show pin ctrl.joint0_pos_cmd pro600.joint0_posfb    # must match before any motion
+python3 ctrl_tuner.py                                       # 1° probe first, then steps
+```
+
+Unpowered-drive signature (START not pressed, or deaf CAN): encoders read fine but
+`status_word 0x0`, `svr_poweroned FALSE`, task_state 2, CAN TX counter frozen.
+

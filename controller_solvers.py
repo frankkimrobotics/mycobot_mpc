@@ -38,6 +38,36 @@ def _gain_array(scalar: float, per_joint: list | None, nj: int = MAX_JOINTS) -> 
     return np.full(nj, scalar, dtype=float)
 
 
+# ---------------------------------------------------------------------------
+# Per-command runtime overrides (set by robot_hal from the "gains" field of a
+# command; cleared after the move). Keys are controller-specific:
+#   pid:      kp, kd (scalar or 6-list), ki, u_max, integral_clamp
+#   pd_velff: kp, kd
+#   mpc:      k0, k1, vmax (deg/s), vel_scale (drive units per deg/s)
+# ---------------------------------------------------------------------------
+_OVR = {}
+
+
+def set_overrides(d):
+    global _OVR
+    _OVR = dict(d) if isinstance(d, dict) else {}
+
+
+def get_overrides():
+    return dict(_OVR)
+
+
+def _ov(name, default):
+    v = _OVR.get(name)
+    if v is None:
+        return default
+    if isinstance(default, np.ndarray):
+        if isinstance(v, (list, tuple)):
+            return np.asarray(v, dtype=float)[:MAX_JOINTS]
+        return np.full(MAX_JOINTS, float(v))
+    return float(v)
+
+
 # PID
 _pid = _P.get("pid", {})
 KP_PID = float(_pid.get("kp", 0.5))
@@ -107,9 +137,11 @@ def pid_solve(q, target_angles, integral, q_vel=None, prev_q=None, dt=None):
         dt = PERIOD_SEC
     integ = np.array(integral, dtype=float)
     integ += error * dt
-    integ = np.clip(integ, -INTEGRAL_CLAMP, INTEGRAL_CLAMP)
-    u = KP_PID_ARR * error - KD_PID_ARR * velocity + KI_PID * integ
-    u = np.clip(u, -U_MAX_PER_STEP, U_MAX_PER_STEP)
+    _ic = _ov("integral_clamp", INTEGRAL_CLAMP)
+    integ = np.clip(integ, -_ic, _ic)
+    u = _ov("kp", KP_PID_ARR) * error - _ov("kd", KD_PID_ARR) * velocity + _ov("ki", KI_PID) * integ
+    _um = _ov("u_max", U_MAX_PER_STEP)
+    u = np.clip(u, -_um, _um)
     next_pos = current + u
     vel_cmd = (u / dt * 0.5) if dt > 0 else np.zeros(MAX_JOINTS)
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd], integ.tolist()
@@ -226,7 +258,7 @@ def pd_velff_solve(q, target_angles, prev_target, q_vel=None, prev_q=None, dt=No
     if prev_target is not None and dt > 0:
         prev_t = np.array(prev_target, dtype=float)
         vel_ff = (target - prev_t) / dt
-    acc_pd = KP_PD_VELFF_ARR * error - KD_PD_VELFF_ARR * velocity
+    acc_pd = _ov("kp", KP_PD_VELFF_ARR) * error - _ov("kd", KD_PD_VELFF_ARR) * velocity
     next_pos = current + (acc_pd + vel_ff) * dt
     vel_cmd = acc_pd + vel_ff
     next_pos = np.clip(next_pos, current - U_MAX_PER_STEP_PD_VELFF, current + U_MAX_PER_STEP_PD_VELFF)
@@ -265,78 +297,6 @@ def _mpc_solve_tinympc(q, target_angles, dt):
     next_pos = x0 + u0
     vel_cmd = (u0 / dt) if dt and dt > 0 else np.zeros(nu)
     return [float(x) for x in next_pos], [float(x) for x in vel_cmd]
-
-
-_lag_mpc_cache = {}
-
-
-def _lag_mpc_get(dt):
-    """Per-process lag-aware MPC (2-state: [err, vel]) with persistent
-    per-joint OSQP solvers (linear-term update only -> fits the 4 ms tick).
-    Models the drive as a first-order velocity lag, so the plan brakes one
-    lag constant early: sim-tuned 0.0% overshoot at unchanged rise time
-    (integrator-model MPC overshot ~5% = drive braking distance)."""
-    import numpy as np
-    import osqp
-    from scipy import sparse
-    key = round(dt, 5)
-    if key in _lag_mpc_cache:
-        return _lag_mpc_cache[key]
-    p = get_controller_params().get("mpc", {})
-    N = int(p.get("lag_horizon", 25))
-    kv = float(p.get("kv_drive", 40.0))
-    vmax = float(p.get("vel_max", 40.0))          # LC deg/s
-    qe = float(p.get("lag_qe", 100.0))
-    qv = float(p.get("lag_qv", 1.0))
-    r = float(p.get("lag_r", 0.005))
-    A = np.array([[1.0, dt], [0.0, 1.0 - kv * dt]])
-    B = np.array([[0.0], [kv * dt]])
-    Ap = [np.linalg.matrix_power(A, k) for k in range(N + 1)]
-    G = np.zeros((2 * N, N))
-    for k in range(1, N + 1):
-        for j in range(k):
-            G[2 * (k - 1):2 * k, j] = (Ap[k - 1 - j] @ B).ravel()
-    W = np.zeros(2 * N)
-    W[0::2] = qe
-    W[1::2] = qv
-    W[-2] = qe * 10.0
-    Wd = np.diag(W)
-    P = G.T @ Wd @ G + r * np.eye(N)
-    Ps = sparse.csc_matrix((P + P.T) / 2)
-    Aq = sparse.eye(N, format="csc")
-    GtW = G.T @ Wd
-    solvers = []
-    for _ in range(MAX_JOINTS):
-        s = osqp.OSQP()
-        s.setup(Ps, np.zeros(N), Aq, np.full(N, -vmax), np.full(N, vmax),
-                verbose=False, max_iter=200, warm_start=True)
-        solvers.append(s)
-    ctx = {"N": N, "Ap": Ap, "GtW": GtW, "vmax": vmax, "solvers": solvers,
-           "np": np}
-    _lag_mpc_cache[key] = ctx
-    return ctx
-
-
-def _mpc_solve_lag(q, target_angles, q_vel, dt):
-    """Lag-aware MPC step. q_vel = joint velocities (LC deg/s) or None."""
-    import numpy as np
-    ctx = _lag_mpc_get(dt)
-    N, Ap, GtW, vmax = ctx["N"], ctx["Ap"], ctx["GtW"], ctx["vmax"]
-    next_pos, vel_cmd = [], []
-    for j in range(MAX_JOINTS):
-        e0 = float(q[j]) - float(target_angles[j])
-        v0 = float(q_vel[j]) if q_vel is not None else 0.0
-        x0 = np.array([e0, v0])
-        f = np.concatenate([(Ap[k] @ x0) for k in range(1, N + 1)])
-        ctx["solvers"][j].update(q=GtW @ f)
-        res = ctx["solvers"][j].solve()
-        if res.info.status.startswith("solved"):
-            u0 = float(np.clip(res.x[0], -vmax, vmax))
-        else:
-            u0 = float(np.clip(-2.0 * e0, -vmax, vmax))
-        vel_cmd.append(u0)
-        next_pos.append(float(q[j]) + u0 * dt)
-    return next_pos, vel_cmd
 
 
 def _mpc_solve_osqp(q, target_angles, dt):
@@ -379,30 +339,33 @@ def _mpc_solve_osqp(q, target_angles, dt):
 
 
 def mpc_solve(q, target_angles, dt=None, q_vel=None):
-    """MPC. Default = lag-aware velocity MPC (sim-tuned: 0% overshoot at
-    the drive-limited rise time). Set mpc.use_lag: false in the yaml to
-    fall back to the legacy integrator MPC (TinyMPC/OSQP)."""
+    # LAG-AWARE LQR-CLAMP (sim-tuned 2026-08-24 on the MuJoCo twin):
+    # u = -K @ [err, vel] clamped to +-VMAX deg/s. K from the DARE of the
+    # 2-state drive-lag model (kv=40/s, dt=4ms, qe=100 qv=1 r=0.005).
+    # Replaces the integrator MPC whose model ignored drive lag ->
+    # ~5% overshoot (= drive braking distance). Solver-free: Pi-safe.
+    _K0 = _ov("k0", 6.0)        # hardware-tuned 2026-09-17 (53.48 limit-cycled on the real drive)
+    _K1 = _ov("k1", 0.0)        # true velocity feedback now; K1 only for streaming (0.2-0.3)
+    _VMAX = _ov("vmax", 50.0)
+    _VS = _ov("vel_scale", 17.0)         # drive velocity units per deg/s (measured 2026-09-17)
+    if dt is None or dt <= 0:
+        dt = PERIOD_SEC
+    next_pos, vel_cmd = [], []
+    for _j in range(MAX_JOINTS):
+        _e = float(q[_j]) - float(target_angles[_j])
+        _v = float(q_vel[_j]) if q_vel is not None else 0.0
+        _u = -(_K0 * _e + _K1 * _v)
+        _u = max(-_VMAX, min(_VMAX, _u))
+        vel_cmd.append(_u * _VS)
+        next_pos.append(float(q[_j]) + _u * dt)
+    return next_pos, vel_cmd
+
+
+def _mpc_solve_legacy(q, target_angles, dt=None):
+    """MPC: TinyMPC if available, else OSQP fallback. Returns (next_pos, vel_cmd)."""
     global _mpc_use_tinympc
     if dt is None or dt <= 0:
         dt = PERIOD_SEC
-    mode = get_controller_params().get("mpc", {}).get("use_lag", "lqr")
-    if mode == "lqr" or mode is True:
-        # LQR-clamp form of the lag-aware MPC (validated identical to the
-        # QP in sim; deployed on the Pi). u = -K @ [err, vel], clamp VMAX.
-        K0, K1, VMAX = 53.4798, 4.7131, 40.0
-        next_pos, vel_cmd = [], []
-        for j in range(MAX_JOINTS):
-            e = float(q[j]) - float(target_angles[j])
-            v = float(q_vel[j]) if q_vel is not None else 0.0
-            u = max(-VMAX, min(VMAX, -(K0 * e + K1 * v)))
-            vel_cmd.append(u)
-            next_pos.append(float(q[j]) + u * PERIOD_SEC)
-        return next_pos, vel_cmd
-    if mode == "qp":
-        try:
-            return _mpc_solve_lag(q, target_angles, q_vel, PERIOD_SEC)
-        except Exception:
-            pass
     if _mpc_use_tinympc is None:
         try:
             import tinympc as _tm

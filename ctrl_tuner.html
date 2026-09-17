@@ -1,0 +1,552 @@
+<title>Pro 630 Controller Tuner</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f5f6f3; --ink:#1b2430; --muted:#5d6876; --panel:#e8ebe6; --line:#c5cbc4;
+  --accent:#0e7c8b; --accent-soft:#d5ecef; --warm:#b5701c; --warm-soft:#f4e6d0;
+  --danger:#a83a2c; --danger-soft:#f3dcd8; --ok:#2f7d4a; --code-bg:#e3e7e2; --sim:#7a5cc4;
+  --h1:#0e7c8b; --h2:#b5701c; --h3:#2f7d4a; --h4:#8a4b8f; --h5:#5d6876;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#121820; --ink:#e4e9ee; --muted:#98a4b1; --panel:#1b242e; --line:#36414d;
+    --accent:#45bccb; --accent-soft:#163a41; --warm:#e2a651; --warm-soft:#3a2c14;
+    --danger:#e07a6a; --danger-soft:#3d1f1a; --ok:#5fc07f; --code-bg:#1f2933; --sim:#b39ce8;
+    --h1:#45bccb; --h2:#e2a651; --h3:#5fc07f; --h4:#c98fd0; --h5:#98a4b1;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#121820; --ink:#e4e9ee; --muted:#98a4b1; --panel:#1b242e; --line:#36414d;
+  --accent:#45bccb; --accent-soft:#163a41; --warm:#e2a651; --warm-soft:#3a2c14;
+  --danger:#e07a6a; --danger-soft:#3d1f1a; --ok:#5fc07f; --code-bg:#1f2933; --sim:#b39ce8;
+  --h1:#45bccb; --h2:#e2a651; --h3:#5fc07f; --h4:#c98fd0; --h5:#98a4b1;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:14px;line-height:1.45;margin:0}
+.wrap{max-width:1400px;margin:0 auto;padding-inline:18px;padding-block:20px 60px}
+h1,h2,h3{font-family:"IBM Plex Sans Condensed","IBM Plex Sans",sans-serif;margin:0;line-height:1.15;text-wrap:balance}
+h1{font-size:1.7rem;font-weight:600}
+h2{font-size:1.1rem;font-weight:600;letter-spacing:.02em}
+h3{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px}
+.mono,code,input,select,button{font-family:"IBM Plex Mono",ui-monospace,monospace}
+code{background:var(--code-bg);padding:1px 5px;border-radius:3px;font-size:.88em}
+.top{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:baseline;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:12px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;font-size:.8rem;font-family:"IBM Plex Mono",monospace;background:var(--panel);color:var(--muted)}
+.pill.on{background:var(--accent-soft);color:var(--accent)}
+.pill.bad{background:var(--danger-soft);color:var(--danger)}
+.pill.warn{background:var(--warm-soft);color:var(--warm)}
+.pills{display:flex;flex-wrap:wrap;gap:8px}
+details{margin-top:14px;border:1px solid var(--line);border-radius:4px;background:var(--panel)}
+summary{cursor:pointer;padding:10px 14px;font-family:"IBM Plex Sans Condensed",sans-serif;font-weight:600;font-size:1rem}
+details>div{padding:0 14px 14px}
+.scroll{overflow-x:auto;border-radius:4px;background:var(--bg)}
+svg.arch{display:block;max-width:100%;height:auto;min-width:720px;font-family:"IBM Plex Sans",system-ui,sans-serif}
+.lane{fill:var(--panel);stroke:none}
+.lanehead{fill:var(--ink);font-family:"IBM Plex Sans Condensed",sans-serif;font-weight:600;font-size:14px;letter-spacing:.04em}
+.lanesub{fill:var(--muted);font-family:"IBM Plex Mono",monospace;font-size:11px}
+.box{fill:var(--bg);stroke:var(--ink);stroke-width:1.1}
+.box.hot{stroke:var(--accent);stroke-width:1.6;fill:var(--accent-soft)}
+.box.warm{stroke:var(--warm);stroke-width:1.4;fill:var(--warm-soft)}
+.t{fill:var(--ink);font-size:12.5px;font-weight:500}
+.s{fill:var(--muted);font-size:11px}
+.m{fill:var(--muted);font-family:"IBM Plex Mono",monospace;font-size:10.5px}
+.ma{fill:var(--accent);font-family:"IBM Plex Mono",monospace;font-size:10.5px;font-weight:500}
+.mw{fill:var(--warm);font-family:"IBM Plex Mono",monospace;font-size:10.5px;font-weight:500}
+.arr{stroke:var(--ink);stroke-width:1.2;fill:none}
+.arr.a{stroke:var(--accent);stroke-width:1.6}
+.arr.w{stroke:var(--warm);stroke-width:1.4}
+.arr.d{stroke-dasharray:4 3}
+figcaption{color:var(--muted);font-size:.85rem;margin-top:6px}
+.grid{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:18px;margin-top:18px}
+@media (max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:var(--panel);border-radius:4px;padding:12px 14px}
+.card+.card{margin-top:14px}
+.row{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}
+label.f{display:grid;grid-template-columns:110px 1fr 74px;gap:8px;align-items:center;font-size:.82rem;margin:5px 0}
+label.f span.n{color:var(--muted)}
+input[type=range]{width:100%;accent-color:var(--accent)}
+input[type=number],input[type=text],select{width:100%;padding:4px 6px;border:1px solid var(--line);border-radius:3px;background:var(--bg);color:var(--ink);font-size:.8rem}
+input:focus,select:focus,button:focus{outline:2px solid var(--accent);outline-offset:1px}
+button{padding:6px 12px;border:1px solid var(--line);border-radius:3px;background:var(--bg);color:var(--ink);font-size:.82rem;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{background:var(--danger);border-color:var(--danger);color:#fff}
+button.warn{background:var(--warm-soft);border-color:var(--warm);color:var(--warm)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.q{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;font-family:"IBM Plex Mono",monospace;font-size:.8rem}
+.q div{background:var(--bg);border-radius:3px;padding:4px 6px;text-align:right;font-variant-numeric:tabular-nums}
+.q div small{display:block;color:var(--muted);text-align:left;font-size:.68rem}
+canvas{display:block;width:100%;background:var(--bg);border-radius:4px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;margin-top:8px}
+.metrics div{background:var(--bg);border-radius:3px;padding:6px 8px;font-variant-numeric:tabular-nums}
+.metrics b{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:500}
+.metrics span{font-family:"IBM Plex Mono",monospace;font-size:.95rem}
+.metrics span.sim{color:var(--sim);font-size:.75rem;margin-left:6px}
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:.78rem;color:var(--muted);margin:6px 0}
+.legend i{display:inline-block;width:20px;border-top:2px solid var(--accent);vertical-align:middle;margin-right:5px}
+.legend i.sim{border-top-style:dashed;border-color:var(--sim)}
+.legend i.tgt{border-color:var(--muted);border-top-width:1px}
+.legend i.cmd{border-color:var(--warm)}
+table{border-collapse:collapse;width:100%;font-size:.78rem;font-family:"IBM Plex Mono",monospace}
+td,th{padding:4px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-family:"IBM Plex Sans Condensed",sans-serif;text-transform:uppercase;letter-spacing:.05em;font-size:.68rem;color:var(--muted)}
+td.sw{width:14px}td.sw i{display:inline-block;width:10px;height:10px;border-radius:2px}
+.note{border-left:3px solid var(--warm);background:var(--warm-soft);padding:6px 10px;border-radius:0 3px 3px 0;font-size:.82rem;margin-top:8px}
+.log{font-family:"IBM Plex Mono",monospace;font-size:.75rem;color:var(--muted);max-height:120px;overflow:auto;background:var(--bg);padding:6px 8px;border-radius:3px;white-space:pre-wrap}
+.hint{font-size:.78rem;color:var(--muted)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+<div class="top">
+  <div><h1>Pro 630 Controller Tuner</h1><div class="hint">Step-test robot_hal's control laws with per-move parameter overrides. Solid = real arm, dashed = sim model.</div></div>
+  <div class="pills">
+    <span class="pill" id="p-live">GUI: connecting…</span>
+    <span class="pill" id="p-stream">stream :9999</span>
+    <span class="pill" id="p-cmd">cmd :9998</span>
+    <span class="pill" id="p-state">robot: —</span>
+  </div>
+</div>
+
+<details>
+<summary>System architecture (desktop → Pi → drives)</summary>
+<div>
+<figure style="margin:0"><div class="scroll"><svg class="arch" viewBox="0 0 1180 660" role="img" aria-label="Three lanes: the desktop runs the cuRobo planner, a ROS 2 node and a TCP bridge; the Raspberry Pi runs robot_hal inside LinuxCNC HAL and the pro600 CAN driver; the robot holds the STM32 master and six joint drives. Arrows show the command path down and the feedback path back up.">
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="context-stroke"/></marker>
+  <marker id="ahi" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--ink)"/></marker>
+  <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--accent)"/></marker>
+  <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill:var(--warm)"/></marker>
+</defs>
+
+<!-- lanes -->
+<rect class="lane" x="20" y="20" width="380" height="600" rx="4"/>
+<rect class="lane" x="420" y="20" width="380" height="600" rx="4"/>
+<rect class="lane" x="820" y="20" width="340" height="600" rx="4"/>
+<text class="lanehead" x="36" y="46">THIS COMPUTER</text>
+<text class="lanesub" x="36" y="63">desktop · GPU · ROS 2 Humble (DOMAIN_ID 42)</text>
+<text class="lanehead" x="436" y="46">RASPBERRY PI 4</text>
+<text class="lanesub" x="436" y="63">10.0.0.27 · LinuxCNC · linuxcnc elerob.ini</text>
+<text class="lanehead" x="836" y="46">MYCOBOT PRO 630</text>
+<text class="lanesub" x="836" y="63">STM32 master · 6 joint drives · CAN</text>
+
+<!-- DESKTOP: bridge (top) -->
+<rect class="box" x="40" y="90" width="340" height="86" rx="3"/>
+<text class="t" x="52" y="110">mycobot_ros2_bridge.py</text>
+<text class="s" x="52" y="127">ROS 2 topics ⇄ newline-JSON TCP to the Pi</text>
+<text class="m" x="52" y="144">pub /joint_states (rad) · /mycobot/status</text>
+<text class="m" x="52" y="160">sub /mycobot/cmd/move · srv /mycobot/home</text>
+
+<!-- DESKTOP: node -->
+<rect class="box" x="40" y="250" width="340" height="96" rx="3"/>
+<text class="t" x="52" y="270">curobo_controller_node.py / online_planner_node.py</text>
+<text class="s" x="52" y="287">rclpy · closes the outer loop at ~10 Hz</text>
+<text class="m" x="52" y="304">goal: TCP pose or joint target</text>
+<text class="m" x="52" y="320">rad → LinuxCNC deg (joint_conventions)</text>
+<text class="m" x="52" y="336">chunk mode: stream 0.2–0.4 s slices of one plan</text>
+
+<!-- DESKTOP: planner server -->
+<rect class="box hot" x="40" y="420" width="340" height="96" rx="3"/>
+<text class="t" x="52" y="440">curobo_planner_server_v2.py</text>
+<text class="s" x="52" y="457">cuRobo MotionGen on GPU · conda env curobo2</text>
+<text class="m" x="52" y="474">TCP 127.0.0.1:9997 · ping / plan_pose / plan_joint</text>
+<text class="m" x="52" y="490">world: ground, back-wall keep-out x&lt;−0.30, D435 mount</text>
+<text class="m" x="52" y="506">ee_link = tcp (0.135 m below flange)</text>
+
+<!-- desktop vertical arrows -->
+<line class="arr" x1="150" y1="176" x2="150" y2="250" marker-end="url(#ahi)"/>
+<text class="m" x="158" y="200">/joint_states</text>
+<text class="m" x="158" y="214">100 Hz, Pi-stamped</text>
+<line class="arr a" x1="300" y1="250" x2="300" y2="176" marker-end="url(#aha)"/>
+<text class="ma" x="196" y="236">/mycobot/cmd/move</text>
+
+<line class="arr" x1="150" y1="346" x2="150" y2="420" marker-end="url(#ahi)"/>
+<text class="m" x="158" y="372">start_q (rad) + goal</text>
+<line class="arr a" x1="300" y1="420" x2="300" y2="346" marker-end="url(#aha)"/>
+<text class="ma" x="196" y="404">trajectory (rad), dt</text>
+
+<!-- PI: robot_hal -->
+<rect class="box hot" x="440" y="90" width="340" height="130" rx="3"/>
+<text class="t" x="452" y="110">robot_hal.py — HAL userspace component “ctrl”</text>
+<text class="s" x="452" y="127">Python, non-realtime, loaded by elerob.hal (loadusr)</text>
+<text class="m" x="452" y="144">:9998 cmd/status   :9999 state stream 100 Hz</text>
+<text class="m" x="452" y="160">loop 10–20 ms: poll → solve → write pins</text>
+<text class="m" x="452" y="176">solve = pid | invdyn | pd_velff | mpc (LQR-clamp)</text>
+<text class="m" x="452" y="192">idle: hold last target, 0.6 s on / 0.4 s off</text>
+<text class="m" x="452" y="208">suction: halcmd setp pro600.digital_out00</text>
+
+<!-- PI: HAL RT -->
+<rect class="box" x="440" y="290" width="340" height="112" rx="3"/>
+<text class="t" x="452" y="310">LinuxCNC HAL realtime (elerob.hal)</text>
+<text class="m" x="452" y="328">servo-thread 10 ms: motion, mux-gen ×12, ddt</text>
+<text class="m" x="452" y="344">slow-thread 20 ms: pid.0–5 (P=60, I=0), pro_socketcan</text>
+<text class="s" x="452" y="364">ctrl.enable selects the mux inputs:</text>
+<text class="m" x="452" y="380">1 → ctrl.jointN_vel_cmd goes straight to the drive</text>
+<text class="m" x="452" y="396">0 → LinuxCNC motion + HAL pid drive it (GUI jog)</text>
+
+<!-- PI: pro600 -->
+<rect class="box" x="440" y="470" width="340" height="80" rx="3"/>
+<text class="t" x="452" y="490">pro600 driver (hal_ele_master600)</text>
+<text class="m" x="452" y="508">in: jointN_poscmd (velocity units), jointN_motor_poscmd</text>
+<text class="m" x="452" y="524">out: jointN_posfb, status_word, svr_enabled</text>
+<text class="m" x="452" y="540">motor_time_interval = 10–20 ms · digital_out00 = pump</text>
+
+<!-- pi vertical arrows -->
+<line class="arr a" x1="560" y1="220" x2="560" y2="290" marker-end="url(#aha)"/>
+<text class="ma" x="568" y="244">ctrl.jointN_pos_cmd</text>
+<text class="ma" x="568" y="258">ctrl.jointN_vel_cmd, enable</text>
+<line class="arr" x1="740" y1="290" x2="740" y2="220" marker-end="url(#ahi)"/>
+<text class="m" x="668" y="278">linuxcnc.stat: q, q̇</text>
+
+<line class="arr a" x1="560" y1="402" x2="560" y2="470" marker-end="url(#aha)"/>
+<text class="ma" x="568" y="426">mux out → pro600.jointN_poscmd</text>
+<text class="ma" x="568" y="440">every slow-thread tick</text>
+<line class="arr" x1="740" y1="470" x2="740" y2="402" marker-end="url(#ahi)"/>
+<text class="m" x="700" y="458">posfb</text>
+
+<!-- ROBOT boxes -->
+<rect class="box warm" x="840" y="90" width="300" height="78" rx="3"/>
+<text class="t" x="852" y="110">Safety and power</text>
+<text class="m" x="852" y="128">base START button once per power-up</text>
+<text class="m" x="852" y="144">e-stop loop → svr_en → machine-on chain</text>
+<text class="m" x="852" y="160">robot_hal SIGINT = power off + brakes</text>
+
+<rect class="box" x="840" y="290" width="300" height="112" rx="3"/>
+<text class="t" x="852" y="310">6 × joint drive (velocity mode)</text>
+<text class="m" x="852" y="328">inner position loop ≈ first-order lag, kv ≈ 40 /s</text>
+<text class="m" x="852" y="344">saturates ≈ 60 °/s; keep plans ≤ 55 °/s</text>
+<text class="m" x="852" y="360">following-error trip → power-off fault</text>
+<text class="m" x="852" y="376">encoder → posfb · brakes engage on power-off</text>
+<text class="m" x="852" y="392">suction pump on digital_out00</text>
+
+<rect class="box" x="840" y="470" width="300" height="80" rx="3"/>
+<text class="t" x="852" y="490">STM32 master board</text>
+<text class="m" x="852" y="508">CAN daisy-chain to the six drives</text>
+<text class="m" x="852" y="524">RX status/encoder frames, TX command frames</text>
+<text class="m" x="852" y="540">deaf drives = TX not ACKed (hardware)</text>
+
+<!-- robot vertical arrows -->
+<line class="arr a" x1="960" y1="470" x2="960" y2="402" marker-end="url(#aha)"/>
+<text class="ma" x="968" y="440">vel cmd per joint</text>
+<line class="arr" x1="1060" y1="402" x2="1060" y2="470" marker-end="url(#ahi)"/>
+<text class="m" x="1068" y="440">encoder</text>
+
+<!-- horizontal cross-lane arrows: desktop <-> pi -->
+<line class="arr a" x1="380" y1="118" x2="440" y2="118" marker-end="url(#aha)"/>
+<text class="ma" x="384" y="108" text-anchor="start">TCP :9998</text>
+<line class="arr" x1="440" y1="158" x2="380" y2="158" marker-end="url(#ahi)"/>
+<text class="m" x="384" y="176" text-anchor="start">TCP :9999</text>
+
+<!-- pi <-> robot CAN -->
+<line class="arr a" x1="780" y1="500" x2="840" y2="500" marker-end="url(#aha)"/>
+<line class="arr" x1="840" y1="530" x2="780" y2="530" marker-end="url(#ahi)"/>
+<text class="ma" x="810" y="488" text-anchor="middle">CAN</text>
+<text class="m" x="810" y="550" text-anchor="middle">≈2 ms</text>
+
+<!-- dead-time bracket -->
+<path class="arr w d" d="M60 600 L60 590 L1000 590 L1000 600"/>
+<text class="mw" x="530" y="612" text-anchor="middle">publish on /mycobot/cmd/move → motion starts: ≈0.58 s fixed dead-time (DDS → bridge → TCP → queue → drive lag), uniform across joints</text>
+</svg></div><figcaption>Command path desktop → Pi → drives; the tuner talks to robot_hal on :9998/:9999 directly (no ROS bridge needed).</figcaption></figure>
+</div>
+</details>
+
+<div class="grid">
+<div>
+  <div class="card">
+    <h3>Joint state (LinuxCNC deg)</h3>
+    <div class="q" id="qgrid"></div>
+    <div class="row" style="margin-top:8px">
+      <span class="hint" id="qinfo">no stream</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Controller</h3>
+    <label class="f"><span class="n">law</span>
+      <select id="ctrl"><option value="mpc">mpc (LQR-clamp)</option><option value="pid">pid</option><option value="pd_velff">pd_velff</option></select><span></span></label>
+    <div id="params"></div>
+    <label class="f"><span class="n">period_ms</span><input type="range" id="period" min="4" max="40" step="1" value="10"><input type="number" id="period_n" min="4" max="50" step="1" value="10"></label>
+    <label class="f" title="robot_hal safety ceiling on |ctrl.jointN_vel_cmd| (drive units, ~15 per deg/s) for this move"><span class="n">vel_cmd_max</span><input type="range" id="vcm" min="10" max="2000" step="10" value="900"><input type="number" id="vcm_n" min="10" max="2000" step="10" value="900"></label>
+    <div class="hint">Overrides apply to this move only; hold mode returns to the yaml defaults. Blank = robot default.</div>
+    <div class="row" style="margin-top:8px"><button id="reset">Reset to deployed defaults</button></div>
+  </div>
+
+  <div class="card">
+    <h3>Step test</h3>
+    <label class="f"><span class="n">joint</span><select id="joint"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select><span></span></label>
+    <label class="f"><span class="n">step (deg)</span><input type="range" id="delta" min="-30" max="30" step="0.5" value="5"><input type="number" id="delta_n" min="-30" max="30" step="0.5" value="5"></label>
+    <label class="f"><span class="n">duration (s)</span><input type="range" id="dur" min="0.5" max="15" step="0.5" value="4"><input type="number" id="dur_n" min="0.5" max="15" step="0.5" value="4"></label>
+    <label class="f"><span class="n">label</span><input type="text" id="label" placeholder="optional"><span></span></label>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" id="run">Run step</button>
+      <button id="back">Step back (−)</button>
+      <button class="warn" id="hold">Hold here</button>
+      <button class="danger" id="estop">E-STOP</button>
+    </div>
+    <div class="hint" style="margin-top:6px">Target = current pose with one joint offset, clamped to soft limits and ±30°. Hold = command the current pose. E-STOP = SIGINT robot_hal (power off + brakes), needs a full LinuxCNC restart afterwards.</div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="card">
+    <h3>Stream test (welded sinusoid)</h3>
+    <label class="f"><span class="n">amp (deg)</span><input type="range" id="samp" min="-20" max="20" step="0.5" value="8"><input type="number" id="samp_n" step="0.5" value="8"></label>
+    <label class="f"><span class="n">freq (Hz)</span><input type="range" id="sfreq" min="0.05" max="1" step="0.05" value="0.25"><input type="number" id="sfreq_n" step="0.05" value="0.25"></label>
+    <label class="f"><span class="n">cycles</span><input type="range" id="scyc" min="0.5" max="6" step="0.5" value="2"><input type="number" id="scyc_n" step="0.5" value="2"></label>
+    <label class="f"><span class="n">chunk_dt (s)</span><input type="range" id="schunk" min="0.02" max="0.5" step="0.01" value="0.1"><input type="number" id="schunk_n" step="0.01" value="0.1"></label>
+    <label class="f"><span class="n">lead (s)</span><input type="range" id="slead" min="0" max="0.3" step="0.005" value="0"><input type="number" id="slead_n" step="0.005" value="0"></label>
+    <label class="f"><span class="n">vff</span><input type="range" id="svff" min="0" max="1.5" step="0.05" value="1"><input type="number" id="svff_n" step="0.05" value="1"></label>
+    <div class="row" style="margin-top:6px"><button class="primary" id="srun">Stream sine</button><span class="hint">uses the mpc K0/K1/vmax/vel_scale above; joint + label from Step test</span></div>
+    <div class="metrics" id="track" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h3>Sim model (dashed)</h3>
+    <label class="f"><span class="n">kv (1/s)</span><input type="range" id="kv" min="2" max="120" step="1" value="40"><input type="number" id="kv_n" step="1" value="40"></label>
+    <label class="f"><span class="n">dead-time (s)</span><input type="range" id="tau" min="0" max="1" step="0.01" value="0.15"><input type="number" id="tau_n" step="0.01" value="0.15"></label>
+    <label class="f"><span class="n">units / °/s</span><input type="range" id="units" min="0.1" max="30" step="0.1" value="15"><input type="number" id="units_n" step="0.1" value="15"></label>
+    <label class="f"><span class="n">v sat (°/s)</span><input type="range" id="vsat" min="5" max="120" step="1" value="60"><input type="number" id="vsat_n" step="1" value="60"></label>
+    <div class="hint">Drive as first-order velocity lag: v̇ = kv·(v* − v), v* = clip(vel_cmd/units, ±vsat), delayed by dead-time. Same control law as the Pi, same period. Fit kv, dead-time and units so the dashed line matches a real run, then tune gains against it.</div>
+  </div>
+</div>
+
+<div>
+  <div class="card">
+    <div class="row" style="justify-content:space-between"><h2>Position response</h2>
+      <div class="legend"><span><i></i>real q</span><span><i class="sim"></i>sim q</span><span><i class="tgt"></i>target</span><span><i class="cmd"></i>cmd_pos (Pi log)</span></div></div>
+    <canvas id="cpos" height="360"></canvas>
+    <div class="metrics" id="metrics"></div>
+    <h3 style="margin-top:12px">Latency per hop (ms) — this run</h3>
+    <div class="metrics" id="latency"><div class="hint">run a step to measure</div></div>
+  </div>
+  <div class="card">
+    <div class="row" style="justify-content:space-between"><h2>Velocity command</h2>
+      <div class="legend"><span><i class="cmd"></i>cmd_vel (Pi log, drive units)</span><span><i class="sim"></i>sim vel_cmd</span><span><i></i>q̇ stream (°/s)</span></div></div>
+    <canvas id="cvel" height="220"></canvas>
+  </div>
+  <div class="card">
+    <div class="row" style="justify-content:space-between"><h2>Runs</h2><div class="row"><button id="refreshRuns">Refresh</button><button id="clearOverlay">Clear overlays</button></div></div>
+    <div class="hint">Tick runs to overlay them on the plots (same joint recommended). Runs are saved in <code>logs/tuner_runs/</code>.</div>
+    <div style="overflow-x:auto;margin-top:6px"><table id="runs"><thead><tr><th></th><th>id</th><th>label</th><th>law</th><th>gains</th><th>j</th><th>Δ°</th><th>over%</th><th>rise s</th><th>settle s</th><th>dead s</th></tr></thead><tbody></tbody></table></div>
+  </div>
+</div>
+</div>
+</div>
+
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const DEF = {
+  mpc:      [["k0",6,0,40,0.1,"K on position error (hardware: 6 for steps, 14-20 for streaming)"],["k1",0,0,5,0.05,"K on velocity (0 for steps, 0.2-0.3 for streaming)"],["vmax",50,0,60,0.5,"clamp °/s (drive saturates ≈50)"],["vel_scale",17,0.05,30,0.05,"drive units per °/s (measured 17 on 2026-09-17)"]],
+  pid:      [["kp",5000,0,20000,10,"Kp (per-joint yaml: 5000-8000)"],["kd",10,0,200,0.5,"Kd"],["ki",8000,0,20000,10,"Ki"],["u_max",80000,0,200000,100,"u clamp / step"]],
+  pd_velff: [["kp",1.6,0,10,0.01,"Kp"],["kd",0.2667,0,3,0.01,"Kd"]],
+};
+const HIST = ["--h1","--h2","--h3","--h4","--h5"];
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+let live=false, status=null, run=null, liveStream=[], simSeries=null, overlays=[], runsCache=[], polling=null;
+
+// ---------- params UI ----------
+function buildParams(){
+  const c=$("ctrl").value, box=$("params"); box.innerHTML="";
+  for(const [k,d,lo,hi,st,desc] of DEF[c]){
+    const l=document.createElement("label"); l.className="f"; l.title=desc;
+    l.innerHTML=`<span class="n">${k}</span><input type="range" id="g_${k}" min="${lo}" max="${hi}" step="${st}" value="${d}"><input type="number" id="g_${k}_n" step="${st}" value="${d}">`;
+    box.appendChild(l);
+    pair(`g_${k}`,`g_${k}_n`, resim);
+  }
+  resim();
+}
+function pair(a,b,cb){
+  const A=$(a),B=$(b);
+  A.addEventListener("input",()=>{B.value=A.value; cb&&cb();});
+  B.addEventListener("input",()=>{A.value=B.value; cb&&cb();});
+}
+function gains(){
+  const c=$("ctrl").value, g={};
+  for(const [k] of DEF[c]){ const v=parseFloat($(`g_${k}_n`).value); if(!isNaN(v)) g[k]=v; }
+  return g;
+}
+$("ctrl").addEventListener("change",buildParams);
+$("reset").addEventListener("click",()=>{buildParams(); $("period").value=$("period_n").value=10;});
+["period","delta","dur","kv","tau","units","vsat","vcm"].forEach(k=>pair(k,k+"_n",resim));
+["samp","sfreq","scyc","schunk","slead","svff"].forEach(k=>pair(k,k+"_n",null));
+$("joint").addEventListener("change",resim);
+
+// ---------- sim ----------
+function simulate(ctrl,g,q0,tgt,dur,periodMs,model){
+  const dt=periodMs/1000, sub=0.001, n=Math.round(dur/sub);
+  let q=q0, v=0, integ=0, velCmd=0, tNextCtrl=0, delayQ=[]; const dlen=Math.max(1,Math.round(model.tau/sub));
+  const T=[],Q=[],U=[]; let tt=0;
+  for(let i=0;i<=n;i++){
+    if(tt>=tNextCtrl-1e-9){ // controller tick
+      const e=q-tgt;
+      if(ctrl==="mpc"){ let u=-(g.k0*e+g.k1*v); u=Math.max(-g.vmax,Math.min(g.vmax,u)); velCmd=u*(g.vel_scale??1); }
+      else if(ctrl==="pid"){ integ+=(-e)*dt; const ic=g.integral_clamp??500000; integ=Math.max(-ic,Math.min(ic,integ)); let u=g.kp*(-e)-g.kd*v+g.ki*integ; const um=g.u_max??80000; u=Math.max(-um,Math.min(um,u)); velCmd=u/dt*0.5; }
+      else { velCmd=g.kp*(-e)-g.kd*v; }
+      tNextCtrl+=dt; U.push([tt,velCmd]);
+    }
+    delayQ.push(velCmd); const cmdEff = delayQ.length>dlen ? delayQ.shift() : 0;
+    let vs=cmdEff/model.units; vs=Math.max(-model.vsat,Math.min(model.vsat,vs));
+    v+=model.kv*(vs-v)*sub; q+=v*sub;
+    if(i%5===0){T.push(tt);Q.push(q);}
+    tt+=sub;
+  }
+  return {t:T,q:Q,u:U};
+}
+function model(){ return {kv:+$("kv_n").value,tau:+$("tau_n").value,units:+$("units_n").value,vsat:+$("vsat_n").value}; }
+function resim(){
+  const j=+$("joint").value, d=+$("delta_n").value, dur=+$("dur_n").value;
+  const q0=(status&&status.q)?status.q[j]:0;
+  simSeries=simulate($("ctrl").value,gains(),q0,q0+d,dur+0.6,+$("period_n").value,model());
+  simSeries.q0=q0; simSeries.tgt=q0+d;
+  draw();
+}
+
+// ---------- metrics ----------
+function metrics(t,q,q0,tgt,tCmd=0){
+  const step=tgt-q0; if(!t.length||Math.abs(step)<1e-6) return {};
+  const norm=q.map(x=>(x-q0)/step);
+  let dead=null,r10=null,r90=null,peak=-Infinity,settle=null;
+  for(let i=0;i<t.length;i++){
+    if(t[i]<tCmd) continue;
+    if(dead===null&&Math.abs(q[i]-q0)>0.2) dead=t[i]-tCmd;
+    if(r10===null&&norm[i]>=0.1) r10=t[i];
+    if(r90===null&&norm[i]>=0.9) r90=t[i];
+    if(norm[i]>peak) peak=norm[i];
+    if(Math.abs(q[i]-tgt)>0.5) settle=t[i]-tCmd;
+  }
+  const tail=q.filter((x,i)=>t[i]>t[t.length-1]-0.5);
+  const sse=tail.length?tail.reduce((a,b)=>a+b,0)/tail.length-tgt:null;
+  return {dead,rise:(r10!==null&&r90!==null)?r90-r10:null,over:Math.max(0,(peak-1)*100),settle:(settle===null?0:settle),sse};
+}
+const f=(v,d=2)=>v==null||isNaN(v)?"—":(+v).toFixed(d);
+function showLatency(L){
+  if(!L){ $("latency").innerHTML='<div class="hint">no latency data</div>'; return; }
+  const names={cmd_net_desktop_to_pi:"desktop → Pi (cmd net)",ack_round_trip:"ack round trip",queue_wait_on_pi:"Pi queue wait (hold burst)",dequeue_to_first_loop:"dequeue → loop start",first_loop_to_hal_write:"poll+solve → HAL write",hal_write_to_motion_sampled:"HAL write → motion sampled (CAN+drive)",stream_net_pi_to_desktop:"Pi → desktop (stream net)",total_send_to_motion_seen:"TOTAL send → motion seen",done_status_lag:"done status lag",clock_offset_used:"clock offset used"};
+  $("latency").innerHTML=Object.entries(names).map(([k,n])=>`<div><b>${n}</b><span>${L[k]==null?"—":L[k]}</span></div>`).join("");
+}
+function showMetrics(real,sim){
+  const M=[["dead-time","dead","s"],["rise 10–90","rise","s"],["overshoot","over","%"],["settle ±0.5°","settle","s"],["SS error","sse","°"]];
+  $("metrics").innerHTML=M.map(([n,k,u])=>`<div><b>${n} (${u})</b><span>${f(real&&real[k])}</span><span class="sim">sim ${f(sim&&sim[k])}</span></div>`).join("");
+}
+
+// ---------- plots ----------
+function axes(ctx,W,H,pad,xr,yr,xl,yl){
+  ctx.strokeStyle=css("--line"); ctx.fillStyle=css("--muted"); ctx.font="11px IBM Plex Mono, monospace"; ctx.lineWidth=1;
+  const nx=6,ny=5;
+  for(let i=0;i<=nx;i++){const x=pad.l+(W-pad.l-pad.r)*i/nx; ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,H-pad.b);ctx.stroke(); ctx.textAlign="center"; ctx.fillText((xr[0]+(xr[1]-xr[0])*i/nx).toFixed(1),x,H-pad.b+14);}
+  for(let i=0;i<=ny;i++){const y=H-pad.b-(H-pad.t-pad.b)*i/ny; ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke(); ctx.textAlign="right"; ctx.fillText((yr[0]+(yr[1]-yr[0])*i/ny).toFixed(1),pad.l-6,y+4);}
+  ctx.textAlign="left"; ctx.fillText(xl,W-pad.r-40,H-4); ctx.save(); ctx.translate(12,pad.t+10); ctx.rotate(-Math.PI/2); ctx.textAlign="right"; ctx.fillText(yl,0,0); ctx.restore();
+}
+function line(ctx,pts,color,dash,w,sx,sy){
+  if(pts.length<2) return; ctx.strokeStyle=color; ctx.lineWidth=w; ctx.setLineDash(dash||[]); ctx.beginPath();
+  pts.forEach((p,i)=>{const x=sx(p[0]),y=sy(p[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y);}); ctx.stroke(); ctx.setLineDash([]);
+}
+function prep(cv){ const dpr=window.devicePixelRatio||1; const W=cv.clientWidth||800,H=+cv.getAttribute("height"); cv.width=W*dpr;cv.height=H*dpr; const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H); return [ctx,W,H]; }
+function range(vals,padF=0.1,min=1){ let lo=Math.min(...vals),hi=Math.max(...vals); if(!isFinite(lo)){lo=0;hi=1;} let s=hi-lo; if(s<min){const c=(hi+lo)/2;lo=c-min/2;hi=c+min/2;s=min;} return [lo-s*padF,hi+s*padF]; }
+
+function currentReal(){ // returns {t,q,qv,q0,tgt,j,csv}
+  const src = run || null; if(!src) return null;
+  const j=src.joint, S=(src.stream&&src.stream.length)?src.stream:liveStream;
+  const t=S.map(s=>s[0]), q=S.map(s=>s[1][j]);
+  const qv=[]; for(let i=1;i<t.length;i++){const dt=t[i]-t[i-1]; qv.push([t[i], dt>0?(q[i]-q[i-1])/dt:0]);}
+  return {t,q,qv,q0:src.q0[j],tgt:src.target[j],j,csv:src.csv||null,dur:src.duration};
+}
+function draw(){
+  const real=currentReal(); const sim=simSeries;
+  // ---- position
+  let [ctx,W,H]=prep($("cpos")); const pad={l:52,r:14,t:12,b:26};
+  const tmax=Math.max(sim?sim.t[sim.t.length-1]:0, real?real.t[real.t.length-1]||0:0, (run&&run.ref&&run.ref.length)?run.ref[run.ref.length-1][0]:0, 1);
+  const ys=[]; if(sim){ys.push(...sim.q,sim.tgt,sim.q0);} if(real){ys.push(...real.q,real.tgt,real.q0);} if(run&&run.ref) run.ref.forEach(p=>ys.push(p[1])); overlays.forEach(o=>ys.push(...o.q));
+  const xr=[-0.3,tmax], yr=range(ys,0.08,2);
+  const sx=x=>pad.l+(x-xr[0])/(xr[1]-xr[0])*(W-pad.l-pad.r), sy=y=>H-pad.b-(y-yr[0])/(yr[1]-yr[0])*(H-pad.t-pad.b);
+  axes(ctx,W,H,pad,xr,yr,"t (s)","deg");
+  const tgt=real?real.tgt:(sim?sim.tgt:null);
+  if(run&&run.ref&&run.ref.length) line(ctx,run.ref,css("--muted"),[5,3],1.4,sx,sy); else if(tgt!=null) line(ctx,[[xr[0],tgt],[xr[1],tgt]],css("--muted"),[2,3],1,sx,sy);
+  line(ctx,[[0,yr[0]],[0,yr[1]]],css("--muted"),[1,3],1,sx,sy);
+  overlays.forEach((o,i)=>line(ctx,o.t.map((t,k)=>[t,o.q[k]]),css(HIST[i%HIST.length]),[],1.2,sx,sy));
+  if(sim) line(ctx,sim.t.map((t,i)=>[t,sim.q[i]]),css("--sim"),[6,4],1.6,sx,sy);
+  if(real&&real.csv&&real.csv.t.length) line(ctx,real.csv.t.map((t,i)=>[t,real.csv.cmd_pos[i]]).filter(p=>p[1]!=null),css("--warm"),[],1,sx,sy);
+  if(real) line(ctx,real.t.map((t,i)=>[t,real.q[i]]),css("--accent"),[],2,sx,sy);
+  // ---- velocity
+  [ctx,W,H]=prep($("cvel"));
+  const vs=[]; if(sim) vs.push(...sim.u.map(p=>p[1])); if(real&&real.csv) vs.push(...real.csv.cmd_vel.filter(v=>v!=null)); if(real) vs.push(...real.qv.map(p=>p[1]));
+  const vr=range(vs.length?vs:[0,1],0.1,2);
+  const sy2=y=>H-pad.b-(y-vr[0])/(vr[1]-vr[0])*(H-pad.t-pad.b);
+  axes(ctx,W,H,pad,xr,vr,"t (s)","units / °/s");
+  line(ctx,[[xr[0],0],[xr[1],0]],css("--muted"),[2,3],1,sx,sy2);
+  if(sim) line(ctx,sim.u,css("--sim"),[6,4],1.4,sx,sy2);
+  if(real&&real.csv&&real.csv.t.length) line(ctx,real.csv.t.map((t,i)=>[t,real.csv.cmd_vel[i]]).filter(p=>p[1]!=null),css("--warm"),[],1.2,sx,sy2);
+  if(real) line(ctx,real.qv,css("--accent"),[],1.4,sx,sy2);
+  // ---- metrics
+  showMetrics(real?metrics(real.t,real.q,real.q0,real.tgt,0):null, sim?metrics(sim.t,sim.q,sim.q0,sim.tgt,0):null);
+}
+window.addEventListener("resize",draw);
+
+// ---------- live ----------
+const logEl=$("log"); function log(m){ logEl.textContent=(new Date().toLocaleTimeString()+"  "+m+"\n"+logEl.textContent).slice(0,4000); }
+async function api(path,body){ const r=await fetch(path,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{}); return r.json(); }
+function pill(id,txt,cls){ const e=$(id); e.textContent=txt; e.className="pill "+(cls||""); }
+async function poll(){
+  try{
+    const s=await api("/api/status"); status=s; live=true;
+    pill("p-live","GUI: live","on");
+    pill("p-stream",`stream :9999 ${s.stream_ok?s.stream_hz+" Hz":"down"}`,s.stream_ok?"on":"bad");
+    pill("p-cmd",`cmd :9998 ${s.cmd_ok?"ok":"down"}`,s.cmd_ok?"on":"bad");
+    const st=s.status||{}; pill("p-state",`robot: ${st.state||"—"}${st.done_reason?" · "+st.done_reason:""}${st.avg_solve_ms!=null?" · solve "+st.avg_solve_ms+" ms":""}`,st.state==="moving"?"warn":(st.state?"on":""));
+    if(s.q){ $("qgrid").innerHTML=s.q.map((v,i)=>`<div><small>j${i}${i===+$("joint").value?" ◀":""}</small>${v.toFixed(2)}</div>`).join(""); $("qinfo").textContent=`age ${s.age_s}s · clock offset ${s.clock_offset_ms} ms · torque ${s.torque?s.torque.map(x=>x.toFixed(0)).join(" "):""}`; }
+    const busy=!!(s.run&&!s.run.done); $("run").disabled=busy||!s.cmd_ok||!s.stream_ok; $("back").disabled=$("run").disabled;
+    if(s.run&&run&&run.id===s.run.id&&!run.done){
+      const st2=await api(`/api/stream?since=${run.t0+(liveStream.length?liveStream[liveStream.length-1][0]:-0.5)}`);
+      st2.samples.forEach(x=>liveStream.push([x[0]-run.t0,x[1],x[2]]));
+      if(s.run.done){ const rr=await api("/api/run"); run=rr.run; showLatency(run.latency_ms); showTracking(run.tracking); log(`run ${run.id} done: ${run.status?run.status.done_reason:"no status"} · err ${run.status?run.status.error_norm:"?"}° · log ${run.csv?run.csv.filename:"none"}`); loadRuns(); }
+      draw();
+    }
+  }catch(e){ live=false; pill("p-live","GUI: static (no server) — sim only","warn"); }
+  clearTimeout(polling); polling=setTimeout(poll, (run&&!run.done)?100:500);
+}
+async function doStep(sign){
+  const j=+$("joint").value, d=sign*+$("delta_n").value;
+  const body={joint:j,delta:d,duration:+$("dur_n").value,controller:$("ctrl").value,gains:gains(),period_ms:+$("period_n").value,vel_cmd_max:+$("vcm_n").value,label:$("label").value};
+  const r=await api("/api/step",body);
+  if(!r.ok){ log("refused: "+r.error); return; }
+  const s=await api("/api/status");
+  run={id:r.id,t0:s.run.t0,joint:j,q0:s.run.q0,target:s.run.target,duration:body.duration,done:false,stream:[],csv:null,controller:body.controller,gains:body.gains};
+  liveStream=[]; resim(); log(`step j${j} ${d>0?"+":""}${d}° ${body.controller} ${JSON.stringify(body.gains)} period ${body.period_ms} ms → run ${r.id}`);
+  poll();
+}
+$("run").addEventListener("click",()=>doStep(+1));
+$("srun").addEventListener("click",async()=>{
+  const j=+$("joint").value; const g=Object.assign({},gains(),{vff:+$("svff_n").value,lead:+$("slead_n").value});
+  const body={joint:j,amp:+$("samp_n").value,freq:+$("sfreq_n").value,cycles:+$("scyc_n").value,chunk_dt:+$("schunk_n").value,gains:g,period_ms:+$("period_n").value,vel_cmd_max:+$("vcm_n").value,label:$("label").value};
+  const r=await api("/api/stream_sine",body); if(!r.ok){log("refused: "+r.error);return;}
+  const s=await api("/api/status"); run={id:r.id,t0:s.run.t0,joint:j,q0:s.run.q0,target:s.run.target,duration:s.run.duration,done:false,stream:[],csv:null,controller:"stream",gains:g,ref:null};
+  liveStream=[]; simSeries=null; log(`stream sine j${j} amp ${body.amp} f ${body.freq} Hz ×${body.cycles} chunk ${body.chunk_dt}s lead ${g.lead}s vff ${g.vff} → run ${r.id}`); poll();
+});
+function showTracking(T){ if(!T){$("track").innerHTML="";return;} const M=[["lag","lag_ms","ms"],["rms err","rms_err_deg","°"],["max err","max_err_deg","°"],["rms (lag-comp)","rms_err_lag_comp_deg","°"],["chunk net mean","chunk_net_ms_mean","ms"],["chunk net max","chunk_net_ms_max","ms"],["min arrival margin","chunk_margin_ms_min","ms"],["chunks acked","chunks_acked",""]];
+  $("track").innerHTML=M.map(([n,k,u])=>`<div><b>${n} ${u}</b><span>${T[k]==null?"—":T[k]}</span></div>`).join(""); }
+$("back").addEventListener("click",()=>doStep(-1));
+$("hold").addEventListener("click",async()=>{const r=await api("/api/hold",{}); log(r.ok?"hold at "+r.target.map(v=>v.toFixed(1)).join(","):"hold failed: "+r.error);});
+$("estop").addEventListener("click",async()=>{ if(!confirm("E-STOP: SIGINT robot_hal on the Pi (power off + brakes). Continue?")) return; const r=await api("/api/estop",{}); log("E-STOP: "+(r.result||r.error)); });
+
+// ---------- runs ----------
+async function loadRuns(){
+  if(!live) return; const r=await api("/api/runs"); runsCache=r.runs||[];
+  const tb=$("runs").querySelector("tbody"); tb.innerHTML="";
+  for(const x of runsCache){
+    const tr=document.createElement("tr"); const on=overlays.find(o=>o.id===x.id);
+    tr.innerHTML=`<td class="sw"><input type="checkbox" ${on?"checked":""} data-id="${x.id}"></td><td>${x.id}</td><td>${x.label||""}</td><td>${x.controller}</td><td>${JSON.stringify(x.gains||{})}${x.period_ms?" @"+x.period_ms+"ms":""}</td><td>${x.joint}</td><td>${f(x.delta,1)}</td><td id="m_${x.id}_over">…</td><td id="m_${x.id}_rise"></td><td id="m_${x.id}_settle"></td><td id="m_${x.id}_dead"></td>`;
+    tb.appendChild(tr);
+    tr.querySelector("input").addEventListener("change",async ev=>{
+      if(ev.target.checked){ const rr=await api(`/api/run_file?id=${x.id}`); if(rr.run&&rr.run.stream.length){ const j=rr.run.joint; overlays.push({id:x.id,t:rr.run.stream.map(s=>s[0]),q:rr.run.stream.map(s=>s[1][j])}); } }
+      else overlays=overlays.filter(o=>o.id!==x.id);
+      draw();
+    });
+    api(`/api/run_file?id=${x.id}`).then(rr=>{ if(!rr.run||!rr.run.stream.length) return; const j=rr.run.joint,S=rr.run.stream; const m=metrics(S.map(s=>s[0]),S.map(s=>s[1][j]),rr.run.q0[j],rr.run.target[j],0);
+      $(`m_${x.id}_over`).textContent=f(m.over,1); $(`m_${x.id}_rise`).textContent=f(m.rise); $(`m_${x.id}_settle`).textContent=f(m.settle); $(`m_${x.id}_dead`).textContent=f(m.dead); });
+  }
+}
+$("refreshRuns").addEventListener("click",loadRuns);
+$("clearOverlay").addEventListener("click",()=>{overlays=[];loadRuns();draw();});
+
+buildParams(); poll(); setTimeout(loadRuns,800);
+})();
+</script>

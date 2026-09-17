@@ -4,7 +4,7 @@
 loadrt pandakins
 
 loadrt [EMCMOT]EMCMOT servo_period_nsec=[EMCMOT]SERVO_PERIOD traj_period_nsec=[EMCMOT]TRAJ_PERIOD num_joints=[KINS]JOINTS num_dio=64 num_aio=64
-loadrt threads name1=slow-thread period1=20000000
+loadrt threads name1=slow-thread period1=10000000
 loadrt ddt count=12
 loadrt or2 count=1
 loadrt pid num_chan=6
@@ -14,24 +14,24 @@ loadrt mux_generic config="ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2,ff2"
 loadrt hal_ele_master600
 loadrt collidet_panda
 # Copy logs/invdyn_params.npz (from identify_invdyn_from_log.py) to Raspi logs/ for model-based invdyn
-loadusr -Wn ctrl python /home/pi/Desktop/mpc/robot_hal.py --controller invdyn --params /home/pi/Desktop/mpc/logs/invdyn_params.npz
+loadusr -Wn ctrl /usr/bin/python3 -u /home/pi/Desktop/mpc/robot_hal.py --controller pid
 
 # add motion controller functions to servo thread
 addf motion-command-handler servo-thread
 addf motion-controller servo-thread
-addf mux-gen.00 servo-thread
-addf mux-gen.01 servo-thread
-addf mux-gen.02 servo-thread
-addf mux-gen.03 servo-thread
-addf mux-gen.04 servo-thread
-addf mux-gen.05 servo-thread
-addf mux-gen.06 servo-thread
-addf mux-gen.07 servo-thread
-addf mux-gen.08 servo-thread
-addf mux-gen.09 servo-thread
-addf mux-gen.10 servo-thread
-addf mux-gen.11 servo-thread
 
+addf mux-gen.00 slow-thread
+addf mux-gen.01 slow-thread
+addf mux-gen.02 slow-thread
+addf mux-gen.03 slow-thread
+addf mux-gen.04 slow-thread
+addf mux-gen.05 slow-thread
+addf mux-gen.06 slow-thread
+addf mux-gen.07 slow-thread
+addf mux-gen.08 slow-thread
+addf mux-gen.09 slow-thread
+addf mux-gen.10 slow-thread
+addf mux-gen.11 slow-thread
 addf pid.0.do-pid-calcs slow-thread
 addf pid.1.do-pid-calcs slow-thread
 addf pid.2.do-pid-calcs slow-thread
@@ -67,7 +67,7 @@ addf pro_socketcan.update slow-thread
 # Pro630: 503
 setp motion.analog-in-55 503
 
-setp pro600.motor_time_interval 20
+setp pro600.motor_time_interval 10
 
 setp pid.0.Pgain     60
 setp pid.0.Igain     0
@@ -181,7 +181,7 @@ setp pro600.joint5_home_offset -7365.860644
 
 # 512*524288 = 512rpm
 #setp pro600.motor_accelaration 268435456
-setp pro600.motor_accelaration  2097152
+setp pro600.motor_accelaration  8388608   # 4x (2026-09-17): only applied at drive init, not live; 1x=2097152 gave 250 deg/s^2, 4x ~800; 4 steps + 1 Hz sine fault-free
 
 # MPC bypass: mux_generic switches between motion (in0) and mpc (in1) when ctrl.enable=1 (sel-bit-00=TRUE)
 net sig0-mot-pos-cmd joint.0.motor-pos-cmd => mux-gen.00.in-float-00
@@ -596,3 +596,8 @@ net sig-mot-en motion.motion-enabled => pro600.motion_enabled
 net ctrl-enable => pid.0.enable pid.1.enable pid.2.enable pid.3.enable pid.4.enable pid.5.enable
 
 net sig-en pro600.svr_enabled => motion.enable colli.enable
+# --- 2026-09-17 latency notes ---
+# mux-gen.* run on slow-thread right before the CAN update (saves up to 10 ms of thread phase).
+# 5 ms option (tested, +~10 ms faster onset, half the streaming error, but 2x CAN error-state events and the
+# CAN update takes 3.5 ms of the 5 ms cycle): set period1=5000000 above, motor_time_interval 5, and
+# SERVO_PERIOD = 5000000 in elerob.ini (the ini caps thread periods). Backups: elerob.hal.bak_20260917_pre5ms
