@@ -387,6 +387,16 @@ update then fills 3.5 ms of every cycle (12 ms worst) and CAN error-state events
 (1.5/s vs 0.8/s idle) on a bus with a wiring history. Left as an opt-in; recipe at the bottom
 of `elerob.hal`.
 
+### Streaming a cuRobo plan (2026-09-17)
+
+`ctrl_tuner` `/api/stream_traj` streams any dense 6-joint trajectory (LinuxCNC deg, uniform `dt`):
+checks the start pose and soft limits, time-scales to `max_vel_deg` (only ever slows), chunks at
+10 Hz and welds on the Pi. A cuRobo `plan_pose` 10 cm straight down and back (joint 0 rig, wall at
+x = −0.30 m, ground at z = −0.10 m in the planner world) tracked with rms 0.21° / max 0.43° on the
+elbow and landed within 0.1 mm of the goal by FK (`docs/curobo_descent.png`).
+
+**B-spline control-point input is not supported yet** — see `TODO_BSPLINE.md` for the plan.
+
 ### Bring-up as of 2026-09-17
 
 ```bash

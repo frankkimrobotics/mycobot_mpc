@@ -19,6 +19,7 @@ import base64
 import csv
 import io
 import json
+import math
 import os
 import socket
 import subprocess
@@ -394,26 +395,73 @@ class Tuner:
                    "traj_dt": traj_dt, "t0": time.time(), "done": False, "status": None, "csv": None, "stream": [],
                    "ref": [], "chunks": [], "clock_offset": self.robot.clock_offset}
             self.run = run
-        threading.Thread(target=self._stream_thread, args=(run, start_delay, math), daemon=True).start()
+        def qref6(tau):
+            tau = min(max(tau, 0.0), T)
+            q = list(q0); q[j] = q0[j] + amp * (1.0 - math.cos(2 * math.pi * f * tau)) / 2.0
+            return q
+        threading.Thread(target=self._stream_thread, args=(run, start_delay, qref6), daemon=True).start()
         return run["id"]
 
-    def _stream_thread(self, run, start_delay, math):
-        j, amp, f, T = run["joint"], run["amp"], run["freq"], run["duration"]
+    def stream_traj(self, body):
+        """Stream an arbitrary joint trajectory (LinuxCNC deg, uniform dt), e.g. a cuRobo plan."""
+        import math
+        cur = self.robot.latest()
+        if cur is None:
+            raise ValueError("no joint stream yet")
+        traj = [[float(x) for x in w] for w in body["traj_deg"]]
+        dt_in = float(body["dt"])
+        if len(traj) < 2 or any(len(w) != MAX_JOINTS for w in traj):
+            raise ValueError("traj_deg must be N x 6")
+        q_now = list(cur[2])
+        if max(abs(traj[0][i] - q_now[i]) for i in range(MAX_JOINTS)) > 2.0:
+            raise ValueError("trajectory does not start at the current pose (>2 deg off)")
+        for w in traj:
+            for i in range(MAX_JOINTS):
+                lo, hi = LINUXCNC_SOFT_LIMITS_DEG[i]
+                if not lo <= w[i] <= hi:
+                    raise ValueError(f"waypoint outside soft limits on joint {i}")
+        max_vel = clamp(float(body.get("max_vel_deg", 40.0)), 1.0, 60.0)
+        peak = max(abs(traj[k + 1][i] - traj[k][i]) / dt_in for k in range(len(traj) - 1) for i in range(MAX_JOINTS))
+        scale = max(1.0, peak / max_vel)                        # only ever slows down
+        dt = dt_in * scale
+        T = dt * (len(traj) - 1)
+        with self.run_lock:
+            if self.run and not self.run.get("done"):
+                raise ValueError("a run is still in progress")
+            gains = {k: float(v) for k, v in (body.get("gains") or {}).items() if k in ("k0", "k1", "vmax", "vel_scale", "vff", "lead")}
+            chunk_dt = clamp(float(body.get("chunk_dt", 0.1)), 0.02, 1.0)
+            traj_dt = clamp(float(body.get("traj_dt", 0.01)), 0.002, 0.05)
+            start_delay = clamp(float(body.get("start_delay", 0.3)), 0.05, 2.0)
+            # plot joint = the one that moves most
+            j = max(range(MAX_JOINTS), key=lambda i: abs(traj[-1][i] - traj[0][i]))
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run = {"id": stamp, "type": "stream", "label": str(body.get("label", "traj"))[:40], "controller": "stream",
+                   "gains": gains, "period_ms": body.get("period_ms"), "vel_cmd_max": clamp(float(body.get("vel_cmd_max", 900)), 10, 2000),
+                   "joint": j, "q0": q_now, "target": traj[-1], "delta": traj[-1][j] - traj[0][j], "duration": T,
+                   "chunk_dt": chunk_dt, "traj_dt": traj_dt, "time_scale": scale, "peak_vel_planned": peak, "peak_vel_scaled": peak / scale,
+                   "t0": time.time(), "done": False, "status": None, "csv": None, "stream": [], "ref": [], "chunks": [],
+                   "clock_offset": self.robot.clock_offset, "traj_in": traj, "dt_in": dt_in}
+            self.run = run
+        def qref6(tau):
+            tau = min(max(tau, 0.0), T)
+            x = tau / dt; k = min(int(x), len(traj) - 2); a = x - k
+            return [traj[k][i] + a * (traj[k + 1][i] - traj[k][i]) for i in range(MAX_JOINTS)]
+        threading.Thread(target=self._stream_thread, args=(run, start_delay, qref6), daemon=True).start()
+        return run["id"]
+
+    def _stream_thread(self, run, start_delay, qref6):
+        j, T = run["joint"], run["duration"]
         chunk_dt, traj_dt, q0 = run["chunk_dt"], run["traj_dt"], run["q0"]
-        n_chunks = int(math.ceil(T / chunk_dt))
+        n_chunks = int(math.ceil(T / chunk_dt)) if T > 0 else 1
         n_pts = int(round(chunk_dt / traj_dt)) + 1               # one point overlap with the next chunk
         T0 = time.time() + start_delay                            # absolute start of the reference (desktop epoch ≈ Pi epoch)
         run["t0"] = T0
         off = self.robot.clock_offset
-        def qref(tau):
-            tau = min(max(tau, 0.0), T)
-            return q0[j] + amp * (1.0 - math.cos(2 * math.pi * f * tau)) / 2.0
+        qref = lambda tau: qref6(tau)[j]
         seq0 = self.robot.status_seq
         for k in range(n_chunks):
             t_anchor = T0 + k * chunk_dt
-            pts = []
-            for i in range(n_pts):
-                q = list(q0); q[j] = qref(k * chunk_dt + i * traj_dt); pts.append([round(x, 4) for x in q])
+            pts = [[round(x, 4) for x in qref6(k * chunk_dt + i * traj_dt)] for i in range(n_pts)]
             tag = f"{run['id']}:{k}"
             cmd = {"chunk": pts, "traj_dt": traj_dt, "t_anchor": t_anchor - off, "seq": k, "tag": tag,
                    "gains": run["gains"], "period_ms": run["period_ms"], "vel_cmd_max": run["vel_cmd_max"],
@@ -443,6 +491,7 @@ class Tuner:
         raw = self.robot.since(T0 - 0.5)
         run["stream"] = [(round(t - T0, 4), q, tq, round(tr - T0, 4)) for t, q, tq, tr in raw]
         run["ref"] = [(round(tau, 3), round(qref(tau), 4)) for tau in [i * 0.01 for i in range(int(T / 0.01) + 1)]]
+        run["ref6"] = [(round(tau, 3), [round(v, 4) for v in qref6(tau)]) for tau in [i * 0.02 for i in range(int(T / 0.02) + 1)]]
         # per-chunk latency from acks
         for c in run["chunks"]:
             a = self.robot.acks.get(c["tag"]) or {}
@@ -591,6 +640,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "id": t.step(body)})
             elif self.path == "/api/stream_sine":
                 self._json({"ok": True, "id": t.stream_sine(body)})
+            elif self.path == "/api/stream_traj":
+                self._json({"ok": True, "id": t.stream_traj(body)})
             elif self.path == "/api/hold":
                 self._json({"ok": True, "target": t.hold()})
             elif self.path == "/api/estop":
