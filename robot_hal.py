@@ -637,6 +637,11 @@ def _handle_cmd_client(conn, addr, log_dir):
                                                 "log_stamp": cmd.get("log_stamp"), "_t_recv": cmd["_t_recv"]})
                             conn.sendall((json.dumps({"state": "ack_chunk", "seq": cmd.get("seq"), "tag": cmd.get("tag"),
                                                       "t_recv": cmd["_t_recv"], "n_ref": n_ref}) + "\n").encode("utf-8"))
+                        elif "suction" in cmd:
+                            # handled here (not queued) so it never interrupts a running stream
+                            os.system(f"halcmd unlinkp {SUCTION_PIN} 2>/dev/null; halcmd setp {SUCTION_PIN} {1 if cmd['suction'] else 0}")
+                            conn.sendall((json.dumps({"state": "ack_suction", "suction": int(bool(cmd["suction"])),
+                                                      "t_recv": time.time(), "tag": cmd.get("tag")}) + "\n").encode("utf-8"))
                         elif "get_log" in cmd:
                             name = cmd.get("get_log")
                             if name and isinstance(name, str):
