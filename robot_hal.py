@@ -415,17 +415,49 @@ def run_control_loop(h, s, target_angles, duration_sec, controller, pos_tol=0.5,
 #   the first chunk queues a _stream_start so the main loop enters run_stream_loop().
 #   law: u = vff*v_ref(t+lead) - K0*(q - q_ref(t+lead)) - K1*(q_vel - v_ref), clamp vmax
 # ---------------------------------------------------------------------------
+#   cmd {"spline": [[6 deg],...], ...}  -- same keys, control points of a uniform cubic
+#   B-spline (spline_ref.SplineRef) instead of samples: C2 reference, analytic v_ref.
 import bisect
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # spline_ref lives next to this file
+from spline_ref import SplineRef
+
 _ref_lock = threading.Lock()
 _ref_t, _ref_q, _ref_chunks = [], [], []
 _stream_requested = False
+_spline_ref = SplineRef(MAX_JOINTS)
+_ref_is_spline = False
+
+
+def _weld_spline(cmd):
+    """Weld a control-point chunk into the B-spline reference (same drop/append rule)."""
+    global _ref_is_spline
+    t_anchor = float(cmd["t_anchor"])
+    dt = float(cmd.get("traj_dt", 0.01))
+    pts = cmd["spline"]
+    with _ref_lock:
+        if not _ref_is_spline and not _ref_t:
+            _ref_is_spline = True                 # first message of the stream selects the mode
+        n = _spline_ref.weld(t_anchor, dt, pts)
+        _ref_chunks.append({"seq": cmd.get("seq"), "t_recv": cmd["_t_recv"], "t_anchor": t_anchor,
+                            "n": len(pts), "mode": "spline"})
+        return n
 
 
 def _weld_chunk(cmd):
+    global _ref_is_spline
     t_anchor = float(cmd["t_anchor"])
     dt = float(cmd.get("traj_dt", 0.01))
     pts = cmd["chunk"]
     with _ref_lock:
+        if _ref_is_spline and not len(_spline_ref):
+            _ref_is_spline = False                # stale flag from a finished spline stream
+        elif _ref_is_spline:
+            # a sampled chunk during a live spline stream (e.g. the retract path): weld it as control
+            # points instead of dropping it into the unused linear list, where it would be ignored.
+            print("[stream] linear chunk during a spline stream -> welded as control points")
+            _ref_chunks.append({"seq": cmd.get("seq"), "t_recv": cmd["_t_recv"], "t_anchor": t_anchor,
+                                "n": len(pts), "mode": "spline_from_chunk"})
+            return _spline_ref.weld(t_anchor, dt, pts)
         k = len(_ref_t)
         while k > 0 and _ref_t[k - 1] >= t_anchor - 1e-6:
             k -= 1
@@ -440,6 +472,9 @@ def _weld_chunk(cmd):
 
 def _sample_ref(t):
     with _ref_lock:
+        if _ref_is_spline:
+            q, v, _a, st = _spline_ref.sample(t)
+            return q, v, st
         n = len(_ref_t)
         if n == 0:
             return None, None, "empty"
@@ -466,6 +501,10 @@ def run_stream_loop(h, s, gains, period_sec, log_dir, log_enabled, idle_timeout=
     VS = float(gains.get("vel_scale", 17.0)); VFF = float(gains.get("vff", 1.0)); LEAD = float(gains.get("lead", 0.0))
     h["enable"] = True
     _lat.clear()
+    with _ref_lock:
+        mode = "spline" if _ref_is_spline else "linear"
+    ctl_name = "stream_spline" if mode == "spline" else "stream"
+    print(f"[stream] reference mode = {mode}")
     log_rows, loop_count, t_prev, prev_q = [], 0, None, None
     t_last_in = time.time()
     done_reason = "idle_timeout"
@@ -504,16 +543,17 @@ def run_stream_loop(h, s, gains, period_sec, log_dir, log_enabled, idle_timeout=
         est_vel = [(q[j] - prev_q[j]) / dt for j in range(MAX_JOINTS)] if (prev_q is not None and dt > 0) else [0.0] * MAX_JOINTS
         prev_q = q.copy()
         err = sum(x * x for x in e) ** 0.5
-        log_rows.append(["stream", t_status, loop_count, *q, *est_vel, *q_ref, *next_pos, *vel_cmd, *u,
+        log_rows.append([ctl_name, t_status, loop_count, *q, *est_vel, *q_ref, *next_pos, *vel_cmd, *u,
                          *hal_vel, *hal_torq, err, _timing["poll"][-1], 0.0, _timing["hal_write"][-1], 0.0, t_loop_start])
         loop_count += 1
         if loop_count % 50 == 0:
-            print(f"[stream] loop {loop_count} err={err:.3f} st={st} n_ref={len(_ref_t)}")
+            n_ref = len(_spline_ref) if mode == "spline" else len(_ref_t)
+            print(f"[stream] loop {loop_count} err={err:.3f} st={st} n_ref={n_ref} mode={mode}")
         sl = period_sec - (time.time() - t_loop_start)
         if sl > 0:
             time.sleep(sl)
-    print(f"[stream] done: {done_reason} after {loop_count} loops")
-    _save_log(log_rows, last_ref or [0.0] * MAX_JOINTS, "stream", log_dir or "logs", log_enabled)
+    print(f"[stream] done: {done_reason} after {loop_count} loops (mode={mode})")
+    _save_log(log_rows, last_ref or [0.0] * MAX_JOINTS, ctl_name, log_dir or "logs", log_enabled)
     return done_reason, last_ref, loop_count
 
 
@@ -627,16 +667,18 @@ def _handle_cmd_client(conn, addr, log_dir):
                             _cmd_queue.put(cmd)
                             conn.sendall((json.dumps({"state": "ack", "target_deg": cmd["target_deg"],
                                                       "t_recv": cmd["_t_recv"], "tag": cmd.get("tag")}) + "\n").encode("utf-8"))
-                        elif "chunk" in cmd:
+                        elif "chunk" in cmd or "spline" in cmd:
                             cmd["_t_recv"] = time.time()
-                            n_ref = _weld_chunk(cmd)
+                            is_spline = "spline" in cmd
+                            n_ref = _weld_spline(cmd) if is_spline else _weld_chunk(cmd)
                             if not _stream_requested:
                                 _stream_requested = True
                                 _cmd_queue.put({"_stream_start": True, "gains": cmd.get("gains") or {},
                                                 "period_ms": cmd.get("period_ms"), "vel_cmd_max": cmd.get("vel_cmd_max"),
                                                 "log_stamp": cmd.get("log_stamp"), "_t_recv": cmd["_t_recv"]})
                             conn.sendall((json.dumps({"state": "ack_chunk", "seq": cmd.get("seq"), "tag": cmd.get("tag"),
-                                                      "t_recv": cmd["_t_recv"], "n_ref": n_ref}) + "\n").encode("utf-8"))
+                                                      "t_recv": cmd["_t_recv"], "n_ref": n_ref,
+                                                      "mode": "spline" if is_spline else "linear"}) + "\n").encode("utf-8"))
                         elif "suction" in cmd:
                             # handled here (not queued) so it never interrupts a running stream
                             os.system(f"halcmd unlinkp {SUCTION_PIN} 2>/dev/null; halcmd setp {SUCTION_PIN} {1 if cmd['suction'] else 0}")
@@ -685,7 +727,7 @@ def _command_server_thread(port, log_dir):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    global _params, _desktop_log_stamp, _vel_cmd_max, _stream_requested
+    global _params, _desktop_log_stamp, _vel_cmd_max, _stream_requested, _ref_is_spline
     import argparse
     parser = argparse.ArgumentParser(description="Unified robot HAL: pid, invdyn, pd_velff, mpc")
     parser.add_argument("--controller", choices=["pid", "invdyn", "pd_velff", "mpc"], default="pid",
@@ -817,11 +859,14 @@ def main():
                     _ref_chunks.clear()
                     del _ref_t[:]
                     del _ref_q[:]
+                    stream_mode = "spline" if _ref_is_spline else "linear"
+                    _spline_ref.clear()
+                    _ref_is_spline = False
                 s.poll()
                 final = [round(s.joint_actual_position[i], 3) for i in range(MAX_JOINTS)]
                 if last_ref is not None:
                     hold_target = list(last_ref)
-                _update_cmd_status("done", final, hold_target, 0.0, done_reason=done_reason, n_loops=n_loops,
+                _update_cmd_status("done", final, hold_target, 0.0, done_reason=done_reason, n_loops=n_loops, mode=stream_mode,
                                    robot_exec_ms=round((time.perf_counter() - t_cmd_start) * 1000, 1),
                                    last_log_name=_last_log_filename, controller="stream", gains=sgains,
                                    period_ms=round(sp * 1000, 3), chunks=chunks, t_recv=cmd.get("_t_recv"),
